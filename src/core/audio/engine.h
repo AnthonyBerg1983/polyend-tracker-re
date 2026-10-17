@@ -1,0 +1,277 @@
+// Audio engine root (spec 04 §1): 8 track voices + the ninth player (metronome), sends,
+// delay, reverb, master saturation, limiter, master volume, line-in,
+// live rendering through IAudioOut and offline (export) rendering.
+//
+// Implements ISequencerSink (spec 03 §6). Real-time contract: render paths
+// never allocate; all memory is owned by the object or caller-provided.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "audio/audio_tables.h"
+#include "audio/effects.h"
+#include "audio/voice.h"
+#include "hal_api.h"
+#include "model/instrument.h"
+#include "model/project.h"
+#include "sequencer/seq_sink.h"
+
+namespace ot {
+namespace audio {
+
+// Sample memory: instruments packed contiguously in index order
+// (spec 02 §8.2). The pool is caller-provided (SDRAM on the device).
+class SampleBank {
+public:
+    static constexpr int kSlots = kSampleInstrumentCount;   // 48
+    void init(int16_t* pool, size_t capacitySamples);
+    // Make room for instrument idx (planar stereo = 2*frames samples) and
+    // return the writable start, or nullptr when the bank is full
+    // ("not enough memory in sample bank"). Moves higher instruments.
+    // Not real-time: stop voices first (AudioEngine::stopAll()).
+    int16_t* reserve(int idx, uint32_t frames, bool stereo);
+    bool store(int idx, const int16_t* samples, uint32_t frames, bool stereo);
+    void remove(int idx);
+    void clear();
+    // In-place loading: decoders write into the free region after the last
+    // instrument (tail(), freeSamples() int16), then commitTail() moves the
+    // data into index order. idx must not be loaded; frames == 0 leaves it empty.
+    int16_t* tail() { return pool_ ? pool_ + usedSamples() : nullptr; }
+    size_t freeSamples() const { return cap_ - usedSamples(); }
+    bool commitTail(int idx, uint32_t frames, bool stereo);
+    // Copy instrument src into dst (dst replaced). False when the bank is full.
+    bool copy(int src, int dst);
+    // Keep frames [start, start+n) of idx (sample editor crop).
+    void crop(int idx, uint32_t start, uint32_t n);
+    // Sample editor apply / one-level undo (spec 06 §6.3/§6.4): idx (loaded)
+    // takes the block of `frames` written at tail(); its old data ends up at
+    // the new tail() (same planar layout), so a second call with the old
+    // size swaps back. In place (rotations), no extra memory.
+    bool replaceFromTail(int idx, uint32_t frames, bool stereo);
+    int16_t* data(int idx) { return loaded(idx) ? pool_ + slots_[idx].off : nullptr; }
+    uint32_t samples(int idx) const { return valid(idx) ? slots_[idx].samples() : 0u; }
+    uint32_t usedBytes() const { return uint32_t(usedSamples() * 2); }
+    uint32_t capacityBytes() const { return uint32_t(cap_ * 2); }
+    bool loaded(int idx) const { return valid(idx) && slots_[idx].loaded; }
+    const int16_t* left(int idx) const;
+    const int16_t* right(int idx) const;
+    uint32_t frames(int idx) const { return loaded(idx) ? slots_[idx].frames : 0; }
+    bool stereo(int idx) const { return loaded(idx) && slots_[idx].stereo; }
+    size_t usedSamples() const;
+    size_t capacitySamples() const { return cap_; }
+
+private:
+    struct Slot {
+        uint32_t off = 0;
+        uint32_t frames = 0;
+        bool stereo = false;
+        bool loaded = false;
+        uint32_t samples() const { return loaded ? frames * (stereo ? 2u : 1u) : 0u; }
+    };
+    static bool valid(int i) { return i >= 0 && i < kSlots; }
+    uint32_t startOf(int idx) const;
+    int16_t* pool_ = nullptr;
+    size_t cap_ = 0;
+    Slot slots_[kSlots];
+};
+
+// Mixer / master / effect parameters in UI units (spec 04 §4.2, §5, §7;
+// spec 07 Q2-Q4). The UI writes these; the engine reads them once per block.
+// Defaults are the engine-reset values (spec 07 Q2) and New Project levels.
+struct MixerSettings {
+    uint8_t trackLevel[kVoices] = {86, 86, 86, 86, 86, 86, 86, 86};   // TRK index, 86 = 0 dB (07 Q6)
+    bool trackMute[kVoices] = {};     // .mt 0x12C+t (03 §2.4): dry and post-fader sends 0
+    bool trackSolo[kVoices] = {};
+    // Global Mixer (spec 07 Q3/Q4): Delay / Reverb levels scale every track's
+    // send gain; Dry Mix scales every track's AMP stage. Returns stay at 1.0.
+    uint8_t delayLevel = 86;          // .mt 0x4D9 (the "S" scaler)
+    uint8_t reverbLevel = 86;         // .mt 0x4D8
+    uint8_t dryMix = 86;              // .mt 0x4DD
+    bool delayMute = false;           // .mt 0x4DB
+    bool reverbMute = false;          // .mt 0x4DA
+    bool dryMute = false;             // .mt 0x4DC
+    bool postFaderSends = true;       // Sends mode, .mt 0x4FC (New Project = 1)
+    uint8_t masterVolume = 86;        // TRK index
+    uint8_t saturationMode = 0;       // 0..4 (§5.4)
+    bool extraHeadroom = false;
+    bool antiAliasing = true;
+    // delay (§5.1)
+    uint16_t delayTimeMs = 500;
+    uint8_t delayFeedback = 50;       // 0..100
+    uint16_t delayFilterHz = 20000;
+    bool delayPingPong = false;
+    bool delaySync = false;
+    uint8_t delaySyncIndex = 6;
+    // reverb (§5.2), 0..1
+    float reverbSize = 0.7f, reverbDamping = 0.2f, reverbPredelay = 0.0f, reverbDiffusion = 0.625f;
+    // limiter (§5.3, spec 07 Q2); engine reset: attack 300, release 10.0,
+    // threshold 32767, side-chain off until the project is applied.
+    uint16_t limiterThreshold = 32767;   // stored value; LIMTHR[min(v,32767)*100/32767]
+    float limiterAttackMs = 300.0f;
+    float limiterReleaseMs = 10.0f;
+    uint8_t limiterMode = 0;
+    uint8_t sidechain = 0;            // 0 off, 1..8 track, 9/10 line-in L/R
+    // line input (§1.3, §5.4, §5.5)
+    uint8_t lineInChannel = 0;        // 0 stereo, 1 left->both, 2 right->both
+    uint8_t lineInLevel = 86;
+    bool lineInMute = false;
+    uint8_t lineInDelaySend = 0;      // TRK index; 0.5*TRK, 0 below 0.01
+    uint8_t lineInReverbSend = 0;
+    // Settings (config, not project): metronome volume 0..100 through the
+    // SEND law (spec 07 Q10, default 50 = -20 dB) and the loader
+    // file-preview level (TRK index).
+    uint8_t metronomeVolume = 50;
+    uint8_t previewVolume = 86;
+
+    // Fill from the project values block (file offsets; RAM 0x20004780 + f,
+    // spec 02 §3.3, spec 07). Fields without a project location keep their value.
+    void loadFromProject(const Project& p);
+};
+
+// One block of every stem, interleaved stereo int16 (spec 04 §6.1 queues):
+// 0..7 track1..8 (post-pan), 8 reverb, 9 delay, 10 master.
+struct StemBlock {
+    static constexpr int kStems = 11;
+    int16_t data[kStems][kBlock * 2];
+};
+
+class AudioEngine : public ISequencerSink {
+public:
+    static constexpr size_t kFxMemorySamples = Delay::kMemorySamples + Reverb::kMemorySamples;
+    static constexpr int kMetronomeVoice = kVoices;   // PREVIEWPLAYER (spec 07 Q10)
+
+    AudioEngine();
+    // fxMemory: kFxMemorySamples int16; samplePool: sample bank memory.
+    // instruments: kSampleInstrumentCount entries owned by the caller.
+    bool init(int16_t* fxMemory, size_t fxSamples, int16_t* samplePool, size_t poolSamples,
+              const Instrument* instruments);
+    SampleBank& bank() { return bank_; }
+    MixerSettings& settings() { return mix_; }
+    const MixerSettings& settings() const { return mix_; }
+
+    // Called at the start of every block with the sequencer advance in
+    // seconds (spec 04 §1.1 step 1 / §6.1); the app runs the sequencer here.
+    using PreBlockFn = void (*)(void* ctx, float seconds);
+    void setPreBlockHook(PreBlockFn fn, void* ctx) { hook_ = fn; hookCtx_ = ctx; }
+    void setMidiOut(IMidiPort* port) { midi_ = port; }
+
+    // Live output.
+    static void fillCallback(int16_t* out, uint32_t frames, void* ctx);   // IAudioOut::FillFn
+    void attachOutput(IAudioOut& out) { out.setCallback(&AudioEngine::fillCallback, this); }
+    void renderLive(int16_t* interleaved);   // one 128-frame block
+    // Render callback disable flag (spec 04 §1.1 "audio callback disabled").
+    void setCallbackDisabled(bool d) { callbackDisabled_ = d; }
+    // Line input for the next block: 128 interleaved int16 frames, or nullptr (silence).
+    void setLineInput(const int16_t* interleaved) { lineIn_ = interleaved; }
+
+    // Pad / instrument audition uses the track voices (spec 07 Q7, see
+    // App::previewOn); the ninth player only plays the metronome click.
+    // SD file preview (WAVPREVIEW, OUT mixer input 1): planar int16 buffer
+    // played once at MixerSettings::previewVolume, stereo files in stereo
+    // (spec 07 Q1); nullptr stops it. The buffer must stay valid while
+    // playing (stopAll() also stops it).
+    void previewBuffer(const int16_t* data, uint32_t frames, bool stereo);
+    bool previewBufferActive() const { return raw_.active; }
+    void previewStop();   // file preview, immediately
+    // Sequencer transport for tempo-locked LFOs (spec 07 Q5): returns true
+    // while the sequencer plays and reports its tick counter (576 per step)
+    // and the track-0 step index. Called from the audio-block context.
+    using TransportFn = bool (*)(void* ctx, uint32_t* tick, int16_t* step0);
+    void setTransportSource(TransportFn fn, void* ctx) { transport_ = fn; transportCtx_ = ctx; }
+    // Peak |post-pan| level of track t (0..1) since the previous call (UI meters).
+    float trackPeak(int t);
+
+    // Performance FX offsets for track t (spec 06 §3.2/§3.4).
+    void setPerf(int track, const PerfOffsets& p) { if (track >= 0 && track < kVoices) voices_[track].setPerf(p); }
+
+    void stopAll();
+    void clearEffects();   // zero delay and reverb memory
+    Voice& voice(int t) { return voices_[t]; }
+
+    // Offline rendering (spec 04 §6.1).
+    void beginOffline();
+    void renderOfflineBlock(int16_t* masterInterleaved, StemBlock* stems);
+    void endOffline();
+    // Render into WAV files: stems=false -> `path` is the master file;
+    // stems=true -> `path` is a directory receiving track1..8/reverb/delay/master.wav.
+    // Stops after maxBlocks or when running(ctx) returns false. Header sample
+    // rate field is 44117 (spec 04 §6.1). Returns blocks rendered, <0 on I/O error.
+    int32_t exportWav(IStorage& fs, const char* path, bool stems, uint32_t maxBlocks, bool (*running)(void*),
+                      void* ctx);
+
+    // Meters.
+    float limiterGainReduction() const { return limL_.meanGain(); }
+    float reverbLevel() const { return reverb_.level(); }
+    float tempo() const { return tempo_; }
+    bool metronomeActive() const { return voices_[kMetronomeVoice].active(); }
+    uint64_t blocksRendered() const { return blocks_; }
+
+    // ISequencerSink (spec 03 §6).
+    void voiceNoteOn(uint8_t track, const VoiceNoteOn& n) override;
+    void voiceNoteOff(uint8_t track, NoteOffMode mode) override;
+    void voiceApplyFx(uint8_t track, uint8_t slot, uint8_t type, uint8_t value) override;
+    void resetAllVoiceFx() override;
+    void engineBlockUpdate(float smoothedTempoBpm) override { tempo_ = smoothedTempoBpm > 0.0f ? smoothedTempoBpm : tempo_; }
+    void metronomeClick(bool accent, uint8_t velocity) override;
+    void midiSend(uint8_t portMask, const uint8_t* bytes, uint8_t len) override;
+
+private:
+    void renderBlock(bool offline, int16_t* master, StemBlock* stems);
+    void updateParams();
+    void controlBlock(float blockUs);
+    template <int kMode>
+    void masterSum(float l0, float li);
+
+    SampleBank bank_;
+    const Instrument* instruments_ = nullptr;
+    MixerSettings mix_;
+    Voice voices_[kVoices + 1];
+    VoiceControl vc_[kVoices + 1];
+    VoiceOut vout_[kVoices + 1];
+    Delay delay_;
+    Reverb reverb_;
+    Limiter limL_, limR_;
+    LineDynamics dynL_, dynR_;   // DYN0/DYN1, line-in send path (spec 04 §5.6)
+    bool dynActive_ = false;     // dynamics state not yet settled
+    Ramp lineLvl_, master_, lineSendD_, lineSendR_, click_;
+
+    // cached parameter state
+    uint32_t cDelayT_ = 0;
+    uint16_t cDelayHz_ = 0;
+    float cLimA_ = -1.0f, cLimR_ = -1.0f;
+    uint8_t cLimMode_ = 0xFF;
+
+    // blocks
+    float dsend_[kBlock], rsend_[kBlock];
+    float dL_[kBlock], dR_[kBlock], rL_[kBlock], rR_[kBlock];
+    float lineL_[kBlock], lineR_[kBlock];
+    float mL_[kBlock], mR_[kBlock];
+
+    struct RawPreview {
+        volatile bool active = false;
+        const int16_t* data = nullptr;
+        uint32_t frames = 0, pos = 0;
+        bool stereo = false;
+    } raw_;
+    volatile float peak_[kVoices] = {};
+
+    // metronome click instruments (normal / accent finetune, spec 07 Q10)
+    Instrument clickIns_[2];
+    bool transportPlaying(uint32_t* tick, int16_t* step0) const;
+    TransportFn transport_ = nullptr;
+    void* transportCtx_ = nullptr;
+
+    PreBlockFn hook_ = nullptr;
+    void* hookCtx_ = nullptr;
+    IMidiPort* midi_ = nullptr;
+    const int16_t* lineIn_ = nullptr;
+    float tempo_ = 130.0f;
+    uint64_t blocks_ = 0;
+    bool callbackDisabled_ = false;
+    bool offline_ = false;
+    bool ready_ = false;
+};
+
+}  // namespace audio
+}  // namespace ot

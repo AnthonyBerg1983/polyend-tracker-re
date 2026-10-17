@@ -1,0 +1,181 @@
+// WAV import (parse, decode, cubic resample to 44.1 kHz int16) and 16-bit
+// 44.1 kHz WAV writing. spec 02 §8.1, §8.3.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "formats/format_common.h"
+#include "hal_api.h"
+
+namespace ot {
+
+namespace wav {
+constexpr uint32_t kHeaderSize = 44;       // canonical header (spec 02 §8.3)
+constexpr uint32_t kMaxChunkScan = 10;     // per phase (spec 02 §8.1)
+constexpr uint32_t kStreamChunk = 0x7F80;  // conversion chunk size
+constexpr uint16_t kFormatPcm = 1;
+constexpr uint16_t kFormatFloat = 3;
+}  // namespace wav
+
+struct WavInfo {
+    bool valid = false;        // RIFF + fmt + data found within the scan limits
+    bool formWave = false;     // RIFF form type == "WAVE"
+    uint16_t format = 0;
+    uint16_t channels = 0;
+    uint32_t sampleRate = 0;
+    uint32_t byteRate = 0;
+    uint16_t blockAlign = 0;
+    uint16_t bitsPerSample = 0;
+    uint32_t dataSize = 0;     // bytes, as declared
+    uint32_t dataOffset = 0;   // file offset of the first data byte
+};
+
+// Sequential byte source for the header parser.
+class ByteReader {
+public:
+    virtual ~ByteReader() = default;
+    virtual int32_t read(void* dst, uint32_t n) = 0;   // bytes read
+    virtual bool skip(uint32_t n) = 0;
+    virtual uint32_t position() const = 0;
+};
+
+class MemReader : public ByteReader {
+public:
+    MemReader(const uint8_t* data, size_t len) : data_(data), len_(len) {}
+    int32_t read(void* dst, uint32_t n) override;
+    bool skip(uint32_t n) override;
+    uint32_t position() const override { return uint32_t(pos_); }
+
+private:
+    const uint8_t* data_;
+    size_t len_;
+    size_t pos_ = 0;
+};
+
+class StorageReader : public ByteReader {
+public:
+    StorageReader(IStorage& fs, IStorage::Handle h) : fs_(fs), h_(h) {}
+    int32_t read(void* dst, uint32_t n) override;
+    bool skip(uint32_t n) override;
+    uint32_t position() const override { return pos_; }
+
+private:
+    IStorage& fs_;
+    IStorage::Handle h_;
+    uint32_t pos_ = 0;
+};
+
+// Header parser (spec 02 §8.1 "Parser"). On failure info.valid == false.
+bool wavParseHeader(ByteReader& r, WavInfo& info);
+bool wavParseHeader(const uint8_t* file, size_t len, WavInfo& info);
+
+// Accepted formats (spec 02 §8.1): WAVE, 1-2 channels, PCM 8/16/24/32 or float 32; any rate.
+bool wavIsSupported(const WavInfo& info);
+// Fast path: PCM 16-bit mono 44.1 kHz (copied verbatim).
+bool wavIsFastPath(const WavInfo& info);
+uint32_t wavBytesPerFrame(const WavInfo& info);
+uint32_t wavSourceFrames(const WavInfo& info);
+// Output length = srcFrames * 44100 / srcRate (spec 02 §8.1).
+uint32_t wavResampledFrames(uint32_t srcFrames, uint32_t srcRate);
+// Decode one sample to int16 (spec 02 §8.1 "Sample decoding").
+int16_t wavDecodeSample(const uint8_t* p, uint16_t format, uint16_t bits);
+
+// Streaming 4-point cubic resampler to 44.1 kHz (spec 02 §8.1). Source
+// samples outside [0, srcFrames) read as zero. Writes outputFrames() samples
+// to dst over the life of one conversion.
+class CubicResampler {
+public:
+    void begin(uint32_t srcRate, uint32_t srcFrames, int16_t* dst);
+    void push(int16_t s);
+    // Treat all remaining source samples as zero and emit the rest.
+    void finish();
+    uint32_t outputFrames() const { return uint32_t(outTotal_); }
+    uint32_t produced() const { return uint32_t(outNext_); }
+
+private:
+    bool ready(uint64_t i) const;
+    void emit();
+    int32_t src(int64_t j) const;
+
+    int16_t hist_[4] = {};
+    uint32_t srcRate_ = 44100;
+    uint64_t srcFrames_ = 0;
+    uint64_t received_ = 0;
+    uint64_t outNext_ = 0;
+    uint64_t outTotal_ = 0;
+    bool ended_ = false;
+    int16_t* dst_ = nullptr;
+};
+
+struct WavImportOptions {
+    bool stereo = false;           // stereo-import mode: keep 2 channels (planar)
+    uint16_t startMarker = 0;      // partial import, 1/65535 units
+    uint16_t endMarker = 65535;
+};
+
+struct WavImportPlan {
+    uint32_t srcStart = 0;     // first source frame used
+    uint32_t srcFrames = 0;    // source frames used
+    uint32_t outFrames = 0;    // 44.1 kHz frames per channel
+    uint8_t outChannels = 1;
+};
+WavImportPlan wavPlanImport(const WavInfo& info, const WavImportOptions& opt);
+
+// Streaming importer: feed the data-chunk bytes in order (any chunking).
+// Output is planar int16: outFrames left samples, then (stereo) outFrames
+// right samples.
+class WavImporter {
+public:
+    FmtStatus begin(const WavInfo& info, const WavImportOptions& opt, int16_t* out, size_t outCapSamples);
+    void feed(const uint8_t* bytes, size_t n);
+    // Returns frames per channel written.
+    uint32_t finish();
+    const WavImportPlan& plan() const { return plan_; }
+
+private:
+    void frame(const uint8_t* f);
+
+    WavInfo info_;
+    WavImportPlan plan_;
+    CubicResampler rs_[2];
+    uint8_t carry_[8] = {};
+    uint32_t carryLen_ = 0;
+    uint32_t bpf_ = 0;
+    uint64_t frameIdx_ = 0;
+};
+
+struct WavImportResult {
+    uint32_t frames = 0;
+    bool stereo = false;
+};
+FmtStatus wavImportMemory(const uint8_t* file, size_t len, const WavImportOptions& opt, int16_t* out,
+                          size_t outCapSamples, WavImportResult& res);
+FmtStatus wavImportFile(IStorage& fs, const char* path, const WavImportOptions& opt, int16_t* out,
+                        size_t outCapSamples, WavImportResult& res);
+
+// --- writing (spec 02 §8.3) ---------------------------------------------
+
+// Canonical 44-byte PCM 16-bit 44.1 kHz header; RIFF size = data + 36.
+void wavMakeHeader(uint8_t out[wav::kHeaderSize], uint16_t channels, uint32_t dataBytes);
+
+// Encode interleaved int16 frames to a complete WAV in memory. Returns the
+// byte count, 0 if cap is too small.
+size_t wavEncode(const int16_t* interleaved, uint32_t frames, uint16_t channels, uint8_t* out, size_t cap);
+
+// Streaming writer: header placeholder on open, patched on close.
+class WavWriter {
+public:
+    bool open(IStorage& fs, const char* path, uint16_t channels);
+    bool write(const int16_t* interleaved, uint32_t frames);
+    bool close();
+    uint32_t frames() const { return frames_; }
+
+private:
+    IStorage* fs_ = nullptr;
+    IStorage::Handle h_ = -1;
+    uint16_t channels_ = 1;
+    uint32_t frames_ = 0;
+};
+
+}  // namespace ot

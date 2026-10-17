@@ -1,0 +1,687 @@
+// Screen classes (spec 06 per-screen behaviour; spec 05 §2 where 06 is silent).
+#pragma once
+
+#include <cstdint>
+
+#include "app/auto_slice.h"
+#include "app/midi_cc.h"
+#include "app/pattern_ops.h"
+#include "app/perf_presets.h"
+#include "ui/ui.h"
+#include "ui/wave.h"
+
+namespace ot {
+
+void* createScreens(Ui& ui, App& app, Screen** out);   // returns the owner
+void destroyScreens(void* owner, Screen** screens);
+
+// ---------------------------------------------------------------------------
+// Pattern editor (spec 06 §1)
+class PatternScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Pattern"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::Pattern; }
+    void padLeds(uint8_t* levels) override;
+    // The Pattern screen draws its whole frame (strip, title, hairline, bar
+    // labels) itself: the popups cover the bar and the title hairline
+    // (VISUAL_DIFF Part 2 §7.2, §7.3).
+    bool fullScreen() const override { return true; }
+
+    // Editor state (spec 06 §1.1 table), public for tests.
+    int track = 0, step = 0, col = 0;
+    int firstTrack = 0;
+    int selState = 1;               // 1 cursor, 2 rectangle
+    int anchorTrack = 0, anchorStep = 0;
+    bool wholeCol = false;
+    bool allTracks = false;
+    int focus = -1;                 // -1 none, 0 pattern, 1 length, 2 step jump, 5 undo, 6 redo
+    int page = 0;
+    bool fillOpen = false;
+    int fillField = 0;
+    pops::FillParams fill[4];
+    uint8_t colMask = 0;            // column-view mask (spec 06 §1.9)
+    bool recArmPage = false;
+    bool armed[12] = {true, true, true, true, true, true, true, true, true, true, true, true};
+
+    SelRect target() const;
+    bool edit() const;
+    int windowTop() const { return hAnchor_ - 7; }   // first visible step, horizontal arrangement
+    static int hStepColW();                          // horizontal arrangement: step column width
+
+    // MIDI note-in step entry (spec 17 §1.4 step 8): the note sounds on
+    // track t; with the sequencer stopped, edit mode on and t inside the
+    // target track range, it is written at (startStep, t). No cursor move.
+    // Returns false when entry does not apply.
+    bool midiChordEntry(int t, uint8_t note, uint8_t velocity);
+    // Grid geometry for the "Pattern top info" config (spec 06 §1.2).
+    bool topInfoOn() const;
+    int gridTop() const;           // y of the grid control (28, or 0 when off)
+    int rowHeight() const;
+    // "PERF" marker in the top info bar (spec 06 §1.2).
+    bool perfMarker() const;
+    // Render selection after the name keyboard (spec 06 §1.11); load = the
+    // "render & load" variant (first free sample slot). False on failure,
+    // cancel or no free slot.
+    bool renderSelection(const char* name, bool load);
+    // "Counting in" popup shown (spec 16 §B.9).
+    bool countInShown() const;
+    // Note popup window base: the note under F1 (tests).
+    int noteWindowBase() const { return noteBase_; }
+    // Column-key popups (spec 06 §1.6): Note (kind 0, 12 x 4 keys), Instrument
+    // (2) / MIDI channel (5) and Fx (3) lists. The screen keeps its own popup
+    // state (the shared Ui picker is not used here) and draws it in stock
+    // style (VISUAL_DIFF Part 2 §8.4..§8.7).
+    const Picker& popup() const { return pop_; }
+    // Notes popup: note of the top-left key's octave row 3 (C of the lowest
+    // shown octave; rows show win .. win + 47, highest octave on top).
+    int noteKeysWindow() const { return noteWin_; }
+
+private:
+    void refreshBar();
+    void moveCursor(int dir, bool shiftHeld);   // dir: 0 step-1, 1 step+1, 2 track+1, 3 track-1
+    void advance(int extraRows = 0);
+    void collapse();
+    void keepTrackVisible();
+    ColMode heldColMode(bool forDelete) const;
+    void focusArrow(uint8_t id);
+    void focusDelta(int d);
+    void editEncoder(int d);
+    void openPicker(int which);
+    void commitPicker();
+    void noteKey(uint8_t id, uint8_t state);    // Note popup F1..F8 (play / pick / Shift window shift)
+    void noteKeysOff();
+    void writeFxPad(const SelRect& r, int pad);   // FX column pad: type (Fx key held) or value
+    void transport();
+    void fillButton(uint8_t id);
+    void fillDelta(int d, bool wrap = false);
+    void fillApply();
+    uint8_t fillFxType() const;                // Fx id of the Fill "Fx Type" index (>= 0)
+    void clampFillValues();                    // From/To into the chosen Fx's range
+    void fillValueText(int val, char* out) const;   // From/To display text (8 bytes)
+    void pageButton(int f, uint8_t state);
+    void drawGrid(Gfx& g);
+    void drawGridVertical(Gfx& g, bool threeTracks);
+    void drawTitleBar(Gfx& g, bool popupRight);
+    void drawBar(Gfx& g);
+    void drawMuteBar(Gfx& g);
+    void drawListPopup(Gfx& g);
+    void drawNotesPopup(Gfx& g);
+    bool popupMove(uint8_t id);                // arrows inside a popup
+    void popupPad(uint8_t pad);
+    void popupLeds(uint8_t* lv) const;
+    void followNoteWindow();
+    void drawGridHorizontal(Gfx& g);   // arrangement 2: tracks as rows, steps as columns
+    void drawFill(Gfx& g);
+    void drawCountIn(Gfx& g);
+    void cellText(int t, int s, char* out) const;
+    void stepLabel(int s, char* out) const;
+    int len() const;
+    int lastNote() const;
+
+    uint8_t colKey_ = 0;            // column key waiting for its hold popup
+    uint32_t colKeyAt_ = 0;
+    uint8_t pickerKey_ = 0;
+    int noteBase_ = 48;             // Note popup: note under F1 (window of 8)
+    uint8_t noteKeysOn_ = 0;        // Note popup F-keys sounding (bit = F-key)
+    bool encUsedInHold_ = false;
+    bool patternHeld_ = false;
+    int maskKeys_[2] = {-1, -1};
+    uint32_t lastUpdate_ = 0;
+    int lastPlayStep_ = -1;
+    int hAnchor_ = 7;               // horizontal arrangement window anchor (spec 06 §1.2)
+    bool blink_ = false;
+    bool lastShift_ = false;
+    bool recBlink_ = false;         // 500 ms blink while a recording waits to start
+    bool recWaitShown_ = false;
+    bool fillNoteInit_ = false;     // Fill note defaults taken from the project (spec 06 §1.10)
+    uint32_t countInUntil_ = 0;     // "Counting in" popup end (ms), 0 = none
+    bool countInDrawn_ = false;
+    int8_t padVoice_[48];
+    Picker pop_;                    // column-key popup state (drawn by this screen)
+    int noteWin_ = 36;              // Notes popup: lowest shown note (C3)
+    int popTop_ = 0;                // list popup: first visible row
+    int statusStep_ = -2;           // step last given to Ui::setStatusCursorStep
+};
+
+// ---------------------------------------------------------------------------
+// Song (spec 06 §2)
+class SongScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Song"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::Song; }
+
+    int length() const;
+    int cursor = 0;
+    bool edit = false;
+    int focus = 1;                 // 0 grid, 1 list, 2 tempo
+    int selRow0 = 0, selRows = 1, selTrack0 = 0, selTracks = 1;
+    int tapCount = 0;
+    uint32_t tapT0 = 0;
+    bool tapShown = false;         // "TAP n/4" display flag SO+0x131 (spec 06 §2.4)
+    int transportState() const;    // F1/F2 label state 0..5 (spec 06 §2.2)
+    bool loopingInSong() const { return loopInSong_; }
+    bool loopTogglePending() const { return togglePending_; }
+
+private:
+    void refreshBar();
+    void setPattern(int slot, int num);
+    void tempoDelta(float d, bool integer);
+    void addSlot(bool empty);
+    void deleteSlot();
+    void copyJob(bool paste);
+    void deleteJob();
+    void applyLoopToggle();
+    void reloadPlayingSlot();
+    int savedFocus_ = 1;
+    bool songKeyHeld_ = false;
+    bool playWhileSongKey_ = false;
+    bool clipValid_ = false;
+    int clipRow0_ = 0, clipRows_ = 0, clipTrack0_ = 0, clipTracks_ = 0;
+    uint32_t lastUpdate_ = 0;
+    bool loopInSong_ = false;      // state 3: song paused on one pattern (spec 06 §2.2)
+    bool togglePending_ = false;   // F1 deferred action (seq+0x548 = 0x5ae00, spec 06 §2.3)
+    int toggleStep_ = 0;           // master step at scheduling; fires on the next one
+};
+
+// ---------------------------------------------------------------------------
+// Instrument parameters (spec 05 §2.7 + appendix C)
+class InstrumentScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Instrument"; }
+    void start(int opt) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::InstrParams; }
+    void onPad(uint8_t pad, uint8_t state) override;
+    void padLeds(uint8_t* levels) override;
+
+    // 0 params, 1 automation, 2 MIDI Mapping, 3 MIDI instrument; effects = mode 0 + effects flag
+    int mode = 0;
+    bool effects = false;
+    int column = 0;        // mode 2: 0 = CC list pane, 1 = Instruments pane
+    int dest = 0;          // automation destination 0..5
+    int ccScroll = 0;      // MIDI Mapping CC list row 0..46 (appendix C §1 +0x334)
+    uint8_t auditionNote() const;   // Enc-push audition note (appendix C §3, 0x30138)
+
+private:
+    int columns() const;
+    bool selectable(int c) const;   // appendix C §3 column rules
+    void onMappingButton(uint8_t id);
+    void mappingMove(int d);
+    void drawMapping(Gfx& g);
+    void edit(int col, int d, bool tap);
+    void reset(int col);
+    void refreshBar();
+    void valueText(int col, char* out, int cap, float* frac, bool* bipolar) const;
+    bool held_[8] = {};
+    int heldCount_ = 0;
+    bool usedWhileHeld_[8] = {};
+};
+
+// ---------------------------------------------------------------------------
+// Sample loader (spec 06 §5)
+class LoaderScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Sample Loader"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+
+    static constexpr int kMaxEntries = 101;   // spec 06 §5.2
+    static constexpr int kMaxDepth = 20;
+    char dir[200] = {};
+    int count = 0;
+    char entries[kMaxEntries][40];
+    bool isDir[kMaxEntries] = {};
+    int sdCursor = 0;
+    int insCursor = 0;
+    int focus = 0;          // 0 SD, 1 instruments, 2 preview volume
+    // Trim (import popup, spec 06 §5.5)
+    bool trim = false;
+    uint16_t trimStart = 0, trimEnd = 65535;
+    int trimSel = 0;
+    uint32_t trimLen_ = 0;
+
+    void list();
+    void enter();
+    void add(bool next);
+    void openImport();                  // F5 (spec 06 §5.5 step 1)
+    // §5.5 gating: Normal iff 2n < free - 10000, low quality iff n < free - 10000.
+    bool importAllowed(bool lowQuality) const;
+    bool over() const { return over_; }
+
+private:
+    void refreshBar();
+    void selectionRange(int* first, int* last) const;               // focused list
+    void listRange(bool sd, int* first, int* last) const;
+    void memoryProjection();
+    void startTrim();
+    void moveCursor(int d);
+    void doAdd(bool next);
+    void entryPath(int i, char* out, int cap) const;
+    uint32_t now() const { return ui_.now(); }
+    int depth_ = 0;
+    int cursorHist_[kMaxDepth] = {};
+    uint8_t marked_[kMaxEntries] = {};
+    uint8_t insMarked_[48] = {};
+    int prevFocus_ = 0;
+    uint32_t projected_ = 0;
+    bool over_ = false;
+    bool addNext_ = false;
+    int copySrc_ = -1, copyCount_ = 0;
+    bool previewing_ = false;
+    uint32_t pendingProjAt_ = 0;
+    bool f7Hold_ = false;               // F7 produced a hold tick (§5.3)
+    bool trimPlaying_ = false;
+    uint32_t trimPlayAt_ = 0, trimElapsed_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Master / mixer (spec 06 §4)
+class MixerScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Master"; }
+    void start(int opt) override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::Master; }
+
+    int page = 0;           // 0 master, 1 track mixer, 2 global mixer
+    int sub = 0;            // master sub-page: 0 main, 1 reverb, 2 delay, 3 limiter, 4 EQ
+    int param = 0;          // selected parameter on the (sub-)page
+    bool rename = false;
+
+    // Track Mixer level meter law (spec 06 §4.4, 0x35454): mean of the last
+    // 10 level readings / 0.71 -> dB; -3.6..+0.6 dB maps linearly onto 0..100
+    // (clamped outside). Peak hold falls 1 unit per 500 ms.
+    static int meterBar(float meanLevel);
+    int meter[8] = {};      // current bar 0..100
+    int meterHold[8] = {};  // peak hold 0..100
+    // Master Limiter gain-reduction meter (spec 06 §4.3): dB of reduction
+    // from the engine's mean limiter gain, read every 50 ms; the bar spans
+    // 0..kGrRangeDb (OpenTracker's scale).
+    static constexpr float kGrRangeDb = 24.0f;
+    static float reductionDb(float meanGain);
+    float gainReduction = 0.0f;   // dB, >= 0
+
+private:
+    void refreshBar();
+    void change(int d);
+    void masterChange(int d);
+    void mixerKey(int i, uint8_t state);
+    bool held_[8] = {};
+    bool changed_[8] = {};
+    // Master key (spec 06 §4.1): snapshot taken on press.
+    bool masterPending_ = false;
+    bool otherKeyDuringMaster_ = false;
+    bool masterHoldFired_ = false;
+    int snapPage_ = 0, snapSub_ = 0, snapParam_ = 0;
+    int solo_ = -1;
+    int globalSolo_ = -1;
+    // Level meters (spec 06 §4.4).
+    uint32_t lastMeter_ = 0;
+    uint32_t lastDecay_ = 0;
+    uint32_t lastGr_ = 0;
+    float hist_[8][10] = {};
+    int histPos_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// File (spec 05 §2.12 + appendix E)
+class FileScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "File"; }
+    void start(int opt) override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onEncoder(int d) override;
+
+    int state = 0;          // 0 main, 1 open, 2 import mod, 3 save, 4 export
+    int count = 0;
+    char entries[64][40];
+    int cursor = 0;
+    int focus = 0;          // open: 0 SD list, 1 recent
+    int pending = 0;        // action after a save prompt: 1 new, 2 open, 3 recent, 4 import, 5 .it
+
+    void doNew();
+    void doOpenSelected();
+    void list();
+
+    // Project cover preview (spec 05 appendix E1.6, spec 13 §I.3): 0 idle,
+    // 1 waiting for the 2 s hold, 2 loaded (drawn), 3 no/invalid image.
+    int coverState = 0;
+    uint16_t coverW = 0, coverH = 0;
+
+private:
+    void refreshBar();
+    void askSaveThen(int action);
+    void runExport(int id);
+    void onImportButton(uint8_t id);
+    void openAction();
+    void importAction();
+    void askStopThen(int action);
+    int exportMode_ = 0;
+    int stopThen_ = 0;              // action after "stop the pattern": 1 open, 2 import
+    char recent_[10][64] = {};
+    int recentCount_ = 0;
+    char coverKey_[300] = {};       // "<folder>/<project>" the cover timer runs for
+    uint32_t coverAt_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Config (spec 06 §7)
+class ConfigScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Config"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    // The Sample Recorder key goes back to the recorder that opened Config
+    // with F4 Metronome (spec 05 appendix C §2.9).
+    bool ownsModuleKey(uint8_t id) const override;
+
+    // Factory-test entry code (spec 06 §7.6): F8,F1,F7,F2 or pads 47,10,45,8,
+    // one shared counter.
+    int codePos = 0;
+    void feedCode(bool pad, uint8_t v);
+    // Firmware-update list (spec 06 §7.5): at most 101 names, sorted.
+    static constexpr int kFwMax = 101;
+    static int firmwareCount();
+    static const char* firmwareName(int i);
+    // /.develop overlay values (spec 06 §7.2), refreshed every > 1 s.
+    DevStats dev;
+    bool devValid = false;
+
+    int category = 0;
+    int option = 0;
+    int focus = 0;          // 0 categories, 1 options
+    bool editing = false;
+    int picker = 0;
+
+    // Menu model (spec 06 §7.1, option list spec 15 §2), for tests/tools.
+    struct OptionInfo {
+        const char* name;
+        uint8_t kind;       // 2 numeric, 3 enum, 5 text, 7 action (spec 06 §7.1)
+        uint8_t store;      // 0 global config, 1 project, 2 none
+        int count;          // picker entries (numeric: max - min + 1)
+        int min;            // numeric minimum (stored value of picker index 0)
+        int displayOffset;  // numeric: shown value = stored + displayOffset
+        const char* help;   // help box text (spec 15 §3.2), nullptr if none
+    };
+    static int categoryCount();
+    static const char* categoryName(int cat);
+    static int optionCount(int cat);
+    static bool optionInfo(int cat, int i, OptionInfo* out);
+    int optionIndex(int cat, int i) const;   // current picker index of the value
+    void optionText(int cat, int i, char* out, int cap) const;
+
+private:
+    void refreshBar();
+    void enter();
+    void apply();
+    void moveCat(int d);
+    void moveOpt(int d);
+    void movePick(int d);
+    bool returnToRecorder();
+    uint32_t lastDev_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Sample playback (spec 05 §2.9 + appendix B)
+class PlaybackScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Sample Playback"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    void padLeds(uint8_t* levels) override;
+    bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
+    // Selected parameter (appendix B §1.5 obj+0xd6): 0 preview/slice,
+    // 1 start/adjust/position, 2 loop start/no of slices/length/window,
+    // 3 loop end/shape, 4 end/zoom (slices)/loop type, 5 zoom, 6 play mode.
+    int sel = 1;
+    bool more = false;          // slice "More" page (obj+0xf0)
+    uint8_t heldPoints = 0;     // held point buttons: 1 start, 2 loop start, 4 loop end, 8 end (obj+0xab2)
+    WaveZoom view;              // spp zoom (appendix B §1.9)
+    AutoSlicer slicer;          // spec 13 §F, stepped from update()
+    int midiNote = -1;          // MIDI note holding the b0 preview voice (spec 17 §1.3 owner 2), -1 none
+    float zoom() const { return view.zoom(); }
+    // Marker-on-crossing bits (spec 13 §H.2, obj+0xab3): same order as heldPoints.
+    uint8_t zeroMask() const;
+    // Slice operations (appendix B §1.10) on the current instrument.
+    void addSlice();
+    void removeSlice();
+    void slicesEvenly();
+    void slicesAuto();
+    void requestSlices(bool autoMode);   // with the overwrite confirmation
+
+private:
+    void refreshBar();
+    void change(int d);
+    void setMode(int m);
+    void movePoint(int which, int d);
+    void keepVisible(uint16_t m, bool force);
+    void sliceDone();
+    void drawModeList(Gfx& g, const Theme& th, int mode) const;
+    int lastInstr_ = -1;
+    int lastMode_ = -1;
+    int sliceInstr_ = -1;       // instrument the detector writes to
+    bool wasBusy_ = false;
+    bool encPushDown_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// Performance (spec 06 §3, spec 12 §A-§E)
+class PerformanceScreen final : public Screen, public PerformanceCcSink {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Performance"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    void padLeds(uint8_t* levels) override;
+    // MIDI CC 41-48 / 51-62 (spec 12 §B.2, §B.3); handled at the next update.
+    void perfTrackPatternCc(uint8_t track, uint8_t value) override;
+    void perfSlotCc(uint8_t slot, uint8_t value) override;
+    void perfBackground(uint32_t now) override;
+    // FX kept live on another screen (spec 16 §A.15).
+    enum class KeepAlive : uint8_t { None, Always, UntilPatternEnd };
+    KeepAlive keepAlive() const { return keepAlive_; }
+
+    bool edit = false;
+    int column = 0;
+    bool fxOn[8] = {true, true, true, true, true, true, true, true};
+    perf::Source src;               // active preset source (spec 12 §A.1)
+    uint8_t sourceIndex = 0;        // 0 global (config), 1 per project
+    int16_t cur[12] = {};           // current value per slot (what is applied)
+    int16_t live[12] = {};          // MIDI-CC live value (row 4)
+    bool liveValid[12] = {};
+    uint8_t shownPattern(int t) const;   // "Patt" label value of track t
+
+private:
+    void refreshBar();
+    void applyAll(bool revertEverything);
+    void revert();
+    void leave();
+    void resetOthers(int slot);
+    void edited();
+    void changeType(int d);
+    void swapColumn(int nc);
+    void play();
+    bool anyTrackKey() const;
+    void trackPatternNow(int t, int num);
+    void trackPatternQueued(int t, int num);
+    bool held_[12] = {};
+    bool keyHeld_[8] = {};
+    bool keyUsed_[8] = {};
+    uint8_t pending_[8] = {};
+    int copySrc_ = -1;
+    bool ccPending_[12] = {};
+    uint8_t ccVal_[12] = {};
+    bool trackCcPending_[8] = {};
+    uint8_t trackCcVal_[8] = {};
+    uint8_t lastPattern_ = 0;
+    uint32_t lastPoll_ = 0, lastLabels_ = 0;
+    bool labelsDirty_ = false;
+    KeepAlive keepAlive_ = KeepAlive::None;
+    uint32_t keepEnds_ = 0;     // App::patternEndCount() when UntilPatternEnd began
+};
+
+// ---------------------------------------------------------------------------
+// Sample editor (spec 06 §6)
+class EditorScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Sample Editor"; }
+    void start(int opt) override;
+    void stop() override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::SampleEditor; }
+    bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
+
+    uint16_t startM = 0, endM = 65535;
+    int focus = 0;          // page 1: 0 start, 1 end, 2 zoom, 3 effect list (spec 06 §6.3)
+    int effect = 0;         // 0..16 (sfx::Effect)
+    int page = 1;           // 1 markers/effect list, 2 effect parameters
+    int paramPage = 0;      // 4-parameter page on page 2
+    int paramFocus = 0;     // parameter index on page 2
+    float params[17][9] = {};
+    bool undoAvail = false;
+    int previewState = 0;   // 0 dirty, 1 processed (spec 06 §6.4 F7)
+    bool previewPlaying = false;
+    bool inert = false;     // MIDI / empty slot, too long, or waiting for the stop prompt
+    WaveZoom view;
+
+    // Run the selected effect on Start..End and commit it (keeps one undo).
+    bool apply();
+    bool undo();
+    bool preview();         // process the selection and play it
+
+private:
+    void enter();
+    void refreshBar();
+    void markerDelta(int which, int d);
+    void paramDelta(int d);
+    bool fits(uint32_t newFrames, uint32_t extraSamples);
+    void stopPreview();
+    void selection(uint32_t* s0, uint32_t* s1) const;
+    uint32_t undoFrames_ = 0;
+    bool undoStereo_ = false;
+    uint8_t slot_ = 0;
+    uint8_t lastInstr_ = 0xFF;
+    int midiNote_ = -1;     // MIDI note that started the running preview (spec 17 §1.3 owner 3)
+};
+
+// ---------------------------------------------------------------------------
+// Sample recorder (spec 05 §2.11 + appendix C §2)
+class RecorderScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Sample Recorder"; }
+    void start(int opt) override;
+    void stop() override;
+    void update(uint32_t now) override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+
+    static constexpr int kUndoLevels = 5;   // appendix C §2.11 "depth counter max 5"
+    int state = 0;          // 0 setup, 1 edit after recording, 2 naming (appendix C §2.3)
+    int sel = 0;            // selected bottom-bar parameter
+    uint16_t startM = 0, endM = 65535;
+    uint32_t off = 0, len = 0;               // current (cropped) view into the capture buffer
+    int undoDepth = 0;
+    int meter = 0;          // 0..100 meter units
+    bool sourceOk = true;
+    char folder[32] = {};
+    char fileName[40] = {};
+    WaveZoom view;
+    int playNote = -1;      // note of the running pad / Preview playback, -1 none
+    uint32_t playFrames = 0;  // frames of that playback (after transposition)
+
+    bool record();          // start (count-in when the metronome is on)
+    void stopRecording();
+    bool crop();
+    bool undoCrop();
+    // Write <folder>/<name>.wav; load = also import into the first free slot.
+    bool save(const char* name, bool load, bool overwrite);
+    // F4 Metronome opened Config; Config returns with switchTo(kModRecorder, kModConfig).
+    bool returnsFromConfig() const { return configReturn_; }
+
+private:
+    void enter();
+    void play(int note);    // selection at `note` (60 = own pitch), appendix C §2.11
+    void playStop();
+    void refreshBar();
+    void setSource(int s);
+    void change(int d);
+    void openNaming(const char* initial);
+    void selection(uint32_t* s0, uint32_t* s1) const;
+    const int16_t* data() const;
+    struct View {
+        uint32_t off, len;
+    } undo_[kUndoLevels] = {};
+    uint32_t lastMeterAt_ = 0, lastDecayAt_ = 0, clipUntil_ = 0;
+    uint32_t lastLen_ = 0;
+    bool seeking_ = false;
+    bool countIn_ = false;
+    bool previewing_ = false;
+    bool recording_ = false;
+    bool configReturn_ = false;   // stock flag +0x71a (appendix C §2.9)
+    int playPad_ = -1;            // pad holding the playback, -1 = b0 Preview, -2 = MIDI note
+    uint8_t lastMidi_ = 48;       // last MIDI instrument used here (stock +0x709)
+};
+
+}  // namespace ot
