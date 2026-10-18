@@ -152,7 +152,7 @@ void headers(Gfx& g, const Theme& th, const Head* h, int n) {
     for (int i = 0; i < n; ++i)
         g.text(50 + 100 * h[i].k, 45, kFont4, th.slot(slot::kTitle), h[i].name, IDisplay::kOptCenter);   // ink y 40..51 [S]
 }
-void bodies(Gfx& g, const Theme& th, const Body* b, int n) {
+void bodies(Gfx& g, const Theme& th, const Ui& ui, const Body* b, int n) {
     const uint32_t c = th.slot(slot::kEmptyPanel + 1);
     // Soft side edges and the blended row 63, the panels (rows 64..424),
     // then the bottom fades.
@@ -168,7 +168,48 @@ void bodies(Gfx& g, const Theme& th, const Body* b, int n) {
     g.rectsBegin(c);
     for (int i = 0; i < n; ++i) g.rectsAdd(b[i].x, 64, b[i].w + 1, 361);
     g.rectsEnd();
-    for (int i = 0; i < n; ++i) wg::bottomFade(g, th, b[i].x, 64, b[i].w, 360, c);
+    // Bottom fades (wg::bottomFade per body: rows 414..425, x .. x + w). A
+    // CMD_GRADIENT costs ~30 RAM_DL words on the FT81x (not the 5 it
+    // uploads), so the bodies (left to right) share one: a vertical
+    // gradient's colour depends on the row only. The gaps between bodies
+    // then get back what they had: the background, the top rows of the
+    // bottom strip (drawn under the screen) and the soft edges of the bodies
+    // next to them (rows 414..424).
+    if (n <= 0 || !th.flag(slot::kFlagBottomFade) || g.lowDetail()) return;
+    const int fy = 64 + 360 - wg::kFadeH, x0 = b[0].x, x1 = b[n - 1].x + b[n - 1].w;
+    if (!g.saveContext(7)) return;   // scissor 2 + CMD_GRADIENT 5
+    g.clip(x0, fy, x1 - x0 + 1, wg::kFadeH + 2);
+    g.gradient(x0, fy, x0, 64 + 360 + 2, c, 0x000000);
+    g.restoreContext();
+    if (n < 2) return;
+    auto gaps = [&](int y, int h) {
+        for (int i = 0; i + 1 < n; ++i) {
+            const int gx = b[i].x + b[i].w + 1;
+            g.rectsAdd(gx, y, b[i + 1].x - gx, h);
+        }
+    };
+    g.rectsBegin(th.bg);
+    gaps(fy, wg::kFadeH + 2);
+    g.rectsEnd();
+    uint32_t strip;
+    if (ui.stripUnder(strip)) {   // wg::bottomStrip inside x 1..798
+        g.alpha(230);
+        g.rectsBegin(strip);
+        gaps(wg::kStripY - 1, 1);
+        g.rectsEnd();
+        g.alpha(255);
+        g.rectsBegin(strip);
+        gaps(wg::kStripY, 1);
+        g.rectsEnd();
+    }
+    g.alpha(wg::kEdgeA);
+    g.rectsBegin(c);
+    for (int i = 0; i + 1 < n; ++i) {
+        g.rectsAdd(b[i].x + b[i].w + 1, fy, 1, 424 - fy + 1);
+        g.rectsAdd(b[i + 1].x - 1, fy, 1, 424 - fy + 1);
+    }
+    g.rectsEnd();
+    g.alpha(255);
 }
 // Bars of bar() above (y 64, h 359) in layers, with its value-0 base lines.
 void bars(Gfx& g, const Theme& th, const wg::ValueBarItem* b, int n) {
@@ -881,7 +922,7 @@ void MixerScreen::draw(Gfx& g) {
             br[2 * t + 1] = wg::ValueBarItem{x + 50, 64, 47, 359, meter[t] / 100.0f, green};
         }
         headers(g, th, hd, 8);
-        bodies(g, th, bd, 16);
+        bodies(g, th, ui_, bd, 16);
         bars(g, th, br, 16);
         // Peak hold (spec 06 §4.4): a 1-px line [I].
         bool hold = false;
@@ -928,7 +969,7 @@ void MixerScreen::draw(Gfx& g) {
         br[nr++] = wg::ValueBarItem{x + 50, 64, 47, 359, float(synthMeter[s]) / 100.0f, green};
     }
     headers(g, th, hd, 4 + kSynthSlotCount);
-    bodies(g, th, bd, nb);
+    bodies(g, th, ui_, bd, nb);
     bars(g, th, br, nr);
     wg::panel(g, th, colX(7), 30, 96, wg::kPanelH - 1);
 }
