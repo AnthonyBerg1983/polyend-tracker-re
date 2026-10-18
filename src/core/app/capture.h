@@ -25,17 +25,14 @@ public:
     int16_t* buffer() const { return buf_; }
     uint32_t capacity() const { return cap_; }
 
-    // Gain 0..100 applied digitally to the input.
-    // SPEC GAP: the hardware gain mapping (appendix C §2.5, 0x56640) is not
-    // recovered; OpenTracker maps 0..100 linearly in dB to -24..+24 dB
-    // (50 = unity), i.e. gainDb = (g - 50) * 0.48.
-    void setGain(uint8_t g);
-    static float gainFactor(uint8_t g);
+    // The recorder gain is analog, in the codec (app/input_gain.h, spec 22
+    // §3); the captured input is not scaled again here.
     // Line-in channel config (0 stereo -> (L+R)/2, 1 left, 2 right).
     void setChannelMode(uint8_t m) { chMode_ = m > 2 ? 0 : m; }
 
     // Metering on/off (recorder screen open).
     void setMetering(bool on) { metering_ = on; }
+    bool metering() const { return metering_; }
     // Peak |x| (0..1) since the previous call (UI meter, appendix C §2.6).
     float takePeak();
 
@@ -67,7 +64,6 @@ private:
     volatile bool full_ = false;
     volatile bool metering_ = false;
     volatile float peak_ = 0.0f;
-    float gain_ = 1.0f;
     uint8_t chMode_ = 0;
     // count-in
     volatile uint32_t countLeft_ = 0;

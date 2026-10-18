@@ -530,6 +530,8 @@ public:
     void perfTrackPatternCc(uint8_t track, uint8_t value) override;
     void perfSlotCc(uint8_t slot, uint8_t value) override;
     void perfBackground(uint32_t now) override;
+    void perfScreenKey(uint8_t id) override;
+    void perfRevertKept() override;
     // FX kept live on another screen (spec 16 §A.15).
     enum class KeepAlive : uint8_t { None, Always, UntilPatternEnd };
     KeepAlive keepAlive() const { return keepAlive_; }
@@ -674,6 +676,7 @@ private:
         uint32_t off, len;
     } undo_[kUndoLevels] = {};
     uint32_t lastMeterAt_ = 0, lastDecayAt_ = 0, clipUntil_ = 0;
+    uint32_t lastRadioCheckAt_ = 0;   // radio source re-route (update)
     uint32_t lastLen_ = 0;
     bool seeking_ = false;
     bool countIn_ = false;

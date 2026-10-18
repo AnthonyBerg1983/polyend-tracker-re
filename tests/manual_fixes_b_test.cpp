@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "test.h"
 #include "ui_fakes.h"
@@ -205,6 +206,94 @@ TEST(perf_stays_live_on_instr_params_and_master) {
     CHECK(p.keepAlive() == PerformanceScreen::KeepAlive::None);
     r.h.tap(btn::Performance);
     CHECK_EQ(p.src.row(1), 0);   // fresh entry
+}
+
+// Spec 16 §A.15: the stock handler runs on every screen key while the FX are
+// live. From Instrument Params (kept indefinitely) a key to another screen
+// reverts at once when stopped, and keeps them to the pattern end when playing.
+TEST(perf_screen_key_from_instr_params_reverts_like_stock) {
+    PerfRig r;
+    App& a = *r.h.app;
+    r.h.tap(btn::Performance);
+    r.h.pad(24 + 1);
+    r.h.tap(btn::InstrParams);
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::Always);
+    r.h.tap(btn::Master);   // Instrument Params / Master keep them
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::Always);
+    r.h.tap(btn::File);   // stopped: immediate revert
+    CHECK(a.ui.active() == kModFile);
+    CHECK(!a.seq.performanceMode());
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::None);
+    // Playing: until the pattern end.
+    r.h.tap(btn::Performance);
+    r.h.pad(24 + 1);
+    r.h.tap(btn::InstrParams);
+    r.h.tap(btn::Play);
+    CHECK(a.seq.isPlaying());
+    r.h.tap(btn::Pattern);
+    CHECK(a.seq.performanceMode());
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::UntilPatternEnd);
+    a.seq.stop();
+    r.h.run(5);
+    CHECK(!a.seq.performanceMode());
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::None);
+}
+
+// Exports run with the Performance FX reverted: kept live on Instrument
+// Params (stopped) or to the pattern end on another screen (playing), the
+// export equals the export made without them.
+TEST(perf_export_while_fx_alive_equals_baseline) {
+    PerfRig r;
+    App& a = *r.h.app;
+    {
+        std::vector<int16_t> smp(3000);
+        for (uint32_t i = 0; i < smp.size(); ++i) smp[i] = int16_t((i % 100) * 300 - 15000);
+        std::vector<uint8_t> w(smp.size() * 2 + 64);
+        w.resize(wavEncode(smp.data(), uint32_t(smp.size()), 1, w.data(), w.size()));
+        r.h.fs.files["click.wav"] = w;
+    }
+    CHECK(a.importSample("click.wav", 0));
+    for (int s = 0; s < 16; s += 4) {
+        a.pattern().tracks[0].steps[s].note = 60;
+        a.pattern().tracks[0].steps[s].instrument = 0;
+    }
+    a.patternEdited();
+    auto exportBytes = [&]() {
+        char p[160];
+        CHECK(a.exportName(App::ExportKind::Pattern, p, sizeof(p)));
+        CHECK(a.exportAudio(App::ExportKind::Pattern, p));
+        return r.h.fs.files[p];
+    };
+    exportBytes();   // warm-up: the first export after boot starts from the live engine state
+    const std::vector<uint8_t> base = exportBytes();
+    CHECK(base.size() > 44100);
+    CHECK(exportBytes() == base);   // the export itself is repeatable (after the warm-up)
+    int loud = 0;
+    for (size_t i = 44; i + 1 < base.size(); i += 2) loud += std::abs(int16_t(base[i] | (base[i + 1] << 8))) > 1000;
+    CHECK(loud > 100);
+    auto liveVolume = [&]() {
+        r.h.tap(btn::Performance);
+        PerformanceScreen& p = r.p();
+        p.src.setType(0, perf::kVolume);
+        p.src.setValue(0, 1, -80);
+        r.h.pad(12 + 0);
+        CHECK_EQ(p.src.row(0), 1);
+        CHECK(a.engine.voice(0).perf().volume != 0);
+    };
+    // Kept indefinitely on Instrument Params, stopped.
+    liveVolume();
+    r.h.tap(btn::InstrParams);
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::Always);
+    CHECK(exportBytes() == base);
+    CHECK(!a.seq.performanceMode());
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::None);
+    // Kept to the pattern end on another screen while playing.
+    liveVolume();
+    r.h.tap(btn::Play);
+    r.h.tap(btn::Pattern);
+    CHECK(r.p().keepAlive() == PerformanceScreen::KeepAlive::UntilPatternEnd);
+    CHECK(exportBytes() == base);
+    CHECK(!a.seq.performanceMode());
 }
 
 // Spec 16 §A.15: playing, another screen keeps the FX until the pattern ends.

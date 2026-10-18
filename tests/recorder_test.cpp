@@ -1,11 +1,15 @@
 // Sample Recorder (spec 05 §2.11, appendix C §2; spec 02 §8.3): input tap,
 // sources, gain, meter, count-in, record/stop, auto-trim, crop + undo,
 // naming / folders, save and save & load.
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <vector>
 
 #include "test.h"
 #include "ui_fakes.h"
 
+#include "app/input_gain.h"
 #include "formats/wav.h"
 #include "ui/screens.h"
 
@@ -95,8 +99,15 @@ TEST(recorder_autotrim_unit) {
     CHECK_EQ(meterUnits(0.0f), 0);
     CHECK(meterUnits(0.5f) > 70 && meterUnits(0.5f) < 85);
     CHECK(meterUnits(0.9f) > 85 && meterUnits(0.9f) < 100);
-    CHECK_NEAR(Capture::gainFactor(50), 1.0, 1e-6);
-    CHECK(Capture::gainFactor(100) > 15.0f && Capture::gainFactor(0) < 0.07f);
+    // spec 22 §3: the gain is analog (codec level), stock integer scale.
+    CHECK_EQ(input_gain::lineLevel(0), 0);
+    CHECK_EQ(input_gain::lineLevel(50), 7);
+    CHECK_EQ(input_gain::lineLevel(100), 15);
+    CHECK_EQ(input_gain::lineLevel(7), 1);
+    CHECK_EQ(input_gain::micDb(2, 50), 12);
+    CHECK_EQ(input_gain::micDb(2, 100), 25);
+    CHECK_EQ(input_gain::micDb(3, 50), 22);
+    CHECK_EQ(input_gain::micDb(3, 100), 44);
 }
 
 TEST(recorder_save_and_load) {
@@ -346,4 +357,73 @@ TEST(recorder_midi_notes_play_chromatically) {
     send(0x90, 60, 0);   // velocity-0 note-on = note-off
     CHECK(!a.engine.previewBufferActive());
     CHECK_EQ(r.playNote, -1);
+}
+
+// ---- Radio source (spec 01 §5.4-§5.6, spec 05 appendix C §2.4/§2.8) ---------
+
+namespace {
+struct FakeTuner final : IRadio {
+    float lo = 0, hi = 0, step = 0, freq = 87.5f;
+    int tunes = 0;
+    void setBand(float a, float b, float s) override { lo = a; hi = b; step = s; }
+    bool tune(float mhz) override { freq = mhz; ++tunes; return true; }
+    bool seek(bool) override { return true; }
+    bool busy() const override { return false; }
+    float frequency() const override { return freq; }
+};
+struct FakeRouting {
+    int calls = 0, last = -1;
+    std::vector<int> sources;
+    static bool fn(void* c, uint8_t src, uint8_t) {
+        auto* r = static_cast<FakeRouting*>(c);
+        ++r->calls;
+        r->last = src;
+        r->sources.push_back(src);
+        return true;
+    }
+};
+}  // namespace
+
+TEST(recorder_radio_source_powers_tuner_routes_input_and_records) {
+    Harness h;
+    App& a = *h.app;
+    FakeTuner tuner;
+    FakeRouting route;
+    a.setInputRouting(&FakeRouting::fn, &route, &tuner);
+    h.run(20);   // project recorder settings -> working copies
+    a.cfg.radioFreq10 = 1011;
+    h.run(20);   // -> project 0x13C (spec 02 §3.3)
+    CHECK_EQ(a.cfg.radioFreq10, 1011);
+    toneBlocks(h, 0, 1u << 30);
+    h.tap(btn::SampleRecorder);
+    RecorderScreen& r = rec(h);
+    CHECK_EQ(route.last, 0);   // line in first
+    // b0: Radio -> the HAL routes source 1 (tuner on, codec LINE input), the
+    // screen sets the region band and tunes the stored frequency.
+    h.tap(btn::F1);
+    CHECK_EQ(a.cfg.recSource, 1);
+    CHECK_EQ(route.last, 1);
+    CHECK(r.sourceOk);
+    CHECK_STR(a.ui.bar.label[0].bottom, "Radio");
+    CHECK_NEAR(tuner.lo, 87.5, 1e-6);
+    CHECK_NEAR(tuner.freq, 101.1, 1e-4);
+    CHECK(tuner.tunes >= 1);
+    // The tuner's audio arrives as the line input: meter and capture follow it.
+    h.audio.pump(20);
+    h.run(400);
+    CHECK(r.meter > 0);
+    recordSome(h, 40);
+    CHECK(a.capture.length() > 0);
+    int peak = 0;
+    for (uint32_t i = 0; i < a.capture.length(); ++i) peak = std::max(peak, std::abs(int(a.capture.buffer()[i])));
+    CHECK(peak > 1000);
+    // While Radio stays the source the screen re-routes it about once a second
+    // (the HAL re-powers a tuner that dropped out after an I2C failure).
+    const int before = route.calls;
+    h.run(2100);
+    CHECK(route.calls >= before + 2);
+    CHECK_EQ(route.last, 1);
+    // Leaving the recorder routes the line input again (tuner off).
+    h.tap(btn::Pattern);
+    CHECK_EQ(route.last, 0);
 }

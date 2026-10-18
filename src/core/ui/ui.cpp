@@ -822,6 +822,7 @@ void Ui::dispatchButton(uint8_t id, uint8_t state) {
         // while it is down (manual: Hold Master/Song + Jog from any page).
         if (state == kPress) {
             songTemporary_ = false;
+            if (app.perfCc && active_ != kModPerformance) app.perfCc->perfScreenKey(id);   // spec 16 §A.15
             switchTo(m, 0);
             if (routesEnteringKey(id) && current() && current()->ownsModuleKey(id)) {
                 enterKey_ = id;

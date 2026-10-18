@@ -14,6 +14,7 @@
 #include "hw_math.h"
 #include "i2c_bus.h"
 #include "k66.h"
+#include "rx_watch.h"
 
 namespace ot {
 namespace hal {
@@ -34,7 +35,17 @@ int16_t rxBuf[2 * kFrames * 2] __attribute__((aligned(32)));
 int16_t rxCopy[kFrames * 2];
 DMAChannel rxDma(false);
 volatile int8_t gRxHalf = -1;            // last completed RX half, -1 = none yet
+// Raw RX peak for the recorder diagnostics (setRxPeak / takeRxPeak).
+volatile bool gRxPeakOn = false;
+volatile int32_t gRxPeakL = 0, gRxPeakR = 0;
+volatile uint32_t gRxPeakBlocks = 0;
 volatile uint32_t gRxBlocks = 0;
+// RX liveness (spec 22 §7 row 21): a halted receiver must not keep handing the
+// app the same block; serviceRx() restarts it.
+RxWatch gRxWatch;
+volatile bool gRxStarted = false;
+uint32_t gRxLastRecoverMs = 0;
+constexpr uint32_t kRcsrFef = 1u << 18;   // K66 RM SAI RCSR[FEF] (w1c)
 volatile IAudioOut::FillFn gFill = nullptr;
 void* volatile gCtx = nullptr;
 volatile bool gRunning = false;
@@ -115,10 +126,9 @@ void i2sConfig() {
     pcr(board::kI2sRxd0) = board::kI2sPcr;
 }
 
-void rxDmaStart() {
-    memset(rxBuf, 0, sizeof(rxBuf));
-    rxDma.begin(true);
-    // spec 01 §5.3 RX column: SADDR RDR0+2, SOFF 0, 16-bit, DOFF 2, DLAST -1024.
+// spec 01 §5.3 RX column: SADDR RDR0+2, SOFF 0, 16-bit, DOFF 2, DLAST -1024.
+// Used by the bring-up and by the stall recovery (same channel, no re-begin).
+void rxDmaProgram() {
     rxDma.TCD->SADDR = reinterpret_cast<volatile uint8_t*>(&I2S0_RDR0) + 2;
     rxDma.TCD->SOFF = 0;
     rxDma.TCD->ATTR = DMA_TCD_ATTR_SSIZE(1) | DMA_TCD_ATTR_DSIZE(1);
@@ -130,6 +140,12 @@ void rxDmaStart() {
     rxDma.TCD->DLASTSGA = -int32_t(sizeof(rxBuf));
     rxDma.TCD->BITER_ELINKNO = sizeof(rxBuf) / 2;
     rxDma.TCD->CSR = DMA_TCD_CSR_INTHALF | DMA_TCD_CSR_INTMAJOR;
+}
+
+void rxDmaStart() {
+    memset(rxBuf, 0, sizeof(rxBuf));
+    rxDma.begin(true);
+    rxDmaProgram();
     rxDma.triggerAtHardwareEvent(DMAMUX_SOURCE_I2S0_RX);   // src 12 (spec 01 §5.3)
     rxDma.attachInterrupt(rxIsr, board::kDmaPrioAudioRx);
     rxDma.enable();
@@ -137,6 +153,26 @@ void rxDmaStart() {
     // the transmitter (RCR2 SYNC=1), so it starts clocking when TE is set below
     // (K66 RM I2S "Synchronous mode": enable the receiver first).
     I2S0_RCSR = I2S_RCSR_RE | I2S_RCSR_BCE | I2S_RCSR_FR | I2S_RCSR_FRDE;
+    gRxStarted = true;
+}
+
+// Restart a halted receiver (serviceRx): stop it, re-arm the same RX DMA
+// channel as the bring-up does, reset the FIFO, clear the error flags, enable
+// again. TX keeps running; the receiver is synchronous to it (RCR2 SYNC=1).
+void rxRestart() {
+    I2S0_RCSR = (I2S0_RCSR & ~(I2S_RCSR_RE | I2S_RCSR_FRDE)) & ~(kRcsrFef | I2S_RCSR_SEF | I2S_RCSR_WSF);
+    // K66 RM SAI: RE reads 1 until the end of the current frame (22.7 us).
+    for (uint32_t t = micros(); (I2S0_RCSR & I2S_RCSR_RE) && micros() - t < 1000;) {}
+    rxDma.disable();
+    rxDma.clearInterrupt();
+    DMA_CERR = rxDma.channel;
+    rxDmaProgram();
+    __disable_irq();
+    gRxHalf = -1;
+    __enable_irq();
+    rxDma.enable();
+    I2S0_RCSR = I2S_RCSR_FR | kRcsrFef | I2S_RCSR_SEF | I2S_RCSR_WSF;   // FIFO reset, flags cleared (w1c)
+    I2S0_RCSR = I2S_RCSR_RE | I2S_RCSR_BCE | I2S_RCSR_FRDE;
 }
 
 // Field diagnostics (first hardware boot: codec NAK, no TX DMA interrupts). Logs the
@@ -344,20 +380,13 @@ void Sgtl5000Audio::setHeadphoneVolume(float v) {
     }
 }
 
-bool Sgtl5000Audio::selectLineIn(uint8_t level) {
+bool Sgtl5000Audio::lineInLevel(uint8_t level) {
+    // lineInLevel(l, r): CHIP_ANA_ADC_CTRL = (l << 4) | r, each <= 15 (spec 01 §5.1).
     if (level > 15) level = 15;
-    uint16_t ana = 0;
-    if (!codecRead(0x0024, ana)) return false;
-    // lineInLevel(l, r): CHIP_ANA_ADC_CTRL = (l << 4) | r (spec 01 §5.1).
-    bool ok = codecWrite(0x0020, uint16_t((level << 4) | level));
-    // OpenTracker: mic bias off while the mic is not selected (stock leaves
-    // MIC_CTRL untouched by inputSelect).
-    ok = codecWrite(0x002A, 0x0000) && ok;
-    // inputSelect(0): CHIP_ANA_CTRL bit 2 SELECT_ADC = 1 (LINEIN).
-    return codecWrite(0x0024, uint16_t(ana | 0x0004)) && ok;
+    return codecWrite(0x0020, uint16_t((level << 4) | level));
 }
 
-bool Sgtl5000Audio::selectMic(uint8_t gainDb) {
+bool Sgtl5000Audio::micGain(uint8_t gainDb) {
     // micGain(dB) (spec 01 §5.1): MIC_CTRL 0x173/0x172/0x171/0x170 for >= 40/30/20/<20
     // dB (bias resistor 2k, bias 3.0 V, preamp 40/30/20/0 dB), the remainder in
     // 1.5 dB ADC steps: g = min(2n/3, 15), CHIP_ANA_ADC_CTRL = g | g << 4.
@@ -368,22 +397,86 @@ bool Sgtl5000Audio::selectMic(uint8_t gainDb) {
     else if (n >= 20) { mic = 0x171; n -= 20; }
     uint32_t g = 2 * n / 3;
     if (g > 15) g = 15;
+    bool ok = codecWrite(0x002A, mic);
+    return codecWrite(0x0020, uint16_t(g | (g << 4))) && ok;
+}
+
+bool Sgtl5000Audio::selectLineIn(uint8_t level) {
+    // spec 22 §3: inputSelect(0), then the gain call (lineInLevel). MIC_CTRL
+    // is left as it is, as stock.
     uint16_t ana = 0;
     if (!codecRead(0x0024, ana)) return false;
-    bool ok = codecWrite(0x002A, mic);
-    ok = codecWrite(0x0020, uint16_t(g | (g << 4))) && ok;
-    // inputSelect(1): SELECT_ADC = 0 (MIC).
-    return codecWrite(0x0024, uint16_t(ana & ~0x0004)) && ok;
+    // inputSelect(0): CHIP_ANA_CTRL bit 2 SELECT_ADC = 1 (LINEIN).
+    bool ok = codecWrite(0x0024, uint16_t(ana | 0x0004));
+    return lineInLevel(level) && ok;
+}
+
+bool Sgtl5000Audio::selectMic(uint8_t gainDb) {
+    uint16_t ana = 0;
+    if (!codecRead(0x0024, ana)) return false;
+    // inputSelect(1): SELECT_ADC = 0 (MIC), then the gain call (micGain).
+    bool ok = codecWrite(0x0024, uint16_t(ana & ~0x0004));
+    return micGain(gainDb) && ok;
 }
 
 const int16_t* Sgtl5000Audio::lineInBlock(void*) {
-    const int8_t h = gRxHalf;
-    if (h < 0) return nullptr;
-    memcpy(rxCopy, rxBuf + h * int(kFrames * 2), sizeof(rxCopy));
+    // A halted receiver (FEF, or no new RX block for a few blocks) gives no
+    // block at all instead of the last one again (rx_watch.h).
+    const int16_t* src = gRxWatch.pick(gRxBlocks, (I2S0_RCSR & kRcsrFef) != 0, gRxHalf, rxBuf, kFrames * 2);
+    if (!src) return nullptr;
+    memcpy(rxCopy, src, sizeof(rxCopy));
+    if (gRxPeakOn) {
+        int32_t pl = gRxPeakL, pr = gRxPeakR;
+        for (uint32_t i = 0; i < kFrames; ++i) {
+            const int32_t l = rxCopy[2 * i] < 0 ? -int32_t(rxCopy[2 * i]) : rxCopy[2 * i];
+            const int32_t r = rxCopy[2 * i + 1] < 0 ? -int32_t(rxCopy[2 * i + 1]) : rxCopy[2 * i + 1];
+            if (l > pl) pl = l;
+            if (r > pr) pr = r;
+        }
+        gRxPeakL = pl;
+        gRxPeakR = pr;
+        gRxPeakBlocks = gRxPeakBlocks + 1;
+    }
     return rxCopy;
 }
 
+void Sgtl5000Audio::setRxPeak(bool on) { gRxPeakOn = on; }
+
+void Sgtl5000Audio::takeRxPeak(int& peakL, int& peakR, uint32_t& blocks) {
+    __disable_irq();
+    peakL = int(gRxPeakL);
+    peakR = int(gRxPeakR);
+    blocks = gRxPeakBlocks;
+    gRxPeakL = gRxPeakR = 0;
+    gRxPeakBlocks = 0;
+    __enable_irq();
+}
+
 uint32_t Sgtl5000Audio::rxBlocks() const { return gRxBlocks; }
+
+uint32_t Sgtl5000Audio::rxRecoveries() { return gRxWatch.recoveries(); }
+uint32_t Sgtl5000Audio::rxStaleBlocks() { return gRxWatch.staleBlocks(); }
+uint32_t Sgtl5000Audio::rxStatus() { return I2S0_RCSR; }
+
+void Sgtl5000Audio::serviceRx() {
+    if (!gRxStarted || !gRxWatch.needsRecovery()) return;
+    const uint32_t now = millis();
+    if (now - gRxLastRecoverMs < 100) return;   // at most 10 restarts per second
+    gRxLastRecoverMs = now;
+    const uint32_t rcsr = I2S0_RCSR, blocks = gRxBlocks;
+    const bool fef = gRxWatch.stallWasFifoError();
+    rxRestart();
+    __disable_irq();
+    gRxWatch.recovered(gRxBlocks);
+    __enable_irq();
+    const uint32_t n = gRxWatch.recoveries();
+    if (n <= 10 || n % 100 == 0)
+        diagLogf("audio: I2S RX halted (%s, RCSR 0x%08lX, rx blocks %lu, stale blocks %lu) -> receiver "
+                 "restarted, RCSR 0x%08lX (restart #%lu)",
+                 fef ? "FIFO error" : "no new blocks", static_cast<unsigned long>(rcsr),
+                 static_cast<unsigned long>(blocks), static_cast<unsigned long>(gRxWatch.staleBlocks()),
+                 static_cast<unsigned long>(I2S0_RCSR), static_cast<unsigned long>(n));
+}
 
 void Sgtl5000Audio::powerDown() {
     digitalWriteFast(board::kTeensyMute, LOW);

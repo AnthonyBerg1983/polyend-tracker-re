@@ -11,7 +11,6 @@ namespace ot {
 bool App::selectInput(uint8_t source, uint8_t gain) {
     if (source > 3) return false;
     if (source == 1 && !hal_.radio) return false;   // radio: needs a tuner driver
-    capture.setGain(gain);
     capture.setChannelMode(cfg.lineInChannel);
     if (hal_.selectInput) return hal_.selectInput(hal_.inputCtx, source, gain);
     return source == 0;   // without a routing hook only the line input exists

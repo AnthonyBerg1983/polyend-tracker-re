@@ -703,7 +703,7 @@ void Voice::renderPlayer(float* out, uint32_t n) {
     const bool fast = useWin && aa_ && glideLeft_ == 0;
     // Produces samples while pos < lim (pos + 1 is then the neighbour).
     auto fastRun = [&](uint32_t& i, int32_t lim) {
-        if (uint32_t(pos) - wb + 1u >= uint32_t(kWin)) fill(pos);
+        if (uint32_t(pos) - wb >= uint32_t(kWin) - 1u) fill(pos);   // also pos == wb - 1 (loop wrap)
         // Each step advances pos by at most si + 1: k steps stay below stop.
         const int32_t wend = int32_t(wb) + kWin - 1;
         const int32_t stop = lim < wend ? lim : wend;

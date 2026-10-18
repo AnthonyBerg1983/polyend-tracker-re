@@ -38,6 +38,11 @@ public:
     // Main-loop tick while another screen is shown: the Performance FX may
     // stay live there (spec 16 §A.15).
     virtual void perfBackground(uint32_t now) { (void)now; }
+    // A screen key pressed while another screen is shown (spec 16 §A.15: the
+    // stock handler is bound to every screen key while perf mode is on).
+    virtual void perfScreenKey(uint8_t id) { (void)id; }
+    // Offline render: FX kept live on another screen are reverted first.
+    virtual void perfRevertKept() {}
 };
 
 namespace midicc {

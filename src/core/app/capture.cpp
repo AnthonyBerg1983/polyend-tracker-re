@@ -11,13 +11,6 @@ void Capture::setBuffer(int16_t* buf, uint32_t capacityFrames) {
     cap_ = buf ? capacityFrames : 0;
 }
 
-float Capture::gainFactor(uint8_t g) {
-    if (g > 100) g = 100;
-    return std::pow(10.0f, (float(g) - 50.0f) * 0.48f / 20.0f);
-}
-
-void Capture::setGain(uint8_t g) { gain_ = gainFactor(g); }
-
 float Capture::takePeak() {
     const float p = peak_;
     peak_ = 0.0f;
@@ -57,7 +50,6 @@ void Capture::process(const int16_t* in, uint32_t frames, audio::AudioEngine* en
         if (in) {
             const float l = float(in[2 * i]), r = float(in[2 * i + 1]);
             x = chMode_ == 1 ? l : (chMode_ == 2 ? r : 0.5f * (l + r));
-            x *= gain_;
         }
         if (x > 32767.0f) x = 32767.0f;
         if (x < -32768.0f) x = -32768.0f;

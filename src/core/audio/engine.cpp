@@ -389,7 +389,9 @@ void AudioEngine::updateParams() {
     master_.set(trkGain(m.masterVolume));
     click_.set(sendGain(m.metronomeVolume));   // OUT input 5 (spec 07 Q10)
     const float lineLevel = m.lineInMute ? 0.0f : trkGain(m.lineInLevel);
-    lineLvl_.set(lineLevel);
+    // Recorder monitor: MSUM line-in gain = table[0x56] = 1.0 (spec 22 §5).
+    // The line sends keep the Global Mixer level (stock writes only MSUM).
+    lineLvl_.set(lineMonitor_ ? 1.0f : lineLevel);
     auto lineSend = [&](uint8_t v) {
         float g = 0.5f * trkGain(v);
         if (m.postFaderSends) g *= lineLevel;
@@ -493,6 +495,16 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
                 lineR_[i] = ch == 1 ? l : r;
             }
             line = true;
+            if (lineMonitor_) {   // Recorder monitor diag: mixed peak
+                float pk = 0.0f;
+                for (uint32_t i = 0; i < kBlock; ++i) {
+                    const float a = std::fabs(lineL_[i]), b = std::fabs(lineR_[i]);
+                    pk = a > pk ? a : pk;
+                    pk = b > pk ? b : pk;
+                }
+                pk *= lineLvl_.target;
+                if (pk > lineMonPeak_) lineMonPeak_ = pk;
+            }
         }
         lineIn_ = nullptr;   // consumed
     }

@@ -122,6 +122,33 @@ void PerformanceScreen::perfBackground(uint32_t now) {
     }
 }
 
+// spec 16 §A.15: the stock screen-key handler runs on every screen key while
+// the FX are live, not only when leaving the Performance screen. From
+// Instrument Params / Master: Instrument Params or Master keep them;
+// the Performance key comes back and resumes; any other screen key reverts
+// at once when stopped, and while playing
+// keeps them until the next pattern end (or Stop).
+void PerformanceScreen::perfScreenKey(uint8_t id) {
+    if (keepAlive_ != KeepAlive::Always || id == btn::InstrParams || id == btn::Master || id == btn::Performance) return;
+    App& a = app_;
+    if (a.seq.isPlaying()) {
+        keepAlive_ = KeepAlive::UntilPatternEnd;
+        keepEnds_ = a.patternEndCount();
+    } else {
+        keepAlive_ = KeepAlive::None;
+        revert();
+    }
+}
+
+// Exports and renders run without Performance FX: stock reverts them on any
+// other screen while stopped (spec 16 §A.15), and a render always stops the
+// transport first.
+void PerformanceScreen::perfRevertKept() {
+    if (keepAlive_ == KeepAlive::None) return;
+    keepAlive_ = KeepAlive::None;
+    revert();
+}
+
 void PerformanceScreen::revert() {
     // spec 12 §C.4: full revert, perf mode off, overrides dropped (the
     // sequencer plays the current pattern again).

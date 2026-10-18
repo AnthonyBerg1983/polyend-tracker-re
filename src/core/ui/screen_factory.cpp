@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "app/input_gain.h"
 #include "ui/gfx.h"
 #include "ui/ui.h"
 
@@ -232,7 +233,10 @@ void FactoryTest::audioStep(uint32_t now) {
         }
         ++audioPhase_;
         if (audioPhase_ < 2) {
-            const bool routed = a.selectInput(kSource[audioPhase_], 50);
+            // spec 01 §5.5 factory levels: line in at level 15, mic 20 dB.
+            const bool routed = a.selectInput(kSource[audioPhase_], kSource[audioPhase_] == 0
+                                                                        ? input_gain::kFactoryLineGain
+                                                                        : input_gain::kFactoryMicGain);
             if (!routed) {
                 audioOk_[audioPhase_] = false;
                 audioAt_ = now;

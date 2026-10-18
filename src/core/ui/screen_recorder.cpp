@@ -640,6 +640,13 @@ void RecorderScreen::update(uint32_t now) {
             ui_.dirty();
         }
     }
+    // Radio source: re-route about once a second. The HAL answers from its
+    // cache while the tuner runs; after an I2C failure dropped it (radio_si4703
+    // fail()) this powers it up again and it re-tunes to the last frequency.
+    if (a.cfg.recSource == 1 && sourceOk && !seeking_ && now - lastRadioCheckAt_ >= 1000) {
+        lastRadioCheckAt_ = now;
+        a.selectInput(1, a.cfg.recGain[1]);
+    }
     // Meter (appendix C §2.6): level every ~10 frames, peak hold falls 1 unit / 500 ms.
     if (now - lastMeterAt_ >= 160) {
         lastMeterAt_ = now;

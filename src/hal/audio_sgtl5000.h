@@ -24,17 +24,30 @@ public:
     void powerDown();                        // spec 01 §5.1 shutdown: ANA_POWER = 0
 
     // spec 01 §5.1 wrapper inputSelect/lineInLevel/micGain. ADC from the line
-    // input at `level` (0..15, CHIP_ANA_ADC_CTRL both channels), mic bias off.
+    // input at `level` (0..15, CHIP_ANA_ADC_CTRL both channels).
     bool selectLineIn(uint8_t level);
     // ADC from the mic input with bias on and `gainDb` split into the MIC_CTRL
     // preamp step + ADC analog gain (spec 01 §5.1 micGain).
     bool selectMic(uint8_t gainDb);
+    // The gain calls alone (spec 22 §3 0x56640, on a recorder gain change).
+    bool lineInLevel(uint8_t level);
+    bool micGain(uint8_t gainDb);
 
     // Line input (I2S RX, spec 01 §5.3): the most recently completed 128-frame
     // block, interleaved L/R int16, copied into a stable buffer. Call from the
     // audio TX callback context (HalRefs::lineIn); nullptr before the first block.
     static const int16_t* lineInBlock(void* ctx);
     uint32_t rxBlocks() const;
+    // RX liveness (rx_watch.h): main loop; restarts a halted receiver and logs it.
+    static void serviceRx();
+    static uint32_t rxRecoveries();    // receiver restarts since boot
+    static uint32_t rxStaleBlocks();   // audio blocks given no input while halted
+    static uint32_t rxStatus();        // I2S0_RCSR
+    // Diagnostics (board.cpp inputDiag): while enabled, lineInBlock() also
+    // tracks the peak |sample| per channel of the raw RX data (before any app
+    // gain); takeRxPeak() returns it and the number of blocks seen, then resets.
+    static void setRxPeak(bool on);
+    static void takeRxPeak(int& peakL, int& peakR, uint32_t& blocks);
 
     uint32_t blocksRendered() const;
     // CPU cycles (DWT, 180 MHz) per 128-frame render callback since start; the

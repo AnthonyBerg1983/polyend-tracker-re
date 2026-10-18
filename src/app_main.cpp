@@ -146,9 +146,47 @@ int bootChecks(ot::FactoryCheck* out, int cap) {
     return n;
 }
 
+// Recorder input diagnostics (docs/HARDWARE_TESTING.md "Recorder input"):
+// once a second while the Sample Recorder is open (capture metering on), one
+// HAL "input:" line (raw I2S RX peak, codec ADC routing, radio switch, Si4703
+// status) and one app "recorder:" line (source, gain, monitor, capture state
+// and the peak of the last recorded 0.1 s), so a device log shows where a
+// signal stops.
+void recorderInputDiag(uint32_t nowMs) {
+    static bool on = false;
+    static uint32_t last = 0;
+    const bool open = gApp.capture.metering();
+    if (open != on) {
+        on = open;
+        ot::hal::inputDiagEnable(open);
+        last = nowMs;
+        if (!open) return;
+    }
+    if (!open || nowMs - last < 1000) return;
+    last = nowMs;
+    ot::hal::inputDiagLog();
+    const ot::Capture& c = gApp.capture;
+    const uint32_t len = c.length();
+    int peak = 0;
+    if (c.buffer()) {
+        const uint32_t n = len < 4410 ? len : 4410;
+        for (uint32_t i = len - n; i < len; ++i) {
+            const int v = c.buffer()[i] < 0 ? -int(c.buffer()[i]) : int(c.buffer()[i]);
+            if (v > peak) peak = v;
+        }
+    }
+    const uint8_t src = gApp.cfg.recSource > 3 ? 0 : gApp.cfg.recSource;
+    ot::hal::diagLogf("recorder: source %u gain %u monitor %u (muted %d) line ch %u | capture state %u len %lu "
+                      "full %d, last 0.1 s peak %d | monitor mix peak %d",
+                      unsigned(src), unsigned(gApp.cfg.recGain[src]), unsigned(gApp.cfg.recMonitor),
+                      int(gApp.inputMonitorMuted), unsigned(gApp.cfg.lineInChannel), unsigned(c.state()),
+                      static_cast<unsigned long>(len), int(c.full()), peak, gApp.engine.takeLineMonitorPeak());
+}
+
 void telemetryTick() {
     const ot::IClock& clock = *ot::hal::halSet().clock;
     gTelemetry.loopMark(clock.micros());
+    recorderInputDiag(clock.millis());
     pollRenderCycles(clock.millis());
     if (!gTelemetry.due(clock.millis())) return;
     ot::diag::TelemetrySample s;

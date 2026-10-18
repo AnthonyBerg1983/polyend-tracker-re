@@ -33,7 +33,7 @@ constexpr uint32_t kRecGainLine = 0x135;       // 0..100
 constexpr uint32_t kRecGainMicLow = 0x136;
 constexpr uint32_t kRecGainMicHigh = 0x137;
 constexpr uint32_t kRecGainRadio = 0x138;
-constexpr uint32_t kRecMonitor = 0x139;        // 0 off, 1 on
+constexpr uint32_t kRecMonitor = 0x139;        // 0 on, 1 off (spec 22 §5)
 constexpr uint32_t kRadioFreq = 0x13C;         // f32 MHz
 // Performance (spec 12 §A.2, §A.4): per-track patterns and the per-project
 // preset source.

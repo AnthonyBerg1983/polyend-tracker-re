@@ -200,6 +200,13 @@ public:
     bool saveConfig();                            // INvStore, else kConfigPath
     void loadConfig();                            // boot: EEPROM, else import the file once
     void setNvStore(INvStore* nv) { hal_.nvstore = nv; }
+    // Recorder input routing + tuner after init (host tests; the device glue
+    // passes them in HalRefs).
+    void setInputRouting(bool (*fn)(void*, uint8_t, uint8_t), void* ctx, IRadio* r) {
+        hal_.selectInput = fn;
+        hal_.inputCtx = ctx;
+        hal_.radio = r;
+    }
     // Recorder settings live in the project (0x134..0x13C, spec 02 §3.3);
     // cfg.rec* are the working copies. Called every loop pass.
     void syncRecorderSettings();

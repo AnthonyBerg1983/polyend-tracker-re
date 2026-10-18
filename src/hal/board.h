@@ -103,12 +103,7 @@ constexpr uint8_t kTeensyMute = 21;          // spec 01 §5.4: PTD6, LOW = muted
 constexpr uint8_t kTeensyRadioSwitch = 24;   // spec 01 §5.4: PTE26, HIGH = radio off. UNVERIFIED [I]
 constexpr Pin kPinRadioReset = {PE, 27};     // spec 01 §5.6: Si4703 RST_N (Teensy #67, board-specific)
 constexpr Pin kPinRadioInt   = {PE, 28};     // spec 01 §5.6: Si4703 GPIO2 (Teensy #68); not used (polled)
-// spec 01 §5.5 factory-test input levels; spec 05 §1.x config defaults 0x0f/0x0f.
-// UNVERIFIED [I]: the normal-operation levels are not recorded (spec 01 §12 item 9).
-constexpr uint8_t kLineInLevel = 15;         // CHIP_ANA_ADC_CTRL nibble (0..15, 1.5 dB steps)
-constexpr uint8_t kRadioInLevel = 15;        // radio enters through the line input
-constexpr uint8_t kMicLowGainDb = 20;        // spec 01 §5.5 factory mic test
-constexpr uint8_t kMicHighGainDb = 40;       // UNVERIFIED [I]: "high gain" = MIC_CTRL 40 dB step
+// Recorder input levels: per-source gain, stock scale (core app/input_gain.h, spec 22 §3).
 constexpr uint8_t kDmaPrioAudioRx = 0x40;    // spec 01 §5.3 RX ISR priority
 constexpr uint32_t kI2sPcr = 0x400;          // spec 01 §3.2 (ALT4) for PTE6/7/10/11/12
 constexpr Pin kI2sMclk = {PE, 6};            // spec 01 §3.2

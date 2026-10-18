@@ -164,6 +164,20 @@ public:
     void setCallbackDisabled(bool d) { callbackDisabled_ = d; }
     // Line input for the next block: 128 interleaved int16 frames, or nullptr (silence).
     void setLineInput(const int16_t* interleaved) { lineIn_ = interleaved; }
+    // Recorder monitor (spec 22 §5): stock 0x153B4(0x56) writes table[0x56] =
+    // 1.0 into the line-in MSUM inputs, so while the Recorder monitors, the
+    // line input reaches the master at unity whatever the Global Mixer line
+    // level / mute (new projects have line in muted, 0x30A = 1). false: the
+    // Global Mixer level applies. Set per block before renderBlock.
+    void setLineMonitor(bool unity) { lineMonitor_ = unity; }
+    bool lineMonitor() const { return lineMonitor_; }
+    // Peak |sample| (Q15) of the line input as mixed into the master while
+    // the Recorder monitors, since the last call (diag).
+    int takeLineMonitorPeak() {
+        const int p = int(lineMonPeak_ * 32768.0f);
+        lineMonPeak_ = 0.0f;
+        return p;
+    }
 
     // Pad / instrument audition uses the track voices (spec 07 Q7, see
     // App::previewOn); the ninth player only plays the metronome click.
@@ -266,6 +280,8 @@ private:
     void* hookCtx_ = nullptr;
     IMidiPort* midi_ = nullptr;
     const int16_t* lineIn_ = nullptr;
+    bool lineMonitor_ = false;
+    volatile float lineMonPeak_ = 0.0f;
     float tempo_ = 130.0f;
     uint64_t blocks_ = 0;
     bool callbackDisabled_ = false;

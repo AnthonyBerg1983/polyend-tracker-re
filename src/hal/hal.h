@@ -92,6 +92,12 @@ void bootPowerGate();
 bool selectInput(void* ctx, uint8_t source, uint8_t gain);
 // Line input block for HalRefs::lineIn (I2S RX, spec 01 §5.3).
 const int16_t* lineIn(void* ctx);
+// Recorder input diagnostics (app_main.cpp, 1 Hz while the recorder is open):
+// on = start/stop the raw RX peak tracking; inputDiagLog() logs one "input:"
+// line (raw RX peak, codec ADC routing readback, radio switch and Si4703
+// status). Main-loop context (codec reads over I2C0).
+void inputDiagEnable(bool on);
+void inputDiagLog();
 
 Ft81xDisplay& display();
 Sgtl5000Audio& audio();

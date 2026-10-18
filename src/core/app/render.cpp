@@ -261,6 +261,7 @@ bool App::exportRunning(void* ctx) {
 
 bool App::exportAudio(ExportKind kind, const char* path, const SelRect* sel, bool stems) {
     seq.stop();
+    if (perfCc) perfCc->perfRevertKept();   // never render with live Performance FX (spec 16 §A.15)
     allVoicesOff();
     if (engineDirty_) applyEngineSettings();
     rendering_ = true;

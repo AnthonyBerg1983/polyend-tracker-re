@@ -114,8 +114,11 @@ void App::preBlock(float seconds) {
     const int16_t* in = hal_.lineIn && !rendering_ ? hal_.lineIn(hal_.lineInCtx) : nullptr;
     // Recorder input tap (spec 05 appendix C §2): meter / count-in / record.
     if (!rendering_) capture.process(in, audio::kBlock, &engine);
-    // Monitor off (appendix C §2.7) keeps the input out of the mix.
+    // Monitor off (appendix C §2.7) keeps the input out of the mix. Monitor
+    // On in the Recorder mixes it at unity, not at the Global Mixer line
+    // level / mute (spec 22 §5).
     if (in && !inputMonitorMuted) engine.setLineInput(in);
+    engine.setLineMonitor(capture.metering() && !inputMonitorMuted && !rendering_);
     // spec 05 §1.3 / spec 04 §1.1 step 1: the audio block drives the sequencer
     // clock (live 128/44122.65 s, offline kRenderBlockSeconds).
     seq.processElapsed(seconds);
@@ -720,7 +723,9 @@ void App::syncRecorderSettings() {
         p[2] = cfg.recGain[2];   // mic low gain
         p[3] = cfg.recGain[3];   // mic high gain
         p[4] = cfg.recGain[1];   // radio
-        p[5] = cfg.recMonitor;
+        // spec 22 §5: the project byte is stock's recorder +0x7E, 0 = On,
+        // 1 = Off (cfg.recMonitor is the UI's 1 = On).
+        p[5] = cfg.recMonitor ? 0 : 1;
         project.setF32(pf::kRadioFreq, float(cfg.radioFreq10) / 10.0f);
     };
     if (!recShadowValid_ || std::memcmp(p, recShadow_, kN) != 0) {
@@ -739,7 +744,7 @@ void App::syncRecorderSettings() {
             cfg.recGain[2] = p[2];
             cfg.recGain[3] = p[3];
             cfg.recGain[1] = p[4];
-            cfg.recMonitor = p[5] ? 1 : 0;
+            cfg.recMonitor = p[5] == 0 ? 1 : 0;   // stock: any non-zero = Off
         }
         const float f = project.f32(pf::kRadioFreq);
         cfg.radioFreq10 = (f >= 76.0f && f <= 108.0f) ? uint16_t(f * 10.0f + 0.5f) : 875;

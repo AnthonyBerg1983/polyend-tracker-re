@@ -1,11 +1,7 @@
-// OpenTracker -- Si4703 FM tuner (spec 01 §5.6). Register names and bits from
-// the public Si4702/03-C19 datasheet and Silicon Labs AN230.
+// OpenTracker -- Si4703 FM tuner register logic (spec 01 §5.6, spec 22 §2).
+// Register names and bits from the public Si4702/03-C19 datasheet and Silicon
+// Labs AN230. Platform independent: the device glue is radio_si4703_port.cpp.
 #include "radio_si4703.h"
-
-#include <Arduino.h>
-#include "board.h"
-#include "i2c_bus.h"
-#include "k66.h"
 
 namespace ot {
 namespace hal {
@@ -18,116 +14,131 @@ constexpr int POWERCFG = 0x02, CHANNEL = 0x03, SYSCONFIG1 = 0x04,
 constexpr uint16_t PWR_DSMUTE = 0x8000, PWR_DMUTE = 0x4000, PWR_MONO = 0x2000, PWR_RDSM = 0x0800,
     PWR_SKMODE = 0x0400, PWR_SEEKUP = 0x0200, PWR_SEEK = 0x0100, PWR_DISABLE = 0x0040, PWR_ENABLE = 0x0001;
 constexpr uint16_t CH_TUNE = 0x8000;
-constexpr uint16_t SC1_DE = 0x0800;            // 1 = 50 us de-emphasis, 0 = 75 us
-constexpr uint16_t ST_STC = 0x4000, ST_ST = 0x0100;
-// spec 01 §5.6 init values.
+constexpr uint16_t SC1_RDS = 0x1000, SC1_DE = 0x0800;   // DE 1 = 50 us, 0 = 75 us
+constexpr uint16_t ST_STC = 0x4000, ST_SFBL = 0x2000, ST_ST = 0x0100;
+// spec 22 §2.2 / §2.3 values.
 constexpr uint16_t kTest1Xosc = 0x8100;        // XOSCEN (+ AN230 reserved bit 8)
 constexpr uint16_t kPowerCfg = PWR_DSMUTE | PWR_DMUTE | PWR_MONO | PWR_RDSM | PWR_ENABLE;   // 0xE801
-static_assert(kPowerCfg == 0xE801, "spec 01 §5.6 POWERCFG");
-constexpr uint16_t kSysCfg2Base = 0x190A;      // SEEKTH 0x19, VOLUME 10 (spec 01 §5.6)
-constexpr uint16_t kSysCfg3Seek = 0x0048;      // SKSNR 4, SKCNT 8 (spec 01 §5.6)
-constexpr uint32_t kOscMs = 500, kPowerUpMs = 110;   // spec 01 §5.6 / datasheet
-constexpr uint32_t kTuneTimeoutMs = 200;       // datasheet: tune <= 60 ms
-constexpr uint32_t kSeekTimeoutMs = 15000;     // full band at ~60 ms/channel
-constexpr uint32_t kStcClearTimeoutMs = 50;
+static_assert(kPowerCfg == 0xE801, "spec 22 §2.3 POWERCFG");
+constexpr uint16_t kSysCfg2Base = 0x190A;      // SEEKTH 0x19, VOLUME 10
+constexpr uint16_t kSysCfg3Seek = 0x0048;      // SKSNR 4, SKCNT 8
+constexpr uint32_t kStatusPollMs = 500;
 }  // namespace
 
-Si4703Radio& radio() {
-    static Si4703Radio r;
-    return r;
-}
-
-bool Si4703Radio::readRegs(int count) {
-    // Reads always start at 0x0A and wrap after 0x0F (datasheet "2-wire").
+bool Si4703Radio::readAll() {
+    // spec 22 §2.1: always all 16 registers, starting at 0x0A and wrapping
+    // 0x0F -> 0x00, ending at 0x09.
     uint8_t b[32];
-    if (count > 16) count = 16;
-    if (!i2c0().read(board::kAddrSi4703, b, uint32_t(count) * 2)) {
+    if (!port_.read || !port_.read(b, sizeof b)) {
         errors_++;
         return false;
     }
-    for (int i = 0; i < count; ++i) regs_[(STATUSRSSI + i) & 15] = uint16_t((b[2 * i] << 8) | b[2 * i + 1]);
+    for (int i = 0; i < 16; ++i) regs_[(STATUSRSSI + i) & 15] = uint16_t((b[2 * i] << 8) | b[2 * i + 1]);
     return true;
 }
 
-bool Si4703Radio::writeRegs() {
-    // Writes always start at 0x02 (spec 01 §5.6: 12 bytes for regs 0x02-0x07).
+bool Si4703Radio::writeRegs(bool retry) {
+    // spec 22 §2.1: 12 bytes = shadow regs 0x02..0x07 (TEST1 is part of every
+    // write); retried up to 10 times unless it is a bring-up write.
     uint8_t b[12];
     for (int i = 0; i < 6; ++i) {
         b[2 * i] = uint8_t(regs_[POWERCFG + i] >> 8);
         b[2 * i + 1] = uint8_t(regs_[POWERCFG + i]);
     }
-    if (!i2c0().write(board::kAddrSi4703, b, sizeof(b))) {
+    for (int n = retry ? kWriteRetries : 1; n > 0; --n) {
+        if (port_.write && port_.write(b, sizeof b)) return true;
         errors_++;
-        return false;
     }
-    return true;
+    return false;
 }
 
-void Si4703Radio::fail() {
-    // spec 01 §5.6: on I2C failure the stock driver resets and re-inits; we
-    // drop to off and let the next selectInput() retry.
-    powerOff();
+void Si4703Radio::fail(const char* what) {
+    // spec 22 §2.1: after a failed read or a write that failed all retries, the
+    // stock driver resets and powers up again. OpenTracker drops to kUnreset;
+    // the recorder re-selects the radio about once a second while it is the
+    // source, and that powerOn() runs the reset + power-up.
+    if (port_.log)
+        port_.log("radio: I2C failure (%s) in state %u, errors %lu -> reset on the next power on", what,
+                  unsigned(state_), static_cast<unsigned long>(errors_));
+    state_ = kUnreset;
+    pendingSeek_ = 0;
 }
 
-bool Si4703Radio::powerOn() {
-    if (state_ != kOff) return true;
-    // spec 01 §5.6 reset: SDIO (PTD9 = I2C0 SDA) LOW while RST_N rises selects
-    // the 2-wire bus mode (datasheet "Reset, Powerup and Powerdown"; SEN is
-    // pulled up on the chip). Only called from the main loop, so no other
-    // I2C0 transfer (codec, button keypad) can be in flight.
-    gpioOutput(board::kPinRadioReset, false);
-    delay(1);
-    gpioOutput(board::kI2c0Sda, false);
-    delay(1);
-    gpioWrite(board::kPinRadioReset, true);
-    delay(1);
-    gpio(board::kI2c0Sda).PDDR &= ~(1u << board::kI2c0Sda.bit);
-    i2c0().recover();   // spec 01 §5.6 "I2C0 then re-initialised"
-    if (!readRegs(16)) {
-        gpioWrite(board::kPinRadioReset, false);
+bool Si4703Radio::boot() {
+    // spec 22 §2.2 steps 2-10 (step 1, PTE26, is board.cpp's). Bring-up
+    // writes are not retried (retry flag 1).
+    if (port_.resetPulse) port_.resetPulse();
+    state_ = kUnreset;
+    if (!readAll()) {
+        if (port_.log) port_.log("radio: boot: no answer at 0x10 after reset (2-wire mode not entered?)");
         return false;
     }
     // UNVERIFIED: identity check only reported (deviceId()); 0x1242 = Si4702/03.
+    if (port_.log)
+        port_.log("radio: boot: DEVICEID 0x%04X CHIPID 0x%04X TEST1 0x%04X (expect DEVICEID 0x1242)",
+                  unsigned(regs_[0]), unsigned(regs_[1]), unsigned(regs_[TEST1]));
     regs_[TEST1] = kTest1Xosc;
-    if (!writeRegs()) {
-        gpioWrite(board::kPinRadioReset, false);
+    if (!writeRegs(false)) {
+        if (port_.log) port_.log("radio: boot: TEST1 (XOSCEN) write failed");
         return false;
     }
-    state_ = kOsc;
-    t0_ = millis();
+    // spec 22 §2.2 step 10 waits 500 ms here; OpenTracker lets the crystal
+    // settle in the background and holds the first power-up back instead.
+    oscAt_ = port_.millis ? port_.millis() : 0;
+    state_ = kStandby;
+    return true;
+}
+
+bool Si4703Radio::powerOn() {
+    if (powered()) return true;
+    if (state_ == kUnreset && !boot()) return false;
+    state_ = kOsc;   // service(): power-up once the crystal has run kOscMs
     rssi_ = 0;
+    timedOut_ = false;
     return true;
 }
 
 void Si4703Radio::powerOff() {
-    if (state_ != kOff) {
-        regs_[POWERCFG] = PWR_DISABLE | PWR_ENABLE;   // datasheet powerdown
-        writeRegs();
-    }
-    state_ = kOff;
+    // spec 22 §2.7: full read; SYSCONFIG1 &= ~RDS; write; full read; POWERCFG
+    // |= DISABLE (ENABLE stays set); write. RST_N is not touched.
+    const bool enabled = state_ >= kPowerUp;
+    const bool midTune = state_ >= kTuning;   // cannot happen in stock (blocking tune)
     pendingSeek_ = 0;
-    // Back to the boot state: RST_N LOW, chip pins high-impedance (boardEarlyInit).
-    gpioOutput(board::kPinRadioReset, false);
+    pendingTune_ = false;
+    if (state_ == kOsc) state_ = kStandby;   // never enabled
+    if (!enabled) return;
+    if (!readAll()) return fail("power off read");
+    regs_[SYSCONFIG1] = uint16_t(regs_[SYSCONFIG1] & ~SC1_RDS);
+    if (midTune) {   // a tune/seek still running: end it so the next one starts cleanly
+        regs_[CHANNEL] = uint16_t(regs_[CHANNEL] & ~CH_TUNE);
+        regs_[POWERCFG] = uint16_t(regs_[POWERCFG] & ~PWR_SEEK);
+    }
+    if (!writeRegs(true)) return fail("power off write");
+    if (!readAll()) return fail("power off read");
+    regs_[POWERCFG] = uint16_t(regs_[POWERCFG] | PWR_DISABLE);
+    if (!writeRegs(true)) return fail("power off write");
+    state_ = kStandby;
 }
 
-void Si4703Radio::applyBandBits() {
-    // Band (datasheet SYSCONFIG2[7:6]): 00 = 87.5-108, 01 = 76-108 (Japan wide).
-    // Spacing [5:4]: 00 = 200 kHz, 01 = 100 kHz, 10 = 50 kHz. spec 05 appendix C
-    // §2.8 region table: 87.5/0.1, 87.5/0.2, 87.5/0.2, 76.0/0.1 (UI max 108).
-    uint16_t band = bandMin_ < 87.0f ? 1 : 0;
+bool Si4703Radio::applyRegion() {
+    // spec 22 §2.4: full read; SYSCONFIG2 &= ~0xF0 (BAND, SPACE); SYSCONFIG1
+    // &= ~DE; then the region bits; write. Band (datasheet SYSCONFIG2[7:6]):
+    // 00 = 87.5-108, 01 = 76-108. Spacing [5:4]: 00 = 200 kHz, 01 = 100 kHz.
+    // The region table (EU 87.5/0.1 DE, US 87.5/0.2, AU 87.5/0.2 DE, JP
+    // 76/0.1 DE) arrives as setBand() limits plus the region index (DE).
+    if (!readAll()) return false;
+    const uint16_t band = bandMin_ < 87.0f ? 1 : 0;
     bottom_ = band ? 76.0f : 87.5f;
-    uint16_t space = step_ > 0.15f ? 0 : (step_ > 0.075f ? 1 : 2);
-    regs_[SYSCONFIG2] = uint16_t(kSysCfg2Base | (band << 6) | (space << 4));
-    regs_[SYSCONFIG3] = uint16_t(regs_[SYSCONFIG3] | kSysCfg3Seek);
-    // De-emphasis (datasheet: 75 us USA, 50 us Europe/Australia/Japan). Region
-    // order EU/US/AU/JP from the spec 05 config table. UNVERIFIED [I]: the stock
-    // "different band register bits" of region 2 are not recorded.
-    uint16_t sc1 = regs_[SYSCONFIG1] & uint16_t(~SC1_DE);
+    const uint16_t space = step_ > 0.15f ? 0 : (step_ > 0.075f ? 1 : 2);
+    regs_[SYSCONFIG2] = uint16_t((regs_[SYSCONFIG2] & ~0x00F0u) | (band << 6) | (space << 4));
+    uint16_t sc1 = uint16_t(regs_[SYSCONFIG1] & ~SC1_DE);
     if (region_ != 1) sc1 |= SC1_DE;
     regs_[SYSCONFIG1] = sc1;
+    return writeRegs(true);
 }
 
 uint16_t Si4703Radio::channelFor(float mhz) const {
+    // spec 22 §2.5: chan = trunc((MHz - base) / spacing + 0.5).
     if (mhz < bandMin_) mhz = bandMin_;
     if (mhz > bandMax_) mhz = bandMax_;
     float c = (mhz - bottom_) / step_ + 0.5f;
@@ -141,20 +152,14 @@ void Si4703Radio::setBand(float minMHz, float maxMHz, float stepMHz) {
     bandMin_ = minMHz;
     bandMax_ = maxMHz;
     step_ = stepMHz;
-    applyBandBits();
-    if (state_ == kReady) {
-        if (writeRegs()) {
-            // Re-tune: CHAN is relative to the band bottom and spacing.
-            pendingFreq_ = freq_;
-            pendingTune_ = true;
-        } else {
-            fail();
-        }
-    }
+    bottom_ = bandMin_ < 87.0f ? 76.0f : 87.5f;
+    // Applied when the tuner is ready (end of the power-up, or after the
+    // running tune/seek), then re-tuned: CHAN is relative to band and spacing.
+    regionDirty_ = true;
 }
 
 bool Si4703Radio::tune(float mhz) {
-    if (state_ == kOff) return false;
+    if (!powered()) return false;
     pendingFreq_ = mhz;
     pendingTune_ = true;
     pendingSeek_ = 0;
@@ -164,56 +169,97 @@ bool Si4703Radio::tune(float mhz) {
 }
 
 bool Si4703Radio::seek(bool up) {
-    if (state_ == kOff) return false;
+    if (!powered()) return false;
     pendingSeek_ = up ? 1 : -1;
     if (state_ == kReady) startSeek();
     return true;
 }
 
 bool Si4703Radio::busy() const {
-    return state_ != kOff && (state_ != kReady || pendingTune_ || pendingSeek_ != 0);
+    return powered() && (state_ != kReady || pendingTune_ || pendingSeek_ != 0);
 }
 
 void Si4703Radio::startTune() {
+    // spec 22 §2.5 step 2: full read; CHANNEL = (CHANNEL & 0xFC00) | chan | TUNE; write.
     pendingTune_ = false;
-    regs_[POWERCFG] = uint16_t(regs_[POWERCFG] & ~PWR_SEEK);
-    regs_[CHANNEL] = uint16_t(CH_TUNE | channelFor(pendingFreq_));
-    if (!writeRegs()) return fail();
+    if (regionDirty_) {
+        regionDirty_ = false;
+        if (!applyRegion()) return fail("region");
+    }
+    const uint16_t chan = channelFor(pendingFreq_);
+    if (!readAll()) return fail("tune read");
+    regs_[CHANNEL] = uint16_t((regs_[CHANNEL] & 0xFC00) | chan | CH_TUNE);
+    if (!writeRegs(true)) return fail("tune write");
     state_ = kTuning;
-    t0_ = millis();
+    timedOut_ = false;
+    t0_ = port_.millis ? port_.millis() : 0;
 }
 
 void Si4703Radio::startSeek() {
-    // Datasheet seek: SKMODE 0 = wrap at the band limit, stop after one lap.
+    // spec 22 §2.6 state 1: up -> SKMODE 0 (wrap) | SEEKUP | SEEK; down ->
+    // SKMODE 0, SEEKUP 0, SEEK. Read-modify-write.
     const bool up = pendingSeek_ > 0;
     pendingSeek_ = 0;
-    regs_[CHANNEL] = uint16_t(regs_[CHANNEL] & ~CH_TUNE);
-    uint16_t p = uint16_t(regs_[POWERCFG] & ~(PWR_SKMODE | PWR_SEEKUP));
-    regs_[POWERCFG] = uint16_t(p | PWR_SEEK | (up ? PWR_SEEKUP : 0));
-    if (!writeRegs()) return fail();
+    if (regionDirty_) {
+        regionDirty_ = false;
+        if (!applyRegion()) return fail("region");
+    }
+    if (!readAll()) return fail("seek read");
+    uint16_t p = regs_[POWERCFG];
+    p = up ? uint16_t((p & ~PWR_SKMODE) | PWR_SEEKUP | PWR_SEEK)
+           : uint16_t((p & ~(PWR_SKMODE | PWR_SEEKUP)) | PWR_SEEK);
+    regs_[POWERCFG] = p;
+    if (!writeRegs(true)) return fail("seek write");
     state_ = kSeeking;
-    t0_ = millis();
+    timedOut_ = false;
+    t0_ = port_.millis ? port_.millis() : 0;
+}
+
+void Si4703Radio::logDone(const char* what, uint32_t now) {
+    if (!port_.log) return;
+    const uint16_t st = regs_[STATUSRSSI];
+    port_.log("radio: %s %s after %lu ms: POWERCFG 0x%04X CHANNEL 0x%04X SYSCONFIG1 0x%04X SYSCONFIG2 0x%04X "
+              "READCHAN 0x%04X (chan %u = %.1f MHz) STATUSRSSI 0x%04X (RSSI %u ST %u SF/BL %u STC %u)",
+              what, timedOut_ ? "FAILED (no STC)" : "done", static_cast<unsigned long>(now - t0_),
+              unsigned(regs_[POWERCFG]), unsigned(regs_[CHANNEL]), unsigned(regs_[SYSCONFIG1]),
+              unsigned(regs_[SYSCONFIG2]), unsigned(regs_[READCHAN]), unsigned(regs_[READCHAN] & 0x3FF),
+              double(freq_), unsigned(st), unsigned(st & 0xFF), unsigned((st & ST_ST) != 0),
+              unsigned((st & ST_SFBL) != 0), unsigned((st & ST_STC) != 0));
 }
 
 void Si4703Radio::service() {
-    if (state_ == kOff) return;
-    const uint32_t now = millis();
+    if (!powered()) return;
+    const uint32_t now = port_.millis ? port_.millis() : 0;
     switch (state_) {
         case kOsc:
-            if (now - t0_ < kOscMs) return;
-            // spec 01 §5.6: SYSCONFIG3 |= 0x48, POWERCFG = 0xE801, SYSCONFIG2 band.
+            if (now - oscAt_ < kOscMs) return;
+            // spec 22 §2.3 steps 1-5: full read; SYSCONFIG3 |= 0x48; POWERCFG =
+            // 0xE801 (also clears a DISABLE left by a power-down); SYSCONFIG2 =
+            // (x & 0xFFF0) | 0x190A (band/space kept); write. CHANNEL untouched.
+            if (!readAll()) return fail("power up read");
+            regs_[SYSCONFIG3] = uint16_t(regs_[SYSCONFIG3] | kSysCfg3Seek);
             regs_[POWERCFG] = kPowerCfg;
-            regs_[CHANNEL] = 0;
-            applyBandBits();
-            if (!writeRegs()) return fail();
+            regs_[SYSCONFIG2] = uint16_t((regs_[SYSCONFIG2] & 0xFFF0) | kSysCfg2Base);
+            if (!writeRegs(false)) return fail("power up write");
+            if (port_.log)
+                port_.log("radio: enable POWERCFG 0x%04X SYSCONFIG1 0x%04X SYSCONFIG2 0x%04X SYSCONFIG3 0x%04X "
+                          "TEST1 0x%04X",
+                          unsigned(regs_[POWERCFG]), unsigned(regs_[SYSCONFIG1]), unsigned(regs_[SYSCONFIG2]),
+                          unsigned(regs_[SYSCONFIG3]), unsigned(regs_[TEST1]));
             state_ = kPowerUp;
             t0_ = now;
             return;
         case kPowerUp:
             if (now - t0_ < kPowerUpMs) return;
-            // spec 01 §5.6 then sets SYSCONFIG1 |= 0x9004 (RDS + GPIO2 interrupt);
-            // OpenTracker polls STC and uses no RDS, so only DE (set above) is kept.
+            // spec 22 §2.3 step 7 then sets SYSCONFIG1 |= 0x9004 (RDS, STC/RDS
+            // interrupt on GPIO2) and arms the PTE28 interrupt. Not done:
+            // OpenTracker shows no RDS and polls STC like the stock tune does
+            // (§2.5), so the interrupt is not needed for tuning (README).
+            // spec 22 §4 step 5: setRegion right after the power-up.
+            if (!applyRegion()) return fail("region");
+            regionDirty_ = false;
             state_ = kReady;
+            // spec 22 §4 step 6: tune to the saved frequency.
             if (!pendingTune_ && pendingSeek_ == 0) {
                 pendingFreq_ = freq_;
                 pendingTune_ = true;
@@ -221,36 +267,55 @@ void Si4703Radio::service() {
             break;
         case kTuning:
         case kSeeking: {
-            if (!readRegs(2)) return fail();
-            const bool stc = regs_[STATUSRSSI] & ST_STC;
+            // spec 22 §2.5 step 3 / §2.6 state 2: full reads until STC.
+            if (!readAll()) return fail("STC read");
             const uint32_t limit = state_ == kTuning ? kTuneTimeoutMs : kSeekTimeoutMs;
-            if (!stc && now - t0_ < limit) return;
-            // Done (or timed out): READCHAN holds the channel; clear TUNE/SEEK and
-            // wait for STC to drop (datasheet tune/seek flow).
-            // A failed seek (SF/BL set) also leaves READCHAN where it stopped.
+            if (!(regs_[STATUSRSSI] & ST_STC)) {
+                if (now - t0_ < limit) return;
+                timedOut_ = true;   // stock waits forever; we give up and say so
+            }
+            // spec 22 §2.5 step 4 / §2.6 state 3: full read; clear TUNE / SEEK; write.
             freq_ = freqFor(regs_[READCHAN]);
-            regs_[CHANNEL] = uint16_t((regs_[CHANNEL] & ~CH_TUNE & ~0x3FFu) | (regs_[READCHAN] & 0x3FF));
-            regs_[POWERCFG] = uint16_t(regs_[POWERCFG] & ~PWR_SEEK);
-            if (!writeRegs()) return fail();
+            if (!readAll()) return fail("STC read");
+            if (state_ == kTuning) regs_[CHANNEL] = uint16_t(regs_[CHANNEL] & ~CH_TUNE);
+            else regs_[POWERCFG] = uint16_t(regs_[POWERCFG] & ~PWR_SEEK);
+            if (!writeRegs(true)) return fail("STC clear write");
             state_ = state_ == kTuning ? kTuneEnd : kSeekEnd;
-            t0_ = now;
             return;
         }
         case kTuneEnd:
-        case kSeekEnd:
-            if (!readRegs(2)) return fail();
-            if ((regs_[STATUSRSSI] & ST_STC) && now - t0_ < kStcClearTimeoutMs) return;
+        case kSeekEnd: {
+            // spec 22 §2.5 step 4 / §2.6 state 4: full reads until STC clears.
+            if (!readAll()) return fail("STC read");
+            // The safety limit covers the whole tune/seek (both STC waits).
+            const uint32_t limit = state_ == kTuneEnd ? kTuneTimeoutMs : kSeekTimeoutMs;
+            if (regs_[STATUSRSSI] & ST_STC) {
+                if (now - t0_ < limit) return;
+                timedOut_ = true;
+            }
+            freq_ = freqFor(regs_[READCHAN]);
+            rssi_ = regs_[STATUSRSSI] & 0xFF;
+            stereo_ = regs_[STATUSRSSI] & ST_ST;
+            if (timedOut_) tuneFailures_++;
+            else tunesDone_++;
+            logDone(state_ == kTuneEnd ? "tune" : "seek", now);
             state_ = kReady;
+            lastStatus_ = now;
             break;
+        }
         default:
             break;
     }
     if (state_ != kReady) return;
+    if (regionDirty_ && !pendingTune_ && pendingSeek_ == 0) {
+        pendingFreq_ = freq_;   // startTune() writes the new region first
+        pendingTune_ = true;
+    }
     if (pendingSeek_ != 0) return startSeek();
     if (pendingTune_) return startTune();
-    if (now - lastStatus_ >= 500) {
+    if (now - lastStatus_ >= kStatusPollMs) {
         lastStatus_ = now;
-        if (!readRegs(1)) return fail();
+        if (!readAll()) return fail("status read");
         rssi_ = regs_[STATUSRSSI] & 0xFF;
         stereo_ = regs_[STATUSRSSI] & ST_ST;
     }

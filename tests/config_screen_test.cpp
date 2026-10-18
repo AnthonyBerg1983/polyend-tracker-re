@@ -310,7 +310,8 @@ TEST(config_recorder_settings_are_per_project) {
     // A project without stored settings takes OpenTracker's defaults.
     CHECK_EQ(a.cfg.recGain[0], 50);
     CHECK_EQ(a.project.u8(pf::kRecGainLine), 50);
-    CHECK_EQ(a.project.u8(pf::kRecMonitor), 1);
+    CHECK_EQ(a.cfg.recMonitor, 1);                  // On
+    CHECK_EQ(a.project.u8(pf::kRecMonitor), 0);     // stock byte: 0 = On (spec 22 §5)
     // Recorder edits -> project bytes, project changed.
     a.cfg.recSource = 2;
     a.cfg.recGain[2] = 70;   // mic low gain
@@ -325,7 +326,7 @@ TEST(config_recorder_settings_are_per_project) {
     // Another project's bytes -> working copies.
     a.project.setU8(pf::kRecSource, 3);
     a.project.setU8(pf::kRecGainMicHigh, 12);
-    a.project.setU8(pf::kRecMonitor, 0);
+    a.project.setU8(pf::kRecMonitor, 1);   // stock: Off
     a.project.setF32(pf::kRadioFreq, 99.0f);
     h.run(20);
     CHECK_EQ(a.cfg.recSource, 3);

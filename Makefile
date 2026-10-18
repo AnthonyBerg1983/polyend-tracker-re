@@ -4,7 +4,7 @@
 # make host-test  -> build and run host-side unit tests
 # make fonts      -> regenerate the committed UI font image (src/core/ui/fonts/font_data.*,
 #                    sim/third_party/rom_fonts.inc); needs python3 + Pillow
-VERSION   ?= 1.9.3
+VERSION   ?= 1.9.4
 BUILD     := build
 # Image file names must be exactly 24 characters (like the stock
 # "PolyendTracker_1.9.2.ptf"): the device's update bootloader rejected a
@@ -46,7 +46,7 @@ COMMON    := $(CPUFLAGS) $(DEFS) $(INCS) -O2 -g -ffunction-sections -fdata-secti
 CFLAGS    := $(COMMON) -std=gnu11
 CXXFLAGS  := $(COMMON) -std=gnu++17 -fno-exceptions -fno-rtti -felide-constructors -Wno-psabi
 LDFLAGS   := $(CPUFLAGS) -O2 -Wl,--gc-sections,--defsym=__rtc_localtime=0 -T$(CORE)/mk66fx1m0.ld \
-             --specs=nano.specs
+             --specs=nano.specs -u _printf_float
 LIBS      := -lm -lstdc++
 
 CORE_C    := $(wildcard $(CORE)/*.c)

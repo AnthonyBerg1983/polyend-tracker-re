@@ -1,10 +1,12 @@
 # OpenTracker
 
-A clean-room reimplementation of the original Polyend Tracker firmware (NXP MK66FX1M0). It contains no vendor code.
+A clean-room reimplementation of the original Polyend Tracker firmware
+(NXP MK66FX1M0), written from behavioural specs in `../docs/specs/`. It
+contains no vendor code, and it runs on real hardware.
 
 ## Licence
 
-OpenTracker's own code is MIT; third-party code keeps its own licence.
+OpenTracker's own code is MIT (see `LICENSE` at the repo root); third-party code keeps its own licence.
 
 ## Screenshots
 
@@ -37,7 +39,7 @@ For the device itself you only need the stock firmware file
 ## Build
 
 ```
-make                 # firmware  -> build/PolyendTrackerOTv193.ptf (OpenTracker 1.9.3)
+make                 # firmware  -> build/PolyendTrackerOTv194.ptf (OpenTracker 1.9.4)
 make VERSION=0.2.0   # set the version (the file name stays 24 characters)
 make SELFTEST=1      # hardware selftest -> build/selftest/PolyendTracker_OTst<N>.ptf
 make -C tests        # host unit tests
@@ -74,8 +76,6 @@ power-cycle. Go back to stock the same way with `PolyendTracker_1.9.2.ptf`.
   - the Sample Editor effect details that spec 18 §2.3 leaves open: the EQ peaking-band coefficients (RBJ, Q = f/bw) and its dB → linear gain conversion, the flanger's per-sample tap (offset + depth·sin, linearly interpolated), the beat time-stretch target length ((steps + micro step) sixteenths at the tempo) and the WSOLA overlap/seek sizes, the note time-stretch granule length (granule ms · 44.1 samples), the flanger mix ((x + tap) / 2), the Normalizer on a silent selection (copied unchanged; stock divides by a zero peak), the fade start/end values (linear 0→1 and 1→0 over the selection), overdrive type 0 above 2/3 FS (clip), the limiter's pre-smoothing coefficient, and the overdrive type labels. Everything else in the 17 effects follows stock: the formulas, parameter conversions, truncation with int16 saturation, the multi-tap Delay that lengthens the sample, the bitcrusher hold, PJRC-style chorus taps, limiter/compressor envelopes, wavetable-smoother crossfades and the one-level undo;
   - the auto-name word list (stock makes a unique `name_NNNN`); the naming keyboard's key layout, labels and text cursor are stock (spec 16 §B.1);
   - the picker look (including the FX description panel, whose state is kept until power-off rather than in the config) and the MIDI-Mapping hint text;
-  - the theme colours;
-  - the second font set, which uses FT81x ROM fonts of the same size.
 - The headphone level is fixed at 0.7; the stock level is unknown.
 - The Loader's SD preview decodes into free sample memory, so there is no preview when memory is full; stock streams it.
 - Master EQ, Bass Boost and Space run in the SGTL5000 codec's DSP (DAP), as in stock 1.9.2 (spec 18 §1): the same register values are written at boot, on every edit and on project load. Because the DAP sits after the mix, offline renders and exports do not contain them, as in stock. The simulator has no equivalent DSP. The audible result is defined by the codec and has not yet been compared against a stock unit.
@@ -90,7 +90,7 @@ power-cycle. Go back to stock the same way with `PolyendTracker_1.9.2.ptf`.
   - USB mass storage, as in stock 1.9.2: the USB Storage Mode page is shown on interface event 10 like stock (its title is stock; the rest of the "Do not unplug…" warning sentence and the Exit button on F8 are OpenTracker's own), but the card is not handed to the host because the stock hardware hook does nothing and has no mass-storage class. No stock trigger for the event is known (spec 01 §6.1). The simulator shows it with the `usbstorage on` script command;
   - battery / fuel-gauge readout.
 - The USB ID 1209:0001 is the pid.codes test ID.
-- Config "Display font" switches between two sets of the display controller's built-in (ROM) fonts: Original is smooth (anti-aliased), New is a sharp bitmap font of about the same height. The pattern grid font stays the same in both. Stock's "New" set is wider and taller, but our screen layouts are sized for Original, so New keeps the same size and changes only the look.
+- Config "Display font": Original uses Roboto Mono and New uses Roboto, both open fonts rendered to the stock font metrics. If the font upload fails at boot, the display controller's built-in fonts are used instead.
 - MIDI CC fixes:
   - Master level CCs (71–82) mark the project as changed, so autosave keeps them.
   - Instrument CCs set the exact target value; the encoder's step limits (LFO speed ±5, Tune ±10 → octave) do not apply.
@@ -128,6 +128,7 @@ power-cycle. Go back to stock the same way with `PolyendTracker_1.9.2.ptf`.
 - Config is kept in the stock EEPROM area (same 0xF4-byte image); an `OpenTracker/config.bin` from an older build is imported once, and is used instead only when the EEPROM is not ready.
 - Recorder source, gains, monitor and radio frequency are saved per project (stock bytes 0x134–0x13F); a project that never stored them gets gain 50 and monitor on.
 - Recorder pads play the recording chromatically one at a time (the last pad pressed sounds) through the file-preview player: the selection is resampled into the free sample memory behind the recording, so a transposition longer than that memory is cut short, and with none left it plays at its own pitch (appendix C §2.11).
+- Radio tuner (spec 22 §2): the reset, power-up, region and tune register sequences are stock's, with three differences. A tune that the tuner never finishes is abandoned after 1 s (a seek after 15 s) and logged as `radio: tune FAILED`; stock waits forever. The tuner is enabled only while Radio is the selected source; stock enables it on every Recorder entry. RDS and its interrupt pin (PTE28) are not set up, because OpenTracker shows no RDS text and, like stock, polls the STC bit to finish a tune.
 - Song paste (Shift+Copy) with the grid focused puts the clip's top-left at the selected slot and track, as the 1.9.2 manual describes; the spec only says "at the cursor" (spec 06 §2.3).
 - Song F1 "Loop Pattern"/"Continue Song" still pending when you leave the Song screen is applied at once instead of at the next step (spec 06 §2.3).
 - Track Mixer meters read the engine's block peak (scaled to sine RMS) every 10 ms for the 10-reading mean; stock reads an RMS analyser (spec 06 §4.4).

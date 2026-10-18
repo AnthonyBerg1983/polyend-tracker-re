@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "audio_sgtl5000.h"
+#include "app/input_gain.h"
 #include "board.h"
 #include "diag.h"
 #include "ft81x.h"
@@ -51,6 +52,7 @@ void (*gPowerOffHook)() = nullptr;
 
 // Recorder input routing state (selectInput).
 int8_t gInputSource = -1;
+uint8_t gInputGain = 0;
 bool gInputOk = false;
 
 void sdramInit() {
@@ -279,12 +281,14 @@ const BootReport& boardInit() {
              static_cast<unsigned long>(i2c0().errorCount()));
 
     r.stage = 11;
-    diagStage("step 10: radio reset LOW, radio switch HIGH (after codec, spec 08 §1)");
-    // Si4703 parked: RST_N held LOW (Si4703 datasheet: SDIO/SCLK high-impedance in
-    // reset) and the radio audio switch in the "radio off" state (PTE26 HIGH, spec 01 §5.4).
-    gpioOutput(board::kPinRadioReset, false);
+    diagStage("step 10: radio switch HIGH, Si4703 reset + crystal (after codec, spec 08 §1, spec 22 §2.2)");
+    // Radio audio switch in the "radio off" state (PTE26 HIGH, spec 01 §5.4).
     digitalWriteFast(board::kTeensyRadioSwitch, HIGH);
     pinMode(board::kTeensyRadioSwitch, OUTPUT);
+    // spec 22 §2.2: the Si4703 is reset once, here, and its crystal started;
+    // RST_N then stays HIGH for the whole session (stock never drives it LOW
+    // again). The radio source only enables / disables it (radio_si4703.h).
+    radio().boot();
     diagStage("step 11: pad bus probe");
     // step 11-13: keypads, pad LEDs, encoder.
     r.padBusAck = padBus().probe(board::kAddrPads);
@@ -473,38 +477,93 @@ void bootPowerGate() {
 }
 
 bool selectInput(void*, uint8_t source, uint8_t gain) {
-    (void)gain;   // digital, core app/capture.h
     if (source > 3) return false;
-    // Same source again (the recorder calls this on every gain change): no
-    // codec traffic, unless the radio dropped out meanwhile.
-    if (int8_t(source) == gInputSource && (source != 1 || radio().powered())) return gInputOk;
+    // spec 22 §3: the recorder gain is analog, stock scale (core app/input_gain.h).
+    const uint8_t level = input_gain::lineLevel(gain);
+    const uint8_t micDb = input_gain::micDb(source, gain);
+    // Same source again (the recorder calls this on every gain change and
+    // once a second for the radio): only the gain call when the gain changed
+    // (stock 0x56640), unless the radio dropped out meanwhile.
+    if (int8_t(source) == gInputSource && (source != 1 || radio().powered())) {
+        if (gain != gInputGain && gInputOk) {
+            gInputGain = gain;
+            gInputOk = source < 2 ? gAudio.lineInLevel(level) : gAudio.micGain(micDb);
+        }
+        return gInputOk;
+    }
     gInputSource = int8_t(source);
+    gInputGain = gain;
     bool ok = false;
+    bool radioOn = false;
     if (source == 1) {
         // spec 01 §5.4/§5.5 radio mode: LINE input, radio on, PTE26 LOW routes
         // the tuner into the codec line input. Deviation: the DAC stays fed from
         // I2S (the stock test feeds it from the ADC) -- OpenTracker monitors the
         // input through the engine (App::inputMonitorMuted).
-        ok = gReport.codecOk && radio().powerOn();
+        radioOn = gReport.codecOk && radio().powerOn();
+        ok = radioOn;
         if (ok) {
             digitalWriteFast(board::kTeensyRadioSwitch, LOW);
-            ok = gAudio.selectLineIn(board::kRadioInLevel);
+            ok = gAudio.selectLineIn(level);   // spec 22 §3: gainRadio * 15 / 100
         }
         if (!ok) {
             radio().powerOff();
             digitalWriteFast(board::kTeensyRadioSwitch, HIGH);
-            gAudio.selectLineIn(board::kLineInLevel);
+            gAudio.selectLineIn(level);
         }
     } else {
         radio().powerOff();
         digitalWriteFast(board::kTeensyRadioSwitch, HIGH);   // spec 01 §5.4: HIGH = radio off
         if (gReport.codecOk) {
-            ok = source == 0 ? gAudio.selectLineIn(board::kLineInLevel)
-                             : gAudio.selectMic(source == 2 ? board::kMicLowGainDb : board::kMicHighGainDb);
+            ok = source == 0 ? gAudio.selectLineIn(level) : gAudio.selectMic(micDb);
         }
     }
     gInputOk = ok;
+    uint16_t ana = 0, adc = 0;
+    const bool rd = gReport.codecOk && gAudio.codecRead(0x0024, ana) && gAudio.codecRead(0x0020, adc);
+    diagLogf("input: select %u (%s) -> %s | codec %d radio %s switch PTE26 %s | ANA_CTRL 0x%04X (ADC %s%s) "
+             "ANA_ADC_CTRL 0x%04X%s",
+             unsigned(source), source == 0 ? "line" : source == 1 ? "radio" : source == 2 ? "mic LG" : "mic HG",
+             ok ? "ok" : "FAILED", int(gReport.codecOk),
+             source != 1 ? "off" : radioOn ? "powering" : "NO ANSWER",
+             digitalReadFast(board::kTeensyRadioSwitch) ? "HIGH (radio off)" : "LOW (radio in)",
+             unsigned(ana), (ana & 0x0004) ? "LINEIN" : "MIC", (ana & 0x0001) ? " MUTED" : "", unsigned(adc),
+             rd ? "" : " (readback failed)");
     return ok;
+}
+
+void inputDiagEnable(bool on) { Sgtl5000Audio::setRxPeak(on); }
+
+void inputDiagLog() {
+    // One line per call: is there signal on the I2S RX (raw, before the app
+    // gain), how is the codec ADC routed, and what is the tuner doing.
+    int pl = 0, pr = 0;
+    uint32_t blocks = 0;
+    Sgtl5000Audio::takeRxPeak(pl, pr, blocks);
+    uint16_t ana = 0, sss = 0, pwr = 0, adcdac = 0, adc = 0;
+    bool rd = gReport.codecOk;
+    rd = rd && gAudio.codecRead(0x0024, ana);
+    rd = rd && gAudio.codecRead(0x000A, sss);
+    rd = rd && gAudio.codecRead(0x0030, pwr);
+    rd = rd && gAudio.codecRead(0x000E, adcdac);
+    rd = rd && gAudio.codecRead(0x0020, adc);
+    const Si4703Radio& r = radio();
+    const uint16_t st = r.reg(0x0A), pcfg = r.reg(0x02), s2 = r.reg(0x05);
+    diagLogf("input: src %d ok %d | rx peak L %d R %d (%lu blocks) RCSR 0x%08lX (FEF %d) restarts %lu stale %lu | codec%s ANA_CTRL 0x%04X SSS_CTRL 0x%04X "
+             "ANA_POWER 0x%04X ADCDAC_CTRL 0x%04X ANA_ADC_CTRL 0x%04X | switch PTE26 %d | radio state %u "
+             "pwr %d DEVID 0x%04X POWERCFG 0x%04X (DMUTE %d DSMUTE %d) VOL %u READCHAN %u %.1f MHz "
+             "RSSI %u STC %u ST %u busy %d err %lu tunes ok %lu failed %lu",
+             int(gInputSource), int(gInputOk), pl, pr, static_cast<unsigned long>(blocks),
+             static_cast<unsigned long>(Sgtl5000Audio::rxStatus()), int((Sgtl5000Audio::rxStatus() >> 18) & 1),
+             static_cast<unsigned long>(Sgtl5000Audio::rxRecoveries()),
+             static_cast<unsigned long>(Sgtl5000Audio::rxStaleBlocks()), rd ? "" : " (READ FAILED)",
+             unsigned(ana), unsigned(sss), unsigned(pwr), unsigned(adcdac), unsigned(adc),
+             int(digitalReadFast(board::kTeensyRadioSwitch)), unsigned(r.stateCode()), int(r.powered()),
+             unsigned(r.deviceId()), unsigned(pcfg), int((pcfg & 0x4000) != 0), int((pcfg & 0x8000) != 0),
+             unsigned(s2 & 0x0F), unsigned(r.reg(0x0B) & 0x3FF), double(r.frequency()), unsigned(st & 0xFF),
+             unsigned((st & 0x4000) != 0), unsigned((st & 0x0100) != 0), int(r.busy()),
+             static_cast<unsigned long>(r.errorCount()), static_cast<unsigned long>(r.tunesDone()),
+             static_cast<unsigned long>(r.tuneFailures()));
 }
 
 const int16_t* lineIn(void* ctx) { return Sgtl5000Audio::lineInBlock(ctx); }
@@ -514,6 +573,7 @@ void service() {
     gInput.service();
     gLeds.service();
     gStorage.service();
+    Sgtl5000Audio::serviceRx();
     radio().service();
     // spec 01 §10 / spec 05 power button: edges become btn::Power presses and
     // releases (Shift + Power = screenshot in the UI). Held for 1500 ms without
