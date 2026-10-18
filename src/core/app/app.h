@@ -526,7 +526,9 @@ private:
     // Tracks 13..16 that did not fit the pool at load (bit e of entry num):
     // the autosave keeps them from the Workspace file until the store holds
     // the track (never lost).
-    uint8_t extKeep_[kPatternCount + 1] = {};
+    // Main loop only (project files, File screen): SDRAM on the device.
+    using ExtKeep = uint8_t[kPatternCount + 1];
+    OT_APP_SDRAM_MEMBER(ExtKeep, extKeep_);   // cleared in init()
     // Synth slots: patch model, where it came from, dirty bits.
     SynthPatch patches_[kSynthSlotCount] = {};
     PatchSource patchSrc_[kSynthSlotCount] = {};
