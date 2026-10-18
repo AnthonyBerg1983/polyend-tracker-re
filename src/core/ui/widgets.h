@@ -312,6 +312,17 @@ struct ValueBarStyle {
 // the track middle.
 void valueBar(Gfx& g, const Theme& th, int x, int y, int w, int h, float value,
               const ValueBarStyle& st = ValueBarStyle());
+// Many unipolar value bars without background (valueBar with background =
+// false, the default set) drawn in layers: all well edges in one RECTS
+// batch, all wells in one, the inner gradients, then the fills batched per
+// colour. The bars must not overlap; the pixels are then the same as one
+// valueBar call per bar, in far fewer display-list words (FT81x RAM_DL).
+struct ValueBarItem {
+    int x, y, w, h;
+    float value;
+    uint32_t fill = kThemeColour;
+};
+void valueBars(Gfx& g, const Theme& th, const ValueBarItem* bars, int n);
 
 // --- popups and text ----------------------------------------------------------
 // Popup box (class 0x06 colours): fill colour[0], 1-px outline colour[1].
