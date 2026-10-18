@@ -631,7 +631,12 @@ void popupItem(void* ctx, int i, char* out, int cap) {
         const FxInfo& f = fxInfo(kFxMenuOrder[i]);
         std::snprintf(out, size_t(cap), "%c - %s", f.symbol, f.name);
     } else if (p->kind == 5) {
-        std::snprintf(out, size_t(cap), "MIDI Channel %d", i + 1);
+        // MIDI tracks: Synth 1..3, then the MIDI channels.
+        const int ins = synthui::popupInstrumentMidi(i);
+        if (isSynthInstrument(uint8_t(ins)))
+            synthui::slotLabel(a, synthSlotOf(uint8_t(ins)), out, cap);
+        else
+            std::snprintf(out, size_t(cap), "MIDI Channel %d", ins - kFirstMidiInstrument + 1);
     } else {
         // Instruments: i is the list position, Synth 1..3 first (Tracker+
         // manual p.100 figure: "Synth 1 (WTFM)" before "1. ...").
@@ -673,7 +678,7 @@ void PatternScreen::drawListPopup(Gfx& g) {
     v.y = 30;
     v.w = 200;
     v.h = kind == 3 ? 409 : 394;
-    v.count = kind == 3 ? kFxCount : (kind == 5 ? 16 : kInstrumentCount + kSynthSlotCount);
+    v.count = kind == 3 ? kFxCount : (kind == 5 ? synthui::kMidiPopupCount : kInstrumentCount + kSynthSlotCount);
     v.sel = pop_.cursor();
     popTop_ = wg::listFollow(v.sel, v.count, wg::listVisibleRows(v.h), popTop_);
     v.top = popTop_;
@@ -765,6 +770,9 @@ void PatternScreen::popupPad(uint8_t pad) {
         const int ins = synthui::popupInstrument(pop_.cursor());
         const int n = (ins >= kSampleInstrumentCount && ins < kInstrumentCount ? kSampleInstrumentCount : 0) + pad;
         if (n < kInstrumentCount) pop_.select(synthui::popupPosition(n));
+    } else if (pop_.kind() == 5) {
+        // MIDI tracks: the Instr-column pad map (pads 1-16 MIDI, 17-19 synths).
+        if (pad < synthui::kMidiPopupCount) pop_.select(synthui::popupPositionMidi(synthui::midiTrackPadInstrument(pad)));
     } else {
         pop_.pick(pad);
     }
@@ -778,6 +786,11 @@ void PatternScreen::popupLeds(uint8_t* lv) const {
         const int ins = synthui::popupInstrument(pop_.cursor());
         const int base = ins >= kSampleInstrumentCount && ins < kInstrumentCount ? kSampleInstrumentCount : 0;
         for (int p = 0; p < 48; ++p) lv[p] = base + p == ins ? full : (base + p < kInstrumentCount ? dim : 0);
+        return;
+    }
+    if (pop_.kind() == 5) {   // MIDI tracks: the pad map of popupPad
+        const int ins = synthui::popupInstrumentMidi(pop_.cursor());
+        for (int p = 0; p < synthui::kMidiPopupCount; ++p) lv[p] = synthui::midiTrackPadInstrument(p) == ins ? full : dim;
         return;
     }
     if (pop_.kind() != 0) {

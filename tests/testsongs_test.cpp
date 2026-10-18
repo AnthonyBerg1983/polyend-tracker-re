@@ -118,6 +118,48 @@ void checkMiniFiles(const Files& gen, const std::string& dir, const ExtTracks& w
     CHECK(patterns > 0);
 }
 
+// Song 14 (vapsong.inc), after the open: Synth 1-3 are VAP patches with our
+// own names (pad polyphony 4, lead and bass mono, the bass with Reset On);
+// every note is a synth note; the held notes stay inside the default budget.
+void checkVapOnly(ot::App& a) {
+    namespace vap = ot::audio::vap;
+    const char* names[3] = {"OT VAP Pad", "OT VAP Lead", "OT VAP Bass"};
+    const uint32_t poly[3] = {4, 1, 1};
+    for (int k = 0; k < 3; ++k) {
+        const ot::SynthSlotRecord r = a.synthSlot(k);
+        CHECK_EQ(r.model, uint32_t(ot::SynthModel::VAP));
+        CHECK_EQ(r.polyphony, poly[k]);
+        CHECK(std::strcmp(r.patchName, names[k]) == 0);
+    }
+    CHECK(ot::audio::synthParamGet(a.synthPatch(0), vap::kReset1) < 0.5f);
+    CHECK(ot::audio::synthParamGet(a.synthPatch(2), vap::kReset1) >= 0.5f);
+    CHECK(ot::audio::synthParamGet(a.synthPatch(1), vap::kOscSync) >= 0.5f);
+    const int held = ts::bgr::peakSynthVoices(a);
+    std::printf("    peak synth voices held %d (budget %d)\n", held, int(ot::Config::kDefaultSynthVoices));
+    CHECK_EQ(held, int(ot::Config::kDefaultSynthVoices));
+    CHECK(std::fabs(a.project.tempo() - 112.0f) < 0.01f);
+    int patterns = 0, notes = 0, maxVol = 0;
+    for (int n = 1; n <= ot::kPatternCount; ++n) {
+        if (!a.patternPresent(n)) continue;
+        ++patterns;
+        ot::Track tr;
+        for (int t = 0; t < ot::kTrackCount; ++t) {
+            a.readStoredTrack(n, t, tr);
+            for (int st = 0; st < ot::kStepCount; ++st) {
+                const ot::Step& x = tr.steps[st];
+                for (const auto& f : x.fx)
+                    if (f.type == uint8_t(ot::FxId::Volume)) maxVol = std::max(maxVol, int(f.value));
+                if (x.note < 0) continue;
+                ++notes;
+                CHECK(x.instrument >= 64 && x.instrument <= 66);
+            }
+        }
+    }
+    std::printf("    %d patterns, %d notes, max Volume %d\n", patterns, notes, maxVol);
+    CHECK_EQ(patterns, 7);
+    CHECK(maxVol <= 50);
+}
+
 // Song 13 (percsong.inc), after the open: Synth 1-3 are PERC kits with our
 // own patch names and polyphony 1 (3 voices <= the default budget of 4);
 // every note is a synth note (no sample, no MIDI); per kit and tick at most
@@ -335,6 +377,10 @@ void checkSong(ts::SongId id, bool force) {
         CHECK_EQ(ptiFiles, 0);
         checkPercOnly(*h.app);
     }
+    if (id == ts::SongId::VapOnly) {
+        CHECK_EQ(ptiFiles, 0);
+        checkVapOnly(*h.app);
+    }
 
     // Re-encode everything from the loaded model, then Save.
     h.app->markProjectDirty();
@@ -376,7 +422,7 @@ void checkSong(ts::SongId id, bool force) {
     uint32_t acc = 0;
     int peak = 0, voices = 0;
     // Song 13 opens with a 128-step pattern at 120 BPM (16 s).
-    const uint32_t ms = id == ts::SongId::LoadStress ? 16500 : (id == ts::SongId::PercOnly ? 17000 : 8500);
+    const uint32_t ms = id == ts::SongId::LoadStress ? 16500 : (id == ts::SongId::PercOnly ? 17000 : (id == ts::SongId::VapOnly ? 9500 : 8500));
     for (uint32_t t = 0; t < ms; t += 10) {
         acc += 10u * 44100u;
         int blocks = 0;
@@ -407,6 +453,11 @@ void checkSong(ts::SongId id, bool force) {
         CHECK(voices <= int(ot::Config::kDefaultSynthVoices));
         CHECK_EQ(h.app->engine.synth().steals(), 0u);
     }
+    if (id == ts::SongId::VapOnly) {
+        std::printf("    synth voices sounding at most %d, steals %u\n", voices, unsigned(h.app->engine.synth().steals()));
+        CHECK(voices >= 4);
+        CHECK(voices <= int(ot::Config::kDefaultSynthVoices));
+    }
     if (id == ts::SongId::Synths) {
         // The chords ask for more voices than the pool has: voices were stolen.
         std::printf("    synth steals %u\n", unsigned(h.app->engine.synth().steals()));
@@ -426,6 +477,7 @@ TEST(testsongs_table) {
     CHECK_EQ(ts::findSong(ts::SongId::Stereo)->available, ts::kHasStereo);
     CHECK_EQ(ts::findSong(ts::SongId::Synths)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK_EQ(ts::findSong(ts::SongId::PercOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
+    CHECK_EQ(ts::findSong(ts::SongId::VapOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK(ts::kHasSynths);
     for (int i = 5; i < ts::kSongCount; ++i) CHECK_EQ(ts::songInfo(i).available, ts::kHasSynths && ts::kHas16Tracks);
     for (int i = 0; i < ts::kSongCount; ++i) CHECK(std::strlen(ts::songInfo(i).name) <= ot::mt::kNameMax);
@@ -481,14 +533,14 @@ std::vector<int16_t> wavSamples(const std::vector<uint8_t>& f) {
 
 }  // namespace
 
-// Songs 1 and 5, two BG remixes and the PERC-only song rendered through the
+// Songs 1 and 5, two BG remixes and the PERC- and VAP-only songs rendered through the
 // App's own stem export (spec 04 §6.1): no stem clips (sample tracks at the
 // voice AMP clamp, synth slot buses at int16), and the sum of the stems --
 // what reaches the master sum before its clamp and the limiter (spec 07
 // §5.4) -- stays under full scale but for isolated transients.
 TEST(testsongs_rendered_levels_do_not_clip) {
     const ts::SongId ids[] = {ts::SongId::TwelveTracks, ts::SongId::Synths, ts::SongId::BgTitle,
-                              ts::SongId::BgFinalBoss, ts::SongId::PercOnly};
+                              ts::SongId::BgFinalBoss, ts::SongId::PercOnly, ts::SongId::VapOnly};
     for (ts::SongId id : ids) {
         const ts::SongInfo* info = ts::findSong(id);
         if (!info || !info->available) continue;

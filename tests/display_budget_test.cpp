@@ -653,6 +653,12 @@ TEST(overlay_matrix_tracks_13_16) {
     h.run(250);
     r.measure("pattern 13-16 dense + MIDI channel popup");
     h.up(btn::Instr);
+    // 2.x: the MIDI-track popup lists Synth 1..3 first; opened on a synth.
+    a.setCurrentInstrument(kFirstSynthInstrument + 1);
+    h.down(btn::Instr);
+    h.run(250);
+    r.measure("pattern 13-16 dense + Instrument popup on Synth 2");
+    h.up(btn::Instr);
     h.tap(btn::Fx1);
     h.down(btn::Fx1);
     h.run(250);
@@ -769,6 +775,12 @@ TEST(overlay_matrix_screens) {
     CHECK(a.ui.picker.isOpen());
     r.measure("sample playback + chooser");
     h.up(btn::Instr);
+    h.push(InputEvent::kPadDown, 0);   // playhead line (USER_REPORTS_R2 §1c)
+    h.audio.pump(4);
+    h.run(40);
+    CHECK(static_cast<PlaybackScreen*>(a.ui.screen(kModPlayback))->drawnHeadX() >= 0);
+    r.measure("sample playback + playhead");
+    h.push(InputEvent::kPadUp, 0);
     a.setCurrentInstrument(1);
     r.screen(btn::SampleEditor, "sample editor (stereo)");
     h.down(btn::Instr);

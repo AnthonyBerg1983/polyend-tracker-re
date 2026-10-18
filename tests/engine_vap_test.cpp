@@ -278,7 +278,7 @@ TEST(polyphonic_chord_is_the_sum_of_its_voices) {
     std::vector<float> sum(chord.L.size(), 0.0f);
     for (int k = 0; k < 4; ++k) {
         Rig one(c);
-        // same random oscillator phases as in the chord: advance the slot rng alike
+        // same per-voice rng (S&H, noise) as in the chord: advance the slot rng alike
         for (int j = 0; j < k; ++j) one.on(7, 30.0f);
         one.alive[7] = false;
         one.on(k, notes[k]);
@@ -357,6 +357,87 @@ TEST(voice_finishes_after_release) {
     s.on(0, 60.0f);
     s.run(10);
     CHECK(s.v[0].level > 0.9f);
+}
+
+// USER_REPORTS_R2 item 3: one note played three times on a fresh voice
+// (the previous one released to silence, as after Stop) renders the same.
+// Returns the three 0..0.5 s renders.
+static std::vector<std::vector<float>> threeFreshNotes(const std::vector<float>& vals) {
+    Rig r(vals);
+    std::vector<std::vector<float>> out;
+    for (int k = 0; k < 3; ++k) {
+        r.L.clear();
+        r.on(0, 60.0f);   // fresh voice: the framework zeroes its state
+        r.run(kBlocksPerSec / 2);
+        out.push_back(r.L);
+        r.off(0);
+        while (r.run(1)) {
+        }
+        r.run(kBlocksPerSec / 4);   // "stop and wait"
+    }
+    return out;
+}
+
+TEST(reset_on_repeats_bit_exactly) {
+    std::vector<float> c = initValues();
+    c[vap::kReset1] = c[vap::kReset2] = 1.0f;
+    const auto n = threeFreshNotes(c);
+    CHECK(n[0] == n[1]);
+    CHECK(n[0] == n[2]);
+    CHECK(rms(n[0]) > 0.05);
+}
+
+TEST(init_patch_reset_off_repeats_bit_exactly) {
+    const std::vector<float> c = initValues();
+    CHECK(c[vap::kReset1] < 0.5f && c[vap::kReset2] < 0.5f);   // Init = Reset Off
+    const auto n = threeFreshNotes(c);
+    CHECK(n[0] == n[1]);
+    CHECK(n[0] == n[2]);
+    // No random relative phase between the two equal saws: a fresh Reset Off
+    // voice starts like Reset On (both oscillators at 0), the full double saw.
+    std::vector<float> on = c;
+    on[vap::kReset1] = on[vap::kReset2] = 1.0f;
+    CHECK(threeFreshNotes(on)[0] == n[0]);
+    // The rich context (noise, a free-running LFO, detune) moves between the
+    // notes, but the same history renders the same.
+    CHECK(threeFreshNotes(richContext()) == threeFreshNotes(richContext()));
+}
+
+// The first two floats of vap.cpp's VoiceState: the oscillator phases.
+struct PhaseProbe {
+    float ph1, ph2;
+};
+
+TEST(reset_off_is_free_running) {
+    // A retrigger on the sounding voice: Reset On restarts the waves, Reset
+    // Off continues the phases from where the voice was.
+    std::vector<float> off = initValues(), on = initValues();
+    on[vap::kReset1] = on[vap::kReset2] = 1.0f;
+    Rig a(off), b(on);
+    a.on(0, 60.0f);
+    b.on(0, 60.0f);
+    a.run(37);
+    b.run(37);
+    const float ph1 = a.v[0].as<PhaseProbe>().ph1, ph2 = a.v[0].as<PhaseProbe>().ph2;
+    CHECK(ph1 != 0.0f);
+    a.on(0, 60.0f, true);
+    b.on(0, 60.0f, true);
+    CHECK_EQ(a.v[0].as<PhaseProbe>().ph1, ph1);
+    CHECK_EQ(a.v[0].as<PhaseProbe>().ph2, ph2);
+    CHECK_EQ(b.v[0].as<PhaseProbe>().ph1, 0.0f);
+    CHECK_EQ(b.v[0].as<PhaseProbe>().ph2, 0.0f);
+    const size_t at = a.L.size();
+    a.run(20);
+    b.run(20);
+    CHECK(rmsDiff(std::vector<float>(a.L.begin() + long(at), a.L.end()),
+                  std::vector<float>(b.L.begin() + long(at), b.L.end())) > 1.0e-3);
+    // Deterministic given the same history.
+    Rig c(off);
+    c.on(0, 60.0f);
+    c.run(37);
+    c.on(0, 60.0f, true);
+    c.run(20);
+    CHECK(c.L == a.L);
 }
 
 TEST(random_parameter_sets_stay_finite) {

@@ -80,8 +80,8 @@ double dbfs(float x) { return 20.0 * std::log10(x > 1e-9f ? double(x) : 1e-9); }
 
 const int kChords[4][4] = {{60, 64, 67, 71}, {57, 60, 64, 67}, {48, 55, 60, 64}, {62, 65, 69, 72}};
 
-// Peak over 40 chords of n voices (the oscillator start phases differ per
-// note, so the level of a VAP note varies; 40 chords cover the spread).
+// Peak over 40 chords of n voices (free-running LFOs and detuned
+// oscillators drift between notes; 40 chords cover the spread).
 float chordPeak(SynthModel m, int32_t engine, int voices, long& clips) {
     Slot s(m, engine, 4);
     for (int trial = 0; trial < 40; ++trial) {
@@ -109,6 +109,32 @@ TEST(levels_vap_init_one_voice_and_chords) {
     CHECK(dbfs(p4) < -1.0);   // a 4-voice chord does not reach it
     CHECK_EQ(c1, 0L);
     CHECK_EQ(c4, 0L);
+}
+
+// USER_REPORTS_R2 item 3 (report B): the VAP Init patch on track 8, note
+// played, Stop, wait, play again: the same tone every time, after a single
+// Stop (transport) or a double Stop (all voices off, slot reset).
+TEST(vap_init_repeats_across_stop_cycles) {
+    Slot s(SynthModel::VAP, kSynthEngineVap, 4);
+    std::vector<std::vector<float>> notes;
+    for (int k = 0; k < 4; ++k) {
+        std::vector<float> out;
+        s.on(7, 60);
+        for (int b = 0; b < 150; ++b) {
+            s.block();
+            out.insert(out.end(), s.L, s.L + kBlock);
+        }
+        s.off(7);
+        s.run(400);   // released to silence, "a few seconds"
+        if (k == 1) s.bank.stopAll();
+        else s.bank.transportStop();
+        s.run(50);
+        notes.push_back(out);
+    }
+    double e = 0.0;
+    for (float x : notes[0]) e += double(x) * x;
+    CHECK(e > 1.0);
+    for (int k = 1; k < 4; ++k) CHECK(notes[k] == notes[0]);
 }
 
 TEST(levels_acd_init_one_voice) {

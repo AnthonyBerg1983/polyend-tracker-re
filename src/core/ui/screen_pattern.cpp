@@ -109,7 +109,12 @@ void instrItem(void* ctx, int pos, char* out, int cap) {
     else if (isSynthInstrument(uint8_t(i))) std::snprintf(out, size_t(cap), "S%d", synthSlotOf(uint8_t(i)) + 1);
     else std::snprintf(out, size_t(cap), "MIDI %d", i - kFirstMidiInstrument + 1);
 }
-void midiItem(void*, int i, char* out, int cap) { std::snprintf(out, size_t(cap), "MIDI %d", i + 1); }
+// i = MIDI-track popup position (synthui::popupInstrumentMidi: Synth 1..3 first).
+void midiItem(void*, int pos, char* out, int cap) {
+    const int i = synthui::popupInstrumentMidi(pos);
+    if (isSynthInstrument(uint8_t(i))) std::snprintf(out, size_t(cap), "S%d", synthSlotOf(uint8_t(i)) + 1);
+    else std::snprintf(out, size_t(cap), "MIDI %d", i - kFirstMidiInstrument + 1);
+}
 // FX list items carry the column letter, "V - Volume/Velocity" (stock FX
 // picker strings 0xa3160..; docs/STRINGS_DIFF_1.9.3.md item 8).
 void fxItem(void*, int i, char* out, int cap) {
@@ -1097,7 +1102,7 @@ void PatternScreen::onPad(uint8_t pad, uint8_t state) {
         // with the pad's instrument (MIDI tracks: channel instrument).
         uint8_t ins = a.currentInstrument(), n = note;
         if (col == 1) {
-            ins = uint8_t(isMidiTrack(track) ? 48 + (pad & 15) : pad);
+            ins = uint8_t(isMidiTrack(track) ? synthui::midiTrackPadInstrument(pad) : pad);
             n = 60;
         }
         a.seq.liveNoteOn(n, 127, uint8_t(track), ins, a.instrumentVolume(ins));
@@ -1119,7 +1124,7 @@ void PatternScreen::onPad(uint8_t pad, uint8_t state) {
     }
     if (!edit()) {
         if (col == 1) {
-            a.setCurrentInstrument(isMidiTrack(track) ? 48 + (pad & 15) : pad);
+            a.setCurrentInstrument(isMidiTrack(track) ? synthui::midiTrackPadInstrument(pad) : pad);
             refreshBar();
         }
         a.previewOn(voice, a.currentInstrument(), note, 127);
@@ -1142,7 +1147,7 @@ void PatternScreen::onPad(uint8_t pad, uint8_t state) {
     } else if (col == 1) {
         int ins = pad;
         for (int t = r.t0; t <= r.t1; ++t)
-            if (isMidiTrack(t)) ins = 48 + (pad & 15);
+            if (isMidiTrack(t)) ins = synthui::midiTrackPadInstrument(pad);
         a.pushUndo();
         pops::writeInstrument(a.pattern(), r, uint8_t(ins));
         a.setCurrentInstrument(ins);
@@ -1189,8 +1194,9 @@ void PatternScreen::openPicker(int which) {
         followNoteWindow();
     } else if (which == 1) {
         if (isMidiTrack(track)) {
-            const int c = a.currentInstrument() >= 48 ? a.currentInstrument() - 48 : 0;
-            pop_.open(5, "MIDI channel", 16, c, midiItem, nullptr);
+            // 2.x: Synth 1..3 then MIDI 1..16 (synthui::popupInstrumentMidi).
+            pop_.open(5, "Instrument", synthui::kMidiPopupCount, synthui::popupPositionMidi(a.currentInstrument()),
+                      midiItem, nullptr);
         } else {
             // 2.x: the synth slots (instruments 64..66) are the first three
             // entries, as on the Tracker+ (manual p.100 figure); the cursor
@@ -1265,7 +1271,7 @@ void PatternScreen::commitPicker() {
     pickerKey_ = 0;
     ui_.dirty();
     if (kind == 2 || kind == 5) {
-        const int ins = kind == 5 ? 48 + v : synthui::popupInstrument(v);
+        const int ins = kind == 5 ? synthui::popupInstrumentMidi(v) : synthui::popupInstrument(v);
         a.setCurrentInstrument(ins);
         if (edit()) {
             a.pushUndo();
@@ -1527,6 +1533,8 @@ void PatternScreen::padLeds(uint8_t* lv) {
             }
         } else if (col == 1) {
             if (st.instrument < 48) lv[st.instrument] = full;
+            const int sp = isMidiTrack(track) ? synthui::midiTrackInstrumentPad(st.instrument) : -1;
+            if (sp >= 0) lv[sp] = full;   // a synth on a MIDI track: pads 17-19
         } else {
             const StepFx& f = st.fx[fxSlotForColumn(col)];
             if (ui_.isDown(col == 2 ? btn::Fx1 : btn::Fx2)) {

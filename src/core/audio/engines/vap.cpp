@@ -42,6 +42,7 @@ namespace vap {
 
 namespace {
 
+constexpr float kOutTrim = 0.70710678f;   // -3 dB voice output (see Dest::amp)
 constexpr float kBlockT = float(kBlock) / kSampleRate;   // seconds per block
 constexpr float kInvFs = 1.0f / kSampleRate;
 constexpr float kPi = 3.14159265f;
@@ -261,9 +262,13 @@ VAP_PER_BLOCK void evalDest(const float* P, const SlotState& S, const float* src
     d.B2 *= in;
     d.C2 *= in;
     d.noise *= in;
-    // Amplifier.
+    // Amplifier. kOutTrim: -3 dB output staging (USER_REPORTS_R2 item 3). With
+    // free-running oscillators the Init patch's two equal saws sum in phase on
+    // every note (until 2.0.3 a random relative phase lost 3 dB on average);
+    // the trim keeps Init's average level and a 4-voice chord's headroom at
+    // the default slot gain (tests/synth_levels_test.cpp).
     const float vol = 1.0f + m[kDstVolume];
-    d.amp = src[kSrcAmpEnv] * (vol > 0.0f ? vol : 0.0f);
+    d.amp = src[kSrcAmpEnv] * (vol > 0.0f ? vol * kOutTrim : 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,10 +725,12 @@ public:
                     V.lfoHold[l] = rnd(V.rng);
                 }
             }
+            // Reset On: the wave restarts at phase 0 on note on. Reset Off: free
+            // running (Mini manual "wave reset on note on, on or off"; 2x-06):
+            // the phase continues from wherever the voice left it (0 on a fresh,
+            // zeroed voice), so a repeated note renders the same every time.
             if (E[kReset1] >= 0.5f) V.ph1 = 0.0f;
-            else if (!n.reused) V.ph1 = float(lcg(V.rng) >> 8) * (1.0f / 16777216.0f);
             if (E[kReset2] >= 0.5f) V.ph2 = 0.0f;
-            else if (!n.reused) V.ph2 = float(lcg(V.rng) >> 8) * (1.0f / 16777216.0f);
         }
         v.level = V.env[0];
     }

@@ -202,6 +202,7 @@ private:
     bool clipValid_ = false;
     int clipRow0_ = 0, clipRows_ = 0, clipTrack0_ = 0, clipTracks_ = 0;
     uint32_t lastUpdate_ = 0;
+    int followPos_ = -1;           // playing slot the cursor last followed (-1: follow at once)
     bool loopInSong_ = false;      // state 3: song paused on one pattern (spec 06 §2.2)
     bool togglePending_ = false;   // F1 deferred action (seq+0x548 = 0x5ae00, spec 06 §2.3)
     int toggleStep_ = 0;           // master step at scheduling; fires on the next one
@@ -519,6 +520,11 @@ public:
     AutoSlicer slicer;          // spec 13 §F, stepped from update()
     int midiNote = -1;          // MIDI note holding the b0 preview voice (spec 17 §1.3 owner 2), -1 none
     float zoom() const { return view.zoom(); }
+    // Playhead (spec 05 §6, 0x52cc0: redraw every >= 5 ms): x of the last
+    // auditioned voice's play position in the waveform, -1 when none shows.
+    static constexpr uint32_t kHeadPollMs = 5;
+    int playheadX() const;
+    int drawnHeadX() const { return headX_; }
     // Marker-on-crossing bits (spec 13 §H.2, obj+0xab3): same order as heldPoints.
     uint8_t zeroMask() const;
     // Slice operations (appendix B §1.10) on the current instrument.
@@ -541,6 +547,10 @@ private:
     int sliceInstr_ = -1;       // instrument the detector writes to
     bool wasBusy_ = false;
     bool encPushDown_ = false;
+    void followHead(uint16_t voiceId);
+    int headTrack_ = -1;        // track of the last audition started here
+    int headX_ = -1;            // playhead x in the last drawn frame
+    uint32_t headAt_ = 0;       // last playhead poll (ms)
 };
 
 // ---------------------------------------------------------------------------
@@ -825,6 +835,31 @@ inline int popupInstrument(int pos) {
 void slotLabel(const App& a, int slot, char* out, int cap);
 inline int popupPosition(int instrument) {
     return isSynthInstrument(uint8_t(instrument)) ? instrument - kFirstSynthInstrument : instrument + kSynthSlotCount;
+}
+// Instrument popup on the MIDI tracks 9-16 (Mini manual §1.8: "tracks 9-16
+// are used for MIDI and synths"; USER_REPORTS_R2 item 5): Synth 1..3 first,
+// as on tracks 1-8, then MIDI 1..16 (positions 3..18 = 48..63).
+constexpr int kMidiPopupCount = kSynthSlotCount + kMidiInstrumentCount;
+inline int popupInstrumentMidi(int pos) {
+    return pos < kSynthSlotCount ? kFirstSynthInstrument + pos : kFirstMidiInstrument + pos - kSynthSlotCount;
+}
+inline int popupPositionMidi(int instrument) {
+    if (isSynthInstrument(uint8_t(instrument))) return instrument - kFirstSynthInstrument;
+    if (instrument >= kFirstMidiInstrument && instrument < kInstrumentCount)
+        return instrument - kFirstMidiInstrument + kSynthSlotCount;
+    return kSynthSlotCount;   // a sample instrument: MIDI 1
+}
+// Instr-column pad on a MIDI track [OT: the Mini's pad rule there is not
+// documented]: pads 1-16 = MIDI 1..16 (stock), pads 17-19 = Synth 1..3, the
+// other pads keep the stock MIDI wrap.
+inline int midiTrackPadInstrument(int pad) {
+    const int k = pad - kMidiInstrumentCount;
+    return k >= 0 && k < kSynthSlotCount ? kFirstSynthInstrument + k : kFirstMidiInstrument + (pad & 15);
+}
+// Pad of a MIDI-track instrument (the inverse; -1: none).
+inline int midiTrackInstrumentPad(int instrument) {
+    if (isSynthInstrument(uint8_t(instrument))) return kMidiInstrumentCount + instrument - kFirstSynthInstrument;
+    return -1;
 }
 }  // namespace synthui
 

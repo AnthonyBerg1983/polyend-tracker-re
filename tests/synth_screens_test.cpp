@@ -614,6 +614,121 @@ TEST(instrument_popup_lists_synths) {
     CHECK(a.currentInstrument() == 50);
 }
 
+// USER_REPORTS_R2 item 5 (Mini manual §1.8: "tracks 9-16 are used for MIDI
+// and synths"): on tracks 9-16 the Instrument popup lists Synth 1..3, then
+// MIDI 1..16; Instr-column pads 1-16 = MIDI 1..16, 17-19 = Synth 1..3 [OT].
+TEST(midi_track_popup_lists_synths) {
+    Harness h;
+    App& a = *h.app;
+    a.setSynthModel(0, int(SynthModel::VAP));
+    h.tap(btn::Pattern);
+    PatternScreen& ps = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    for (int i = 0; i < kTrackCount; ++i) h.tap(btn::Right);
+    while (ps.track > 12) h.tap(btn::Left);
+    CHECK_EQ(ps.track, 12);   // track 13
+    h.tap(btn::Rec);
+    ps.col = 1;
+    ps.step = 0;
+    a.setCurrentInstrument(kFirstMidiInstrument + 2);   // MIDI 3
+    h.down(btn::Instr);
+    h.run(300);
+    CHECK(ps.popup().isOpen());
+    CHECK_EQ(ps.popup().kind(), 5);
+    CHECK_EQ(ps.popup().cursor(), 5);   // MIDI 3 after the three synths
+    CHECK(frameHas(h, "Synth 1 (VAP)"));
+    CHECK(frameHas(h, "Synth 3 (VAP)"));
+    CHECK(frameHas(h, "MIDI Channel 1"));
+    for (int i = 0; i < 40; ++i) h.enc(1);
+    CHECK(frameHas(h, "MIDI Channel 16"));
+    CHECK_EQ(ps.popup().cursor(), synthui::kMidiPopupCount - 1);   // MIDI 16 ends the list
+    CHECK_EQ(synthui::popupInstrumentMidi(ps.popup().cursor()), kInstrumentCount - 1);
+    // Pads: 1-16 pick MIDI 1..16, 17-19 Synth 1..3, the rest nothing.
+    h.pad(3);
+    CHECK_EQ(synthui::popupInstrumentMidi(ps.popup().cursor()), kFirstMidiInstrument + 3);
+    h.pad(17);
+    CHECK_EQ(synthui::popupInstrumentMidi(ps.popup().cursor()), kFirstSynthInstrument + 1);
+    h.pad(30);
+    CHECK_EQ(synthui::popupInstrumentMidi(ps.popup().cursor()), kFirstSynthInstrument + 1);
+    uint8_t lv[48] = {};
+    ps.padLeds(lv);
+    CHECK(lv[17] == a.cfg.padFull());
+    CHECK(lv[0] == a.cfg.padDim());
+    CHECK(lv[19] == 0);
+    // Up to the first entry: Synth 1; commit on release.
+    for (int i = 0; i < 40; ++i) h.enc(-1);
+    CHECK_EQ(ps.popup().cursor(), 0);
+    h.up(btn::Instr);
+    CHECK(a.currentInstrument() == kFirstSynthInstrument);
+    CHECK_EQ(int(a.pattern().tracks[12].steps[0].instrument), kFirstSynthInstrument);
+    // A synth current instrument reopens the popup on its own entry (the
+    // MIDI-only list put the cursor at 16, past its 16 entries).
+    h.down(btn::Instr);
+    h.run(300);
+    CHECK_EQ(ps.popup().cursor(), 0);
+    h.enc(1);
+    h.enc(1);
+    h.up(btn::Instr);
+    CHECK(a.currentInstrument() == kFirstSynthInstrument + 2);
+    // MIDI channels still commit as 48..63.
+    h.down(btn::Instr);
+    h.run(300);
+    CHECK_EQ(ps.popup().cursor(), 2);
+    h.enc(1);
+    h.up(btn::Instr);
+    CHECK(a.currentInstrument() == kFirstMidiInstrument);
+    CHECK_EQ(int(a.pattern().tracks[12].steps[0].instrument), kFirstMidiInstrument);
+    // Instr-column pads in edit mode: pad 18 writes Synth 2, pad 4 MIDI 5;
+    // the step LEDs light pad 18 for the synth.
+    ps.step = 1;
+    h.pad(17);
+    CHECK_EQ(int(a.pattern().tracks[12].steps[1].instrument), kFirstSynthInstrument + 1);
+    ps.step = 1;
+    for (int p = 0; p < 48; ++p) lv[p] = 0;
+    ps.padLeds(lv);
+    CHECK(lv[17] == a.cfg.padFull());
+    ps.step = 2;
+    h.pad(4);
+    CHECK_EQ(int(a.pattern().tracks[12].steps[2].instrument), kFirstMidiInstrument + 4);
+    ps.step = 3;
+    h.pad(20);   // past the synths: the stock MIDI wrap
+    CHECK_EQ(int(a.pattern().tracks[12].steps[3].instrument), kFirstMidiInstrument + 4);
+}
+
+// A synth step on track 13 plays the synth; a MIDI step on track 14 still
+// sends MIDI (USER_REPORTS_R2 item 5).
+TEST(midi_track_synth_step_plays_the_synth) {
+    Harness h;
+    App& a = *h.app;
+    a.setSynthModel(0, int(SynthModel::VAP));
+    a.cfg.midiOut = 3;   // MIDI out on both ports
+    a.applySequencerSettings();
+    Step& s13 = a.pattern().tracks[12].steps[0];
+    s13.note = 60;
+    s13.instrument = uint8_t(kFirstSynthInstrument);
+    Step& s14 = a.pattern().tracks[13].steps[0];
+    s14.note = 62;
+    s14.instrument = uint8_t(kFirstMidiInstrument + 1);
+    a.patternEdited();
+    const size_t n0 = h.midi.sent.size();
+    h.tap(btn::Pattern);
+    h.tap(btn::Play);
+    for (int i = 0; i < 6; ++i) {
+        h.audio.pump(4);
+        h.run(10);
+    }
+    const audio::SynthVoice* v = a.engine.synth().voiceOfTrack(12);
+    CHECK(v != nullptr);
+    if (v) CHECK_EQ(int(v->slot), 0);
+    CHECK(a.engine.synth().voiceOfTrack(13) == nullptr);
+    bool noteOn = false;
+    for (size_t i = n0; i + 2 < h.midi.sent.size(); ++i)
+        if (h.midi.sent[i] == 0x91 && h.midi.sent[i + 1] == 62) noteOn = true;   // channel 2, note 62
+    CHECK(noteOn);
+    if (!noteOn)
+        for (size_t i = n0; i < h.midi.sent.size(); ++i) std::printf(" %02x", h.midi.sent[i]);
+    h.tap(btn::Play);
+}
+
 // The title bar names a synth current instrument "Synth 1 (VAP)" (Tracker+
 // 1.0, docs/SYNTH_UX_MINI_VS_OT.md row 3), never "65. MIDI Channel 17".
 TEST(title_names_synth_instrument) {

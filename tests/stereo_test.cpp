@@ -240,7 +240,8 @@ TEST(stereo_slice_boundaries_both_channels) {
         ins.selectedSlice = 1;
         VoiceControl c;
         c.antiAliasing = false;
-        const Out o = renderNote(ins, L.data(), R.data(), 60, 40, 0, 0, 0, 0, false, c);
+        // Beat Slice: note n plays slice n - 24 (1.9.7), so slice 1 is note 25.
+        const Out o = renderNote(ins, L.data(), R.data(), m == PlayMode::BeatSlice ? 25 : 60, 40, 0, 0, 0, 0, false, c);
         const int32_t s = int32_t(uint64_t(n) * ins.slices[1] / 65535u);
         const int32_t e = int32_t(uint64_t(n) * ins.slices[2] / 65535u);
         int played = 0;
@@ -491,7 +492,7 @@ TEST(mono_path_byte_exact) {
         }
     }
     std::printf("  mono voice hash: %016llx\n", (unsigned long long)h);
-    CHECK_EQ(h, 0xfa5f5f54eba76ec3ull);   // golden (host x86-64), recorded at 253012b
+    CHECK_EQ(h, 0x4ba92d3a52b009e7ull);   // golden (host x86-64), re-recorded at 1.9.7 (Beat Slice note -> slice)
 }
 
 // --- engine: stereo bank instrument plays stereo, stems keep the image ------------
