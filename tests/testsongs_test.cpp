@@ -118,6 +118,92 @@ void checkMiniFiles(const Files& gen, const std::string& dir, const ExtTracks& w
     CHECK(patterns > 0);
 }
 
+// Song 13 (percsong.inc), after the open: Synth 1-3 are PERC kits with our
+// own patch names and polyphony 1 (3 voices <= the default budget of 4);
+// every note is a synth note (no sample, no MIDI); per kit and tick at most
+// one tom and one hi-hat note (one channel each); every drum, the silent
+// notes, several tom pitches, all six macro FX and a six-drum tick (the cost
+// governor's case) are in the song.
+void checkPercOnly(ot::App& a) {
+    namespace perc = ot::audio::perc;
+    const char* names[3] = {"OT Perc Deep", "OT Perc Tight", "OT Perc Space"};
+    uint32_t polySum = 0;
+    for (int k = 0; k < 3; ++k) {
+        const ot::SynthSlotRecord r = a.synthSlot(k);
+        CHECK_EQ(r.model, uint32_t(ot::SynthModel::PERC));
+        CHECK_EQ(a.synthPatch(k).engine, ot::kSynthEnginePerc);
+        CHECK_EQ(r.polyphony, 1u);
+        CHECK(std::strcmp(r.patchName, names[k]) == 0);
+        CHECK(r.gainDb <= -9.0f);
+        polySum += r.polyphony;
+        // Six bipolar macros of our own.
+        for (int m = 0; m < 6; ++m) {
+            CHECK(a.synthPatch(k).macros[m].bipolar);
+            CHECK(a.synthPatch(k).macros[m].count >= 1);
+        }
+    }
+    CHECK(polySum <= ot::Config::kDefaultSynthVoices);
+    const int held = ts::bgr::peakSynthVoices(a);
+    std::printf("    peak synth voices held %d (budget %d)\n", held, int(ot::Config::kDefaultSynthVoices));
+    CHECK(held <= int(ot::Config::kDefaultSynthVoices));
+    CHECK(std::fabs(a.project.tempo() - 120.0f) < 0.01f);
+    int patterns = 0, notes = 0, maxSameTick = 0, maxVol = 0;
+    std::map<int, int> drums;   // perc::Drum -> hits
+    std::map<int, int> tomPitches, silent;
+    bool macroFx[6] = {};
+    for (int n = 1; n <= ot::kPatternCount; ++n) {
+        if (!a.patternPresent(n)) continue;
+        ++patterns;
+        std::vector<ot::Track> tr(ot::kTrackCount);
+        for (int t = 0; t < ot::kTrackCount; ++t) a.readStoredTrack(n, t, tr[size_t(t)]);
+        for (int st = 0; st < ot::kStepCount; ++st) {
+            int toms[3] = {}, hats[3] = {}, kinds[3] = {};
+            for (int t = 0; t < ot::kTrackCount; ++t) {
+                const ot::Step& x = tr[size_t(t)].steps[st];
+                for (const auto& f : x.fx) {
+                    for (int m = 0; m < 6; ++m) {
+                        const ot::FxId ids[6] = {ot::FxId::MidiCcA, ot::FxId::MidiCcB, ot::FxId::MidiCcC,
+                                                 ot::FxId::MidiCcD, ot::FxId::MidiCcE, ot::FxId::MidiCcF};
+                        if (f.type == uint8_t(ids[m])) macroFx[m] = true;
+                    }
+                    if (f.type == uint8_t(ot::FxId::Volume)) maxVol = std::max(maxVol, int(f.value));
+                }
+                if (x.note < 0) continue;
+                ++notes;
+                CHECK(x.instrument >= 64 && x.instrument <= 66);
+                if (x.instrument < 64 || x.instrument > 66) continue;
+                const int k = x.instrument - 64;
+                const perc::Drum d = perc::drumForNote(uint8_t(x.note));
+                if (d == perc::kNone) {
+                    ++silent[x.note];
+                    continue;
+                }
+                ++drums[d];
+                ++kinds[k];
+                if (d == perc::kTom) {
+                    ++toms[k];
+                    ++tomPitches[x.note];
+                }
+                if (d == perc::kHat) ++hats[k];
+            }
+            for (int k = 0; k < 3; ++k) {
+                CHECK(toms[k] <= 1);
+                CHECK(hats[k] <= 1);
+                maxSameTick = std::max(maxSameTick, kinds[k]);
+            }
+        }
+    }
+    std::printf("    %d patterns, %d notes, %zu tom pitches, max drums on one tick %d, max Volume %d\n", patterns,
+                notes, tomPitches.size(), maxSameTick, maxVol);
+    CHECK(patterns >= 6 && patterns <= 8);
+    for (int d = 0; d < perc::kDrums; ++d) CHECK(drums[d] > 0);
+    CHECK_EQ(silent.size(), size_t(4));   // 61, 63, 68, 70
+    CHECK(tomPitches.size() >= 6);
+    for (bool m : macroFx) CHECK(m);
+    CHECK_EQ(maxSameTick, 6);   // every drum on one tick: the governor keeps five
+    CHECK(maxVol <= 50);        // Volume law (TESTSONGS.md)
+}
+
 // Generates `id`, then checks stock format, open, round trip and playback.
 void checkSong(ts::SongId id, bool force) {
     const ts::SongInfo* info = ts::findSong(id);
@@ -214,7 +300,7 @@ void checkSong(ts::SongId id, bool force) {
             }
         CHECK(toms > 0);
     }
-    const bool bg = int(id) >= int(ts::SongId::BgTitle);
+    const bool bg = ts::isBgSong(id);
     if (bg) {
         // BLAST GRID remixes (bgsongs.inc): Synth 1 VAP, 2 ACD, 3 PERC; the
         // notes per track match the source parser's counts (bg_data.h); the
@@ -245,6 +331,10 @@ void checkSong(ts::SongId id, bool force) {
         if (f.first.size() > 4 && f.first.compare(f.first.size() - 4, 4, ".pti") == 0) ++ptiFiles;
     for (int i = 0; i < ot::kSampleInstrumentCount; ++i) present += h.app->instrPresent[i] ? 1 : 0;
     CHECK_EQ(present, ptiFiles);
+    if (id == ts::SongId::PercOnly) {
+        CHECK_EQ(ptiFiles, 0);
+        checkPercOnly(*h.app);
+    }
 
     // Re-encode everything from the loaded model, then Save.
     h.app->markProjectDirty();
@@ -285,7 +375,8 @@ void checkSong(ts::SongId id, bool force) {
     CHECK(h.app->seq.isPlaying());
     uint32_t acc = 0;
     int peak = 0, voices = 0;
-    const uint32_t ms = id == ts::SongId::LoadStress ? 16500 : 8500;
+    // Song 13 opens with a 128-step pattern at 120 BPM (16 s).
+    const uint32_t ms = id == ts::SongId::LoadStress ? 16500 : (id == ts::SongId::PercOnly ? 17000 : 8500);
     for (uint32_t t = 0; t < ms; t += 10) {
         acc += 10u * 44100u;
         int blocks = 0;
@@ -309,6 +400,13 @@ void checkSong(ts::SongId id, bool force) {
         CHECK_EQ(h.app->seq.swingActive(), sw != 0);
         if (sw) CHECK_EQ(int(h.app->seq.swingValue()), sw);
     }
+    if (id == ts::SongId::PercOnly) {
+        // Three PERC slots, one voice each: inside the budget, nothing stolen.
+        std::printf("    synth voices sounding at most %d, steals %u\n", voices, unsigned(h.app->engine.synth().steals()));
+        CHECK(voices >= 1);
+        CHECK(voices <= int(ot::Config::kDefaultSynthVoices));
+        CHECK_EQ(h.app->engine.synth().steals(), 0u);
+    }
     if (id == ts::SongId::Synths) {
         // The chords ask for more voices than the pool has: voices were stolen.
         std::printf("    synth steals %u\n", unsigned(h.app->engine.synth().steals()));
@@ -327,6 +425,7 @@ TEST(testsongs_table) {
     CHECK_EQ(ts::findSong(ts::SongId::SixteenTracks)->available, ts::kHas16Tracks);
     CHECK_EQ(ts::findSong(ts::SongId::Stereo)->available, ts::kHasStereo);
     CHECK_EQ(ts::findSong(ts::SongId::Synths)->available, ts::kHasSynths && ts::kHas16Tracks);
+    CHECK_EQ(ts::findSong(ts::SongId::PercOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK(ts::kHasSynths);
     for (int i = 5; i < ts::kSongCount; ++i) CHECK_EQ(ts::songInfo(i).available, ts::kHasSynths && ts::kHas16Tracks);
     for (int i = 0; i < ts::kSongCount; ++i) CHECK(std::strlen(ts::songInfo(i).name) <= ot::mt::kNameMax);
@@ -382,14 +481,14 @@ std::vector<int16_t> wavSamples(const std::vector<uint8_t>& f) {
 
 }  // namespace
 
-// Songs 1 and 5 and two BG remixes rendered through the
+// Songs 1 and 5, two BG remixes and the PERC-only song rendered through the
 // App's own stem export (spec 04 §6.1): no stem clips (sample tracks at the
 // voice AMP clamp, synth slot buses at int16), and the sum of the stems --
 // what reaches the master sum before its clamp and the limiter (spec 07
 // §5.4) -- stays under full scale but for isolated transients.
 TEST(testsongs_rendered_levels_do_not_clip) {
     const ts::SongId ids[] = {ts::SongId::TwelveTracks, ts::SongId::Synths, ts::SongId::BgTitle,
-                              ts::SongId::BgFinalBoss};
+                              ts::SongId::BgFinalBoss, ts::SongId::PercOnly};
     for (ts::SongId id : ids) {
         const ts::SongInfo* info = ts::findSong(id);
         if (!info || !info->available) continue;
@@ -443,7 +542,7 @@ TEST(testsongs_rendered_levels_do_not_clip) {
 TEST(testsongs_bg_arpeggios_are_sustained_samples) {
     for (int i = 0; i < ts::kSongCount; ++i) {
         const ts::SongInfo& info = ts::songInfo(i);
-        if (int(info.id) < int(ts::SongId::BgTitle) || !info.available) continue;
+        if (!ts::isBgSong(info.id) || !info.available) continue;
         std::unique_ptr<Harness> hp = deviceHarness();
         Harness& h = *hp;
         ts::GenOptions opt;
