@@ -41,10 +41,22 @@ struct Track {
         lastStep = last;
         for (auto& s : steps) s.clear();
     }
-};
 
-struct Pattern {
-    Track tracks[kTrackCount];
+    // Track without data: every step empty (note, instrument and both FX
+    // types 0; FX values are ignored like Step::clear() leaves them).
+    bool blank() const {
+        for (const Step& s : steps)
+            if (s.note != kNoteEmpty || s.instrument || s.fx[0].type || s.fx[1].type) return false;
+        return true;
+    }
+};
+static_assert(sizeof(Track) == 769, "track record is 769 bytes (spec 02 §4.2)");
+
+// N tracks of a pattern. Layout = N packed track records (no padding).
+template <int N>
+struct PatternTracks {
+    static constexpr int kTracks = N;
+    Track tracks[N];
 
     // Default pattern (spec 02 §4.4): every track 32 steps, all steps empty.
     void setDefault() {
@@ -54,5 +66,34 @@ struct Pattern {
         }
     }
 };
+
+// Stock pattern: tracks 0..11. The resident pattern store
+// (App::storedStock) and the pattern_NN.mtp image (spec 02 §4).
+struct PatternStock : PatternTracks<kStockTrackCount> {};
+
+// Working pattern: all 16 tracks (sequencer current / preload buffers, undo,
+// file undo, clipboard, performance scratch). Tracks 12..15 are stored in
+// the ext-track pool (model/pattern_store.h) when not empty.
+struct Pattern : PatternTracks<kTrackCount> {
+    void copyStockFrom(const PatternStock& s) {
+        for (int t = 0; t < kStockTrackCount; ++t) tracks[t] = s.tracks[t];
+    }
+    void copyStockTo(PatternStock& s) const {
+        for (int t = 0; t < kStockTrackCount; ++t) s.tracks[t] = tracks[t];
+    }
+};
+
+static_assert(sizeof(PatternStock) == 769u * kStockTrackCount, "packed stock tracks");
+static_assert(sizeof(Pattern) == 769u * kTrackCount, "packed tracks");
+
+// An extension track that has no pool block reads as this: all steps empty,
+// the pattern length of stock track 0 (as the legacy 8 -> 12 upgrade fills
+// tracks 8..11, spec 02 §4.4).
+inline void defaultExtTrack(Track& t, const PatternStock& s) { t.clear(s.tracks[0].lastStep); }
+inline void defaultExtTrack(Track& t, const Pattern& p) { t.clear(p.tracks[0].lastStep); }
+// True when ext track t (12..15) of p carries nothing a block must keep.
+inline bool extTrackIsDefault(const Track& t, uint8_t baseLastStep) {
+    return t.lastStep == baseLastStep && t.blank();
+}
 
 }  // namespace ot

@@ -59,8 +59,8 @@ TEST(config_reset_reapplies_backlight) {
     App& a = *h.app;
     a.cfg.brightness = 0;
     h.tap(btn::Config);
-    for (int i = 0; i < 4; ++i) h.tap(btn::Down);   // Firmware
-    CHECK(cfgScreen(h).category == 4);
+    for (int i = 0; i < 5; ++i) h.tap(btn::Down);   // Firmware
+    CHECK(cfgScreen(h).category == 5);
     h.tap(btn::Right);
     for (int i = 0; i < 3; ++i) h.tap(btn::Down);   // Reset config
     h.tap(btn::F8);
@@ -75,8 +75,8 @@ TEST(config_licenses_page) {
     App& a = *h.app;
     h.tap(btn::Config);
     ConfigScreen& c = cfgScreen(h);
-    for (int i = 0; i < 5; ++i) h.tap(btn::Down);   // Info
-    CHECK(c.category == 5);
+    for (int i = 0; i < 6; ++i) h.tap(btn::Down);   // Info
+    CHECK(c.category == 6);
     h.tap(btn::Right);        // Licenses
     CHECK(c.option == 0);
     h.tap(btn::F8);
@@ -110,7 +110,7 @@ TEST(config_menu_lists_all_options_with_defaults) {
     struct Want {
         const char* name;
         int kind;     // 2 numeric, 3 enum, 5 text, 7 action
-        int store;    // 0 config, 1 project, 2 none
+        int store;    // 0 config, 1 project, 2 none, 3 live USB storage state
         int count;    // picker entries
         int min;
         int def;      // default picker index (-1: not checked)
@@ -128,7 +128,8 @@ TEST(config_menu_lists_all_options_with_defaults) {
         {"Pads brightness", 3, 0, 3, 0, 2},   {"Pads preview", 3, 0, 3, 0, 2},
         {"Recording options", 3, 0, 4, 0, 0}, {"Numbering mode", 3, 0, 3, 0, 1},
         {"Pattern arrangement", 3, 0, 3, 0, 0}, {"Pattern top info", 3, 0, 3, 0, 0},
-        {"Line in channel", 3, 0, 3, 0, 0},
+        {"Line in channel", 3, 0, 3, 0, 0},   {"CPU meter", 3, 0, 3, 0, 0},   // 2.x [I]
+        {"Synth voices", 2, 0, 8, 1, 3},                                     // 2.x [I], default 4
     };
     const Want midi[] = {
         {"Clock in", 3, 0, 3, 0, 0},          {"Clock out", 3, 0, 4, 0, 0},
@@ -147,19 +148,26 @@ TEST(config_menu_lists_all_options_with_defaults) {
         {"Firmware update", 7, 2, 0, 0, -1}, {"Current version", 5, 2, 0, 0, -1},
         {"Build", 5, 2, 0, 0, -1},           {"Reset config", 7, 2, 0, 0, -1},
     };
-    const Want info[] = {{"Licenses", 7, 2, 0, 0, -1}};
+    // 2.x USB Storage: live state, never stored (store 3), Off at boot.
+    const Want usb[] = {{"USB Storage", 3, 3, 2, 0, 0}};
+    const Want info[] = {{"Licenses", 7, 2, 0, 0, -1},
+                         // 2.x [I] (spec 2x-02 §2.2)
+                         {"CPU overruns", 5, 2, 0, 0, -1},
+                         {"Governor reductions", 5, 2, 0, 0, -1},
+                         {"Synth voice cap", 5, 2, 0, 0, -1}};
     struct CatWant {
         const char* name;
         const Want* w;
         int n;
     };
     const CatWant cats[] = {
-        {"Project Settings", project, 10}, {"General", general, 11}, {"MIDI", midi, 11},
-        {"Metronome", metro, 5},           {"Firmware", firmware, 4}, {"Info", info, 1},
+        {"Project Settings", project, 10}, {"General", general, 13}, {"MIDI", midi, 11},
+        {"USB", usb, 1},                   // [I] 2.x (Tracker Mini order)
+        {"Metronome", metro, 5},           {"Firmware", firmware, 4}, {"Info", info, 4},
     };
-    CHECK_EQ(ConfigScreen::categoryCount(), 6);
+    CHECK_EQ(ConfigScreen::categoryCount(), 7);
     int total = 0;
-    for (int k = 0; k < 6; ++k) {
+    for (int k = 0; k < 7; ++k) {
         CHECK_STR(ConfigScreen::categoryName(k), cats[k].name);
         CHECK_EQ(ConfigScreen::optionCount(k), cats[k].n);
         for (int i = 0; i < cats[k].n; ++i, ++total) {
@@ -174,9 +182,11 @@ TEST(config_menu_lists_all_options_with_defaults) {
             if (w.def >= 0) CHECK_EQ(c.optionIndex(k, i), w.def);
         }
     }
-    CHECK_EQ(total, 42);
+    CHECK_EQ(total, 48);   // stock 42 + 2.x CPU meter, Synth voices, three Info lines, USB Storage
     char t[48];
-    c.optionText(3, 2, t, sizeof t);   // time signature numerator default 4
+    c.optionText(3, 0, t, sizeof t);   // USB Storage: Off
+    CHECK_STR(t, "Off");
+    c.optionText(4, 2, t, sizeof t);   // time signature numerator default 4
     CHECK_STR(t, "4");
     c.optionText(2, 10, t, sizeof t);  // clock sync correction default 0
     CHECK_STR(t, "0");
@@ -185,17 +195,17 @@ TEST(config_menu_lists_all_options_with_defaults) {
     // Help texts: 25 options (spec 15 §3.2): all of Project Settings and
     // General, CC in, CC in channel, Clock sync correction, Firmware update.
     int helps = 0;
-    for (int k = 0; k < 6; ++k)
+    for (int k = 0; k < 7; ++k)
         for (int i = 0; i < cats[k].n; ++i) {
             ConfigScreen::OptionInfo o;
             CHECK(ConfigScreen::optionInfo(k, i, &o));
-            const bool want = k <= 1 || (k == 2 && (i == 7 || i == 8 || i == 10)) || (k == 4 && i == 0);
+            const bool want = k <= 1 || (k == 2 && (i == 7 || i == 8 || i == 10)) || k == 3 || (k == 5 && i == 0);
             CHECK_EQ(o.help != nullptr, want);
             helps += o.help != nullptr;
         }
-    CHECK_EQ(helps, 25);
-    CHECK_EQ(configHelpCount(), 25);
-    c.optionText(4, 1, t, sizeof t);
+    CHECK_EQ(helps, 28);   // stock 25 + 2.x CPU meter, Synth voices and USB Storage
+    CHECK_EQ(configHelpCount(), 28);
+    c.optionText(5, 1, t, sizeof t);
     CHECK(std::strlen(t) > 0);
 }
 
@@ -335,6 +345,31 @@ TEST(config_recorder_settings_are_per_project) {
     CHECK_EQ(a.cfg.radioFreq10, 990);
 }
 
+TEST(config_recorder_source_radio_and_mic_hg_survive_save_and_open) {
+    // 0x134 recorder source on the original Tracker: Radio (1) and Mic high
+    // gain (3) come back from a saved project (2.0.0 used the Mini's
+    // `> 2 -> 0` load rule, which reset Mic high gain to line in).
+    for (uint8_t src : {uint8_t(1), uint8_t(3)}) {
+        Harness h;
+        App& a = *h.app;
+        h.run(20);
+        a.cfg.recSource = src;
+        a.cfg.recGain[1] = 41;
+        a.cfg.radioFreq10 = 1037;
+        h.run(20);
+        CHECK(a.saveProjectAs("RadioSrc"));
+        CHECK(a.newProject());
+        h.run(20);
+        CHECK_EQ(a.cfg.recSource, 0);
+        CHECK(a.openProject("Projects", "RadioSrc"));
+        h.run(20);
+        CHECK_EQ(a.project.u8(pf::kRecSource), src);
+        CHECK_EQ(a.cfg.recSource, src);
+        CHECK_EQ(a.cfg.recGain[1], 41);
+        CHECK_EQ(a.cfg.radioFreq10, 1037);
+    }
+}
+
 // ---- Stock labels, help box, clock sync picker, line in (spec 15) -----------
 
 TEST(config_stock_value_labels) {
@@ -440,11 +475,34 @@ TEST(config_line_in_channel_reaches_engine) {
     CHECK_EQ(h.audio.pump(8), 0);                      // right side is silent
     // Reset config re-applies the default (stereo).
     h.tap(btn::F1);
-    for (int i = 0; i < 3; ++i) h.tap(btn::Down);    // Firmware
+    for (int i = 0; i < 4; ++i) h.tap(btn::Down);    // Firmware
     h.tap(btn::Right);
     for (int i = 0; i < 3; ++i) h.tap(btn::Down);    // Reset config
     h.tap(btn::F8);
     h.tap(btn::F8);
     h.audio.pump(1);
     CHECK_EQ(a.engine.settings().lineInChannel, 0);
+}
+
+// 2.x [I]: Config > General > Synth voices (1..8, default 4) sets the
+// governor budget (VERIFY 2.0.0 R3).
+TEST(config_synth_voices_reaches_governor) {
+    Harness h;
+    App& a = *h.app;
+    CHECK_EQ(a.engine.governor().budget(), 4);
+    h.tap(btn::Config);
+    h.tap(btn::Down);         // General
+    h.tap(btn::Right);
+    for (int i = 0; i < 12; ++i) h.tap(btn::Down);   // Synth voices
+    ConfigScreen& c = cfgScreen(h);
+    char t[48];
+    c.optionText(1, 12, t, sizeof t);
+    CHECK_STR(t, "4");
+    h.tap(btn::F8);
+    h.tap(btn::Down);
+    h.tap(btn::Down);         // 6
+    h.tap(btn::F8);
+    CHECK_EQ(a.cfg.synthVoices, 6);
+    a.preBlock(0.0f);
+    CHECK_EQ(a.engine.governor().budget(), 6);
 }

@@ -2,6 +2,15 @@
 #include "audio/audio_tables.h"
 
 #include <cmath>
+#include <cstring>
+
+// Const wavetable pitch / grain window tables on ARM (see audio_tables.h);
+// OT_TABLES_RUNTIME (the table generator) computes them instead.
+#if defined(__arm__) && !defined(OT_TABLES_RUNTIME)
+#define OT_CONST_AUDIO_TABLES 1
+#else
+#define OT_CONST_AUDIO_TABLES 0
+#endif
 
 namespace ot {
 namespace audio {
@@ -12,12 +21,18 @@ constexpr float kPi = 3.14159265f;
 
 bool gBuilt = false;
 float gPitch[kPitchTableSize];
+#if OT_CONST_AUDIO_TABLES
+#include "audio/audio_tables_arm.inc"
+const float (&gWtPitch)[kWavetableSizes][kPitchTableSize] = kWtPitchArm;
+const uint16_t (&gWindow)[3][kGrainWindowLen] = kWindowArm;
+#else
 float gWtPitch[kWavetableSizes][kPitchTableSize];
+uint16_t gWindow[3][kGrainWindowLen];
+#endif
 float gCutoff[kCutoffSteps];
 float gVol[101];
 float gTrk[101];
 float gSend[101];
-uint16_t gWindow[3][kGrainWindowLen];
 
 // RATE (spec 04 §4.8), steps per LFO cycle, 29 entries.
 const float kRate[kRateCount] = {128.0f, 96.0f, 64.0f, 48.0f, 32.0f, 24.0f, 16.0f, 12.0f, 8.0f, 6.0f,
@@ -51,16 +66,38 @@ inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 
 float dbToGain(float db) { return std::pow(10.0f, db / 20.0f); }
 
+void computeConstTables(float wtPitch[kWavetableSizes][kPitchTableSize], uint16_t window[3][kGrainWindowLen]) {
+    // spec 04 §2.4: wt_rate_W[i] = rate[i] * (2^(1/4) * 440 * W / 44100), rate as gPitch.
+    float pitch[kPitchTableSize];
+    for (int i = 0; i < kPitchTableSize; ++i) pitch[i] = std::exp2(float(i - kUnityNote) / 12.0f) * 0.9996f;
+    for (int k = 0; k < kWavetableSizes; ++k) {
+        const float w = float(32u << k);
+        const float scale = std::exp2(0.25f) * 440.0f * w / 44100.0f;
+        for (int i = 0; i < kPitchTableSize; ++i) wtPitch[k][i] = pitch[i] * scale;
+    }
+    // spec 04 §3.1 grain windows.
+    for (int i = 0; i < kGrainWindowLen; ++i) {
+        window[0][i] = 65535;
+        const int tri = i < 500 ? i : (kGrainWindowLen - i);
+        window[1][i] = uint16_t(clampi(int(float(tri) / 500.0f * 65535.0f), 0, 65535));
+        window[2][i] = uint16_t(clampi(int(std::sin(kPi * float(i) / 1000.0f) * 65535.0f), 0, 65535));
+    }
+}
+
+bool constTablesMatch() {
+    static float wt[kWavetableSizes][kPitchTableSize];
+    static uint16_t win[3][kGrainWindowLen];
+    computeConstTables(wt, win);
+    return std::memcmp(wt, gWtPitch, sizeof(wt)) == 0 && std::memcmp(win, gWindow, sizeof(win)) == 0;
+}
+
 void initTables() {
     if (gBuilt) return;
     // spec 04 §2.4: rate[i] = 2^((i-60)/12) * 0.9996.
     for (int i = 0; i < kPitchTableSize; ++i) gPitch[i] = std::exp2(float(i - kUnityNote) / 12.0f) * 0.9996f;
-    // spec 04 §2.4: wt_rate_W[i] = rate[i] * (2^(1/4) * 440 * W / 44100).
-    for (int k = 0; k < kWavetableSizes; ++k) {
-        const float w = float(32u << k);
-        const float scale = std::exp2(0.25f) * 440.0f * w / 44100.0f;
-        for (int i = 0; i < kPitchTableSize; ++i) gWtPitch[k][i] = gPitch[i] * scale;
-    }
+#if !OT_CONST_AUDIO_TABLES
+    computeConstTables(gWtPitch, gWindow);
+#endif
     // spec 04 §4.4: CUT[k] = 20 * 2^(k/50).
     for (int k = 0; k < kCutoffSteps; ++k) gCutoff[k] = 20.0f * std::exp2(float(k) / 50.0f);
     // spec 04 §4.2 VOL[], TRK[]; §5.5 SEND[].
@@ -74,13 +111,6 @@ void initTables() {
     for (int i = 87; i <= 100; ++i) gTrk[i] = dbToGain(0.12f + 0.42f * float(i - 86));
     gSend[0] = 0.0f;
     for (int i = 1; i <= 100; ++i) gSend[i] = dbToGain(-40.0f + 0.4f * float(i));
-    // spec 04 §3.1 grain windows.
-    for (int i = 0; i < kGrainWindowLen; ++i) {
-        gWindow[0][i] = 65535;
-        const int tri = i < 500 ? i : (kGrainWindowLen - i);
-        gWindow[1][i] = uint16_t(clampi(int(float(tri) / 500.0f * 65535.0f), 0, 65535));
-        gWindow[2][i] = uint16_t(clampi(int(std::sin(kPi * float(i) / 1000.0f) * 65535.0f), 0, 65535));
-    }
     gBuilt = true;
 }
 

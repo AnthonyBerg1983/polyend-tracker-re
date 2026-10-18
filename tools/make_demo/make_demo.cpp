@@ -127,7 +127,10 @@ int main(int argc, char** argv) {
     FixedClock clock;
 
     std::vector<int16_t> bank(4u * 1024 * 1024), fx(ot::audio::AudioEngine::kFxMemorySamples);
-    std::vector<ot::Pattern> pats(ot::kPatternCount), undo(20), fundo(10);
+    std::vector<ot::PatternStock> pats(ot::kPatternCount);
+    std::vector<ot::Pattern> undo(20), fundo(10), seqBufs(2);
+    std::vector<ot::Track> extTracks(ot::ExtTrackPool::kDefaultBlocks + 1);
+    std::vector<uint8_t> extMeta(ot::ExtTrackPool::metaBytes(ot::ExtTrackPool::kDefaultBlocks));
     ot::Pattern clip;
     std::vector<uint8_t> nums(64), scratch(0x10000);
     std::unique_ptr<ot::App> app(new ot::App());
@@ -145,6 +148,10 @@ int main(int argc, char** argv) {
     m.fxMemory = fx.data();
     m.fxSamples = uint32_t(fx.size());
     m.patterns = pats.data();
+    m.seqBuffers = seqBufs.data();
+    m.extTracks = extTracks.data();
+    m.extTrackBlocks = int(extTracks.size());
+    m.extMeta = extMeta.data();
     m.undo = undo.data();
     m.undoNums = nums.data();
     m.undoSlots = 20;

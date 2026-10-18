@@ -42,22 +42,31 @@ struct SequencerSettings {
 // audio ISR never copies track data. `scratch` receives the whole source
 // pattern; it is separate from the preload buffer, so a song/queued preload
 // is never clobbered (stock reuses the preload buffer, spec 12 §C.1).
+// 2.x (docs/M1_PLAN.md §3): every track 0..15 has an override.
 struct PerfPatternMemory {
-    Track slot[8][2];
+    Track slot[kTrackCount][2];
     Pattern scratch;
 };
 static_assert(sizeof(Track) == 769, "track record is 769 bytes (spec 02 §4.2)");
 
 class Sequencer {
 public:
-    static constexpr int kTracks = kTrackCount;   // 12
+    // 2.x: 16 tracks (spec 2x-01 §6). Tracks 8..15 play MIDI and synths; synths
+    // (instruments 64..66) play on all 16 tracks (Mini manual 6.13).
+    static constexpr int kTracks = kTrackCount;   // 16
     static constexpr int kVoiceTracks = 8;        // tracks 0..7 own a sample voice
 
     Sequencer() { resetState(); }
 
     // --- wiring -------------------------------------------------------------
-    // bufA becomes the current pattern, bufB the preload buffer.
-    void attach(ISequencerSink* sink, ISequencerHost* host, Project* project, Pattern* bufA, Pattern* bufB);
+    // bufA becomes the current pattern, bufB the preload buffer. stage
+    // (optional, a third buffer): switchPatternNow() assembles the new
+    // pattern there in the main loop and the audio context swaps it in (no
+    // pattern copy in the audio block). nullptr keeps the stage buffer of an
+    // earlier attach() unless it is bufA or bufB; with none, the audio
+    // context loads the pattern itself (one copy in that block).
+    void attach(ISequencerSink* sink, ISequencerHost* host, Project* project, Pattern* bufA, Pattern* bufB,
+                Pattern* stage = nullptr);
     SequencerSettings& settings() { return settings_; }
     void seedRandom(uint32_t s) { rng_.seed(s); }
     uint32_t randomState() const { return rng_.state(); }
@@ -85,11 +94,14 @@ public:
     // (1..255) at once, also while playing. The sequencer is re-pointed like
     // 0x11a34 (swap buffers, Tempo-FX override and roll/arp cleared); the step
     // positions are kept (wrapped when beyond the new length). Main loop:
-    // while playing it publishes the request and the audio context commits it
-    // at its next block (one O(1) copy from the resident pattern store, no
-    // allocation); while stopped it commits now. A queued Left/Right change
-    // stays queued.
+    // with a stage buffer it loads the pattern there (host loadPattern, in
+    // the main loop), then publishes the request; the audio context swaps
+    // the stage buffer in at its next block (pointer swap, OP-1). Without one
+    // the audio context loads it (one copy from the resident pattern store).
+    // While stopped it commits now. A request not yet committed is replaced.
+    // A queued Left/Right change stays queued.
     void switchPatternNow(uint8_t num);
+    Pattern* stagePattern() { return stage_.load(std::memory_order_relaxed); }
     // Pattern number a not-yet-committed switchPatternNow() will play, else 0.
     uint8_t pendingSwitch() const { return pendSwitch_.load(std::memory_order_acquire); }
     // Song screen F1 deferred action (spec 06 §2.3): flips seq+0x1c without
@@ -122,8 +134,9 @@ public:
     void setPerformanceMode(bool on);
     bool performanceMode() const { return perfMode_; }
     void setPerfGlobalLength(int lastIndex) { perfGlobalLen_ = int16_t(lastIndex); }   // -1 = per track
-    void setPerfTrackLength(int t, int lastIndex) { if (t >= 0 && t < 8) perfLen_[t] = int16_t(lastIndex); }
-    // Play mode 0..22 (spec 12 §D); used on tracks 0..7 in performance mode.
+    void setPerfTrackLength(int t, int lastIndex) { if (validTrack(t)) perfLen_[t] = int16_t(lastIndex); }
+    // Play mode 0..22 (spec 12 §D); used on every track in performance mode
+    // (2.x: tracks 8..15 too, docs/M1_PLAN.md §3).
     // Changing to 0 from another mode re-syncs the step to the master step.
     void setPerfPlayMode(int t, uint8_t mode);
     uint8_t perfPlayMode(int t) const { return validTrack(t) ? tracks_[t].playMode : 0; }
@@ -140,16 +153,16 @@ public:
     // --- per-track pattern override (spec 12 §C) ----------------------------
     // Main-loop API. Without memory the override calls fail (return false).
     void setPerfPatternMemory(PerfPatternMemory* mem) { perfMem_ = mem; }
-    // Load pattern `number` (1..255) for voice track t (0..7) through the
+    // Load pattern `number` (1..255) for track t (0..15) through the
     // host (synchronous) into that track's staging slot and enter performance
     // mode. immediate: the track's next step plays the new data (while
     // stopped: now). Otherwise it is queued and commits when that track wraps
     // (its own loop end); a later call for the same track replaces the queue.
     bool setTrackPattern(int t, uint8_t number, bool immediate);
     // Pattern number playing on track t (0 = the current pattern, no override).
-    uint8_t trackPattern(int t) const { return (t >= 0 && t < 8 && ovActive_[t]) ? ovNum_[t] : 0; }
+    uint8_t trackPattern(int t) const { return (validTrack(t) && ovActive_[t]) ? ovNum_[t] : 0; }
     // Queued (not yet committed) pattern for track t, 0 = none.
-    uint8_t queuedTrackPattern(int t) const { return (t >= 0 && t < 8) ? pendNum_[t].load() : 0; }
+    uint8_t queuedTrackPattern(int t) const { return validTrack(t) ? pendNum_[t].load() : 0; }
     // Drop every override and pending queue (tracks play the current pattern).
     void clearTrackPatterns();
 
@@ -169,6 +182,10 @@ public:
     int microStep(int track = 0) const { return validTrack(track) ? tracks_[track].micro : 0; }
     int masterMicroStep() const { return masterMicro_; }
     int masterStep() const { return masterStep_; }
+    // Pattern position that drives the pattern end: wraps at the base pattern
+    // length (selection / global length override included), never at a
+    // per-track length or play mode (docs/M1_PLAN.md §3).
+    int patternPosition() const { return masterPos_; }
     int songPosition() const { return songPos_; }
     uint8_t currentPatternNumber() const { return curPatternNum_; }
     int queuedPattern() const { return queueActive_ ? queued_ : 0; }
@@ -268,8 +285,16 @@ private:
     void advanceStep(int t);
     void patternEnd();
     void swapBuffers();
+    void afterSwap();
     void commitSwitch();
     void startPreload();
+    void beginPreload(uint8_t num);
+    void preloadPart(int maxTracks);
+    void dropPreload() {
+        preloadIssued_ = false;
+        partNext_ = kTracks;
+    }
+    int preloadTracksPerBlock() const;
     void resetPositions(int startStep);
     void startPlayback(int startStep, bool keepSongMode, bool afterCountIn);
 
@@ -284,11 +309,15 @@ private:
     int distanceToNextNote(int t, int fromStep) const;
 
     int lastIndex(int t) const;
+    // Last step index of the pattern itself (no per-track length): drives masterPos_.
+    int baseLastIndex() const;
+    void advanceMaster();
     // Track data the sequencer plays: the override slot or the current pattern.
     const Track& playTrack(int t) const {
-        return (t < 8 && ovActive_[t] && perfMem_) ? perfMem_->slot[t][ovSlot_[t]] : cur_->tracks[t];
+        return (ovActive_[t] && perfMem_) ? perfMem_->slot[t][ovSlot_[t]] : cur_->tracks[t];
     }
-    bool perfTrack(int t) const { return perfMode_ && !selection_ && t < kVoiceTracks; }
+    // Owner decision (M1-WP4): Performance FX apply to all 16 tracks.
+    bool perfTrack(int t) const { (void)t; return perfMode_ && !selection_; }
     int syncPosition() const { return masterStep_ - syncOrigin_; }
     void resyncTrack(int t);
     void commitTrackPattern(int t);
@@ -314,6 +343,10 @@ private:
     Project* project_ = nullptr;
     Pattern* cur_ = nullptr;
     Pattern* next_ = nullptr;
+    // switchPatternNow staging buffer. Owned by the main loop while
+    // pendSwitch_ == 0, by the audio context (which swaps it with cur_)
+    // while non-zero.
+    std::atomic<Pattern*> stage_{nullptr};
     SequencerSettings settings_;
     seq::ParkMiller rng_;
 
@@ -330,11 +363,16 @@ private:
     bool selection_ = false;
     bool selLoop_ = false;
     int16_t selStart_ = 0, selEnd_ = 0;
-    uint8_t selTrackStart_ = 0, selTrackEnd_ = 11;
+    uint8_t selTrackStart_ = 0, selTrackEnd_ = kTracks - 1;
     int songPos_ = 0;
     uint8_t curPatternNum_ = 1;
     uint8_t nextPatternNum_ = 0;
     bool preloadIssued_ = false;
+    // Spread preload (host loadsPatternTracks(), CPU round 3): the next
+    // track of next_ to copy; kTracks = nothing pending. A few tracks per
+    // audio block during the preload step, the rest at the pattern end.
+    uint8_t partNext_ = kTracks;
+    float blockUs_ = 2901.0f;   // last advance() block length
     bool queueActive_ = false;
     bool queueReady_ = false;
     int queued_ = 0;
@@ -346,6 +384,7 @@ private:
     uint64_t tickCount_ = 0;
     uint8_t masterMicro_ = 1;
     int32_t masterStep_ = 0;
+    int16_t masterPos_ = 0;               // pattern position, wraps at baseLastIndex()
     float accUs_ = 0;
 
     // tempo
@@ -377,18 +416,18 @@ private:
 
     // performance
     int16_t perfGlobalLen_ = -1;
-    int16_t perfLen_[8] = {};
+    int16_t perfLen_[kTracks] = {};
     int32_t syncOrigin_ = 0;               // masterStep_ at pattern step 0
     PerfPatternMemory* perfMem_ = nullptr;
-    // Override state per voice track. pendNum_/pendImm_ are the main-loop ->
+    // Override state per track. pendNum_/pendImm_ are the main-loop ->
     // ISR handshake; the rest is written where noted in sequencer.cpp.
-    std::atomic<uint8_t> pendNum_[8] = {};
-    std::atomic<bool> pendImm_[8] = {};
+    std::atomic<uint8_t> pendNum_[kTracks] = {};
+    std::atomic<bool> pendImm_[kTracks] = {};
     std::atomic<uint8_t> pendSwitch_{0};   // switchPatternNow main loop -> ISR
-    uint8_t ovActive_[8] = {};
-    uint8_t ovSlot_[8] = {};
-    uint8_t ovNum_[8] = {};
-    uint8_t freshCommit_ = 0;              // tracks committed during this µstep
+    uint8_t ovActive_[kTracks] = {};
+    uint8_t ovSlot_[kTracks] = {};
+    uint8_t ovNum_[kTracks] = {};
+    uint16_t freshCommit_ = 0;             // tracks committed during this µstep (bit per track)
 };
 
 }  // namespace ot

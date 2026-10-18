@@ -30,7 +30,7 @@ inline bool emptyNote(int8_t n) { return n == kNoteEmpty || n < kNoteOff; }
 namespace pops {
 
 int length(const Pattern& p);
-void setLength(Pattern& p, int len);                    // 1..128, all 12 tracks
+void setLength(Pattern& p, int len);                    // 1..128, all 16 tracks
 // Track-type mapping (spec 06 §1.7): audio tracks 0..63, MIDI tracks 48..63.
 uint8_t mapInstrument(int track, int instr);
 

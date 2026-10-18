@@ -11,6 +11,7 @@
 
 namespace ot {
 
+class App;
 struct Config;
 struct Project;
 
@@ -88,4 +89,20 @@ uint8_t trackPattern(const Project& p, int t);
 void setTrackPattern(Project& p, int t, uint8_t num);
 
 }  // namespace perf
+
+// Per-track settings across both banks (docs/specs/2x-01 §1.1, §4), as
+// the Tracker Mini (docs/MINI_PLAN.md §1, spec 21 §3.2), t = 0..15:
+// - level: tracks 1-8 only (0x4D0); the Mini has no levels for 9-16, so
+//   level() reads 0 and setLevel() ignores them;
+// - mute: project.mt 0x12C (1-8) and 0x742[0..7] (9-16, App::trackMuted);
+// - name: project.mt 0x428 (1-8, 20 chars) and 0x603 slots 0..7 (9-16,
+//   7 chars); "" is stored as written.
+namespace trk {
+bool muted(App& a, int t);
+void setMuted(App& a, int t, bool m);
+uint8_t level(App& a, int t);
+void setLevel(App& a, int t, uint8_t v);
+void name(App& a, int t, char* out, int cap);
+void setName(App& a, int t, const char* s);
+}  // namespace trk
 }  // namespace ot

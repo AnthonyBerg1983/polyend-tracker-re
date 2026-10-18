@@ -92,19 +92,24 @@ FmtStatus decodeProject(const uint8_t* file, size_t len, Project& p, ProjectLoad
     std::memcpy(p.playlist, buf + mt::kSongOff, kSongSlots);
     p.playlistPos = buf[mt::kSongOff + kSongSlots];
     std::memcpy(p.values, buf + mt::kValuesOff, mt::kValuesSize);
-    sanitizeProject(p, trackIndexLimit);
+    li.synthSlotsReset = sanitizeProject(p, trackIndexLimit);
 
     if (info) *info = li;
     return FmtStatus::Ok;
 }
 
-void sanitizeProject(Project& p, uint8_t trackIndexLimit) {
+uint8_t sanitizeProject(Project& p, uint8_t trackIndexLimit) {
     // spec 02 §3.3 "Validation on load" column.
     if (int8_t(p.u8(0x110)) < 0) p.setU8(0x110, 48);
     if (p.u8(0x111) > 63) p.setU8(0x111, 0);
     if (p.u8(0x113) > 49) p.setU8(0x113, 0);
     for (uint32_t i = 0; i < 8; ++i)
         if (p.u8(mt::kTrackBool8 + i) > 1) p.setU8(mt::kTrackBool8 + i, 0);
+    // 0x134 = Sample Recorder source (spec 05 appendix C §2.1/§2.4: 0 line in,
+    // 1 radio, 2 mic low gain, 3 mic high gain). The original Tracker keeps
+    // the stock 1.9.2 range 0..3 (`> 3 -> 0`). The Mini's `> 2 -> 0` (spec 21
+    // §3.2) belongs to hardware without a tuner and would reset a stored
+    // "Mic high gain" to line in on every load here.
     if (p.u8(mt::kMode134) > 3) p.setU8(mt::kMode134, 0);
     for (uint32_t i = 0; i < 8; ++i) {
         uint16_t v = p.u16(mt::kTrackWord8 + 2 * i);
@@ -148,6 +153,17 @@ void sanitizeProject(Project& p, uint8_t trackIndexLimit) {
     for (uint32_t i = 0; i < 8; ++i)
         if (p.u8(mt::kTrackFlags8 + i) > 1) p.setU8(mt::kTrackFlags8 + i, 0);
     if (p.u8(mt::kPercent80C) > 100) p.setU8(mt::kPercent80C, 0);
+    return sanitizeSynthSlots(p);
+}
+
+uint8_t sanitizeSynthSlots(Project& p, const uint8_t* bipolarMask) {
+    uint8_t reset = 0;
+    for (int s = 0; s < kSynthSlotCount; ++s) {
+        if (p.synthSlotValid(s)) continue;
+        p.resetSynthSlot(s, bipolarMask ? bipolarMask[s] : 0);
+        reset = uint8_t(reset | (1u << s));
+    }
+    return reset;
 }
 
 }  // namespace ot

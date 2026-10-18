@@ -336,3 +336,15 @@ TEST(text_rotated_uses_bitmap_transform) {
     CHECK(logged(d, "V 10 20 8 3"));
     applyFontSet(nullptr, 0);
 }
+
+// The firmware's packed pen advances (font_adv.inc, tools/fonts/pack_fonts.py)
+// are the metric width tables of the raw image.
+TEST(packed_advances_match_image) {
+    static const uint8_t adv[10][128] = {
+#include "ui/fonts/font_adv.inc"
+    };
+    for (int set = 0; set < 2; ++set)
+        for (int role = 0; role < 5; ++role)
+            for (int ch = 0; ch < 128; ++ch)
+                CHECK_EQ(adv[set * 5 + role][ch], fd::kBlob[fd::info(set, role).metric + uint32_t(ch)]);
+}

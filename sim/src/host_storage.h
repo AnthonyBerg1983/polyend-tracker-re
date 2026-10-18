@@ -29,7 +29,19 @@ public:
     bool rename(const char* from, const char* to) override;
     int32_t listDir(const char* path, DirFn fn, void* ctx) override;
 
+    // USB Storage mode (SimUsbStorage): the "computer" owns the card; every
+    // app access is refused and counted.
+    void setLocked(bool on) { locked_ = on; }
+    bool locked() const { return locked_; }
+    int lockedAccess() const { return lockedAccess_; }
+
 private:
+    bool refuse() {
+        if (locked_) ++lockedAccess_;
+        return locked_;
+    }
+    bool locked_ = false;
+    int lockedAccess_ = 0;
     // Resolve a card path to a host path. If the last component does not exist,
     // it is appended as given (parent components must exist when mustExist).
     bool resolve(const char* path, std::string& out, bool* existsOut = nullptr) const;

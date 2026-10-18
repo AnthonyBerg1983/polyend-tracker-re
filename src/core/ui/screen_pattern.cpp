@@ -101,9 +101,12 @@ void noteItem(void*, int i, char* out, int cap) {
     noteName(int8_t(i), n);
     std::snprintf(out, size_t(cap), "%s", n);
 }
-void instrItem(void* ctx, int i, char* out, int cap) {
+// i = popup position (synthui::popupInstrument: Synth 1..3 first).
+void instrItem(void* ctx, int pos, char* out, int cap) {
     App* a = static_cast<App*>(ctx);
+    const int i = synthui::popupInstrument(pos);
     if (i < kSampleInstrumentCount) std::snprintf(out, size_t(cap), "%02d %s", i + 1, a->instrPresent[i] ? a->instruments[i].name : "");
+    else if (isSynthInstrument(uint8_t(i))) std::snprintf(out, size_t(cap), "S%d", synthSlotOf(uint8_t(i)) + 1);
     else std::snprintf(out, size_t(cap), "MIDI %d", i - kFirstMidiInstrument + 1);
 }
 void midiItem(void*, int i, char* out, int cap) { std::snprintf(out, size_t(cap), "MIDI %d", i + 1); }
@@ -1189,7 +1192,11 @@ void PatternScreen::openPicker(int which) {
             const int c = a.currentInstrument() >= 48 ? a.currentInstrument() - 48 : 0;
             pop_.open(5, "MIDI channel", 16, c, midiItem, nullptr);
         } else {
-            pop_.open(2, "Instrument", kInstrumentCount, a.currentInstrument(), instrItem, &a);
+            // 2.x: the synth slots (instruments 64..66) are the first three
+            // entries, as on the Tracker+ (manual p.100 figure); the cursor
+            // is a list position (synthui::popupPosition).
+            pop_.open(2, "Instrument", kInstrumentCount + kSynthSlotCount,
+                      synthui::popupPosition(a.currentInstrument()), instrItem, &a);
         }
     } else {
         const int slot = fxSlotForColumn(which);
@@ -1258,7 +1265,7 @@ void PatternScreen::commitPicker() {
     pickerKey_ = 0;
     ui_.dirty();
     if (kind == 2 || kind == 5) {
-        const int ins = kind == 5 ? 48 + v : v;
+        const int ins = kind == 5 ? 48 + v : synthui::popupInstrument(v);
         a.setCurrentInstrument(ins);
         if (edit()) {
             a.pushUndo();
@@ -1802,7 +1809,7 @@ int PatternScreen::rowHeight() const { return topInfoOn() ? kRowHInfo : kRowHOff
 // Title bar (spec 20 §1.2, §4.1 top info; Part 2 §7.2): pattern title,
 // the status group (play time, transport glyphs, P pattern.step: the
 // playhead while playing, the cursor step otherwise) and the right text
-// (instrument "N. name" / "N. MIDI Channel c", or the Fx name on an Fx
+// (instrument "N. name" / "N. MIDI Channel c" / "Synth k (MODEL)", or the Fx name on an Fx
 // column). A right-hand popup hides the status group and the right text.
 void PatternScreen::drawTitleBar(Gfx& g, bool popupRight) {
     App& a = app_;
@@ -1816,6 +1823,8 @@ void PatternScreen::drawTitleBar(Gfx& g, bool popupRight) {
         const uint8_t ci = a.currentInstrument();
         if (ci < kSampleInstrumentCount)
             std::snprintf(sub, sizeof(sub), "%d. %s", ci + 1, a.instrPresent[ci] ? a.instruments[ci].name : "");
+        else if (isSynthInstrument(ci))   // "Synth 1 (WTFM)" (Tracker+, docs/SYNTH_UX_MINI_VS_OT.md row 3)
+            synthui::slotLabel(a, synthSlotOf(ci), sub, sizeof(sub));
         else
             std::snprintf(sub, sizeof(sub), "%d. MIDI Channel %d", ci + 1, ci - kFirstMidiInstrument + 1);
     } else {

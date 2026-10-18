@@ -92,12 +92,13 @@ int capTop(uint8_t role) {
     return f.baseline - f.cap;
 }
 
-// Glyph text with its cap top at capY: glyphRun at `pitch` px with custom
-// fonts; one CMD_TEXT on the ROM fallback (host tests read whole strings).
+// Glyph text with its cap top at capY: glyphRun at `pitch` px (custom
+// fonts, or the ROM font glyphs when they are not bound: OP-6); one CMD_TEXT
+// in romTextMode() kRomWholeText (host tests read whole strings).
 void run(Gfx& g, int x, int capY, uint8_t font, const char* s, uint32_t c, int pitch = 0) {
     if (!s || !*s) return;
     const int y = capY - capTop(font);
-    if (customFontsBound()) g.glyphRun(x, y, font, s, c, pitch);
+    if (customFontsBound() || romTextMode() != kRomWholeText) g.glyphRun(x, y, font, s, c, pitch);
     else g.text(x, y, font, c, s);
 }
 
@@ -394,8 +395,9 @@ void PatternScreen::drawGridVertical(Gfx& g, bool threeTracks) {
         }
         g.fill(1, T + pitch - 1, right - 2, 1, tc);
     }
-    // 8. Vertical separators [15] with their AA columns.
-    {
+    // 8. Vertical separators [15] with their AA columns: a cached RAM_G
+    //    fragment (2.x M0, Gfx::cached), static while the view does not change.
+    g.cached(kFragPatSeparators, [&] {
         int xs[10], n = 0;
         for (int v = 0; v <= nT && v <= L.tracks; ++v) xs[n++] = (v == 4 && !colMask) || v == 8 ? kRightSep : trackX(v);
         if (threeTracks) n = colMask ? 3 : nT;   // the 4th track area stays bare [S snap 015]
@@ -412,7 +414,7 @@ void PatternScreen::drawGridVertical(Gfx& g, bool threeTracks) {
         g.rectsBegin(sc);
         for (int i = 0; i < n; ++i) g.rectsAdd(xs[i], sy, 1, sh);
         g.rectsEnd();
-    }
+    });
 
     // Wrap line [20] (spec 20 §4.1 step 8), over the separators.
     if (wrapRow > 0 && wrap) {
@@ -525,8 +527,10 @@ void PatternScreen::drawGridVertical(Gfx& g, bool threeTracks) {
         }
     }
 
-    // 12. Track header tabs: grey [19] (muted [12]), black bold names.
-    {
+    // 12. Track header tabs: grey [19] (muted [12]), black bold names; a
+    //     cached RAM_G fragment (2.x M0), static while names / mutes / the
+    //     view do not change.
+    g.cached(kFragPatHeaders, [&] {
         int tx[8], tw[8], n = 0;
         char names[8][24];
         bool muted[8];
@@ -578,7 +582,7 @@ void PatternScreen::drawGridVertical(Gfx& g, bool threeTracks) {
         g.clip(0, ty, right, 28);
         for (int i = 0; i < n; ++i) run(g, tx[i] + 4, ty + 6, kFont4, names[i], gc(th, kGcTabText));
         g.noClip();
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -628,10 +632,16 @@ void popupItem(void* ctx, int i, char* out, int cap) {
         std::snprintf(out, size_t(cap), "%c - %s", f.symbol, f.name);
     } else if (p->kind == 5) {
         std::snprintf(out, size_t(cap), "MIDI Channel %d", i + 1);
-    } else if (i < kSampleInstrumentCount) {
-        std::snprintf(out, size_t(cap), "%d. %s", i + 1, a.instrPresent[i] ? a.instruments[i].name : "");
     } else {
-        std::snprintf(out, size_t(cap), "%d. MIDI Channel %d", i + 1, i - kFirstMidiInstrument + 1);
+        // Instruments: i is the list position, Synth 1..3 first (Tracker+
+        // manual p.100 figure: "Synth 1 (WTFM)" before "1. ...").
+        const int ins = synthui::popupInstrument(i);
+        if (ins < kSampleInstrumentCount)
+            std::snprintf(out, size_t(cap), "%d. %s", ins + 1, a.instrPresent[ins] ? a.instruments[ins].name : "");
+        else if (isSynthInstrument(uint8_t(ins)))
+            synthui::slotLabel(a, synthSlotOf(uint8_t(ins)), out, cap);
+        else
+            std::snprintf(out, size_t(cap), "%d. MIDI Channel %d", ins + 1, ins - kFirstMidiInstrument + 1);
     }
 }
 }  // namespace
@@ -663,7 +673,7 @@ void PatternScreen::drawListPopup(Gfx& g) {
     v.y = 30;
     v.w = 200;
     v.h = kind == 3 ? 409 : 394;
-    v.count = kind == 3 ? kFxCount : (kind == 5 ? 16 : kInstrumentCount);
+    v.count = kind == 3 ? kFxCount : (kind == 5 ? 16 : kInstrumentCount + kSynthSlotCount);
     v.sel = pop_.cursor();
     popTop_ = wg::listFollow(v.sel, v.count, wg::listVisibleRows(v.h), popTop_);
     v.top = popTop_;
@@ -748,6 +758,13 @@ void PatternScreen::popupPad(uint8_t pad) {
     if (pop_.kind() == 0) {
         const int n = noteWin_ + 12 * (3 - pad / 12) + pad % 12;
         if (n <= 127) pop_.select(n);
+    } else if (pop_.kind() == 2) {
+        // Pads keep the stock instrument map (Tracker+ manual p.100: pads
+        // 1-48 = sample instruments, synths only with the encoder): page 0
+        // = samples (also from a synth entry), page 1 = MIDI 1..16.
+        const int ins = synthui::popupInstrument(pop_.cursor());
+        const int n = (ins >= kSampleInstrumentCount && ins < kInstrumentCount ? kSampleInstrumentCount : 0) + pad;
+        if (n < kInstrumentCount) pop_.select(synthui::popupPosition(n));
     } else {
         pop_.pick(pad);
     }
@@ -757,6 +774,12 @@ void PatternScreen::popupPad(uint8_t pad) {
 
 void PatternScreen::popupLeds(uint8_t* lv) const {
     const uint8_t dim = app_.cfg.padDim(), full = app_.cfg.padFull();
+    if (pop_.kind() == 2) {   // the stock pad map of popupPad (synth entries light no pad)
+        const int ins = synthui::popupInstrument(pop_.cursor());
+        const int base = ins >= kSampleInstrumentCount && ins < kInstrumentCount ? kSampleInstrumentCount : 0;
+        for (int p = 0; p < 48; ++p) lv[p] = base + p == ins ? full : (base + p < kInstrumentCount ? dim : 0);
+        return;
+    }
     if (pop_.kind() != 0) {
         pop_.leds(lv, dim, full);
         return;

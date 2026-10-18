@@ -77,6 +77,7 @@ bool HostStorage::resolve(const char* path, std::string& out, bool* existsOut) c
 }
 
 ot::IStorage::Handle HostStorage::open(const char* path, OpenMode mode) {
+    if (refuse()) return -1;
     std::string hp;
     bool ex = false;
     if (!resolve(path, hp, &ex)) return -1;
@@ -97,6 +98,7 @@ ot::IStorage::Handle HostStorage::open(const char* path, OpenMode mode) {
 }
 
 int32_t HostStorage::read(Handle h, void* dst, uint32_t len) {
+    if (refuse()) return -1;
     std::FILE* f = get(h);
     if (!f) return -1;
     std::fflush(f);
@@ -106,6 +108,7 @@ int32_t HostStorage::read(Handle h, void* dst, uint32_t len) {
 }
 
 int32_t HostStorage::write(Handle h, const void* src, uint32_t len) {
+    if (refuse()) return -1;
     std::FILE* f = get(h);
     if (!f) return -1;
     // Switching from reading to writing on a "r+" stream needs a positioning call.
@@ -115,11 +118,13 @@ int32_t HostStorage::write(Handle h, const void* src, uint32_t len) {
 }
 
 bool HostStorage::seek(Handle h, uint32_t pos) {
+    if (refuse()) return false;
     std::FILE* f = get(h);
     return f && std::fseek(f, long(pos), SEEK_SET) == 0;
 }
 
 int32_t HostStorage::size(Handle h) {
+    if (refuse()) return -1;
     std::FILE* f = get(h);
     if (!f) return -1;
     std::fflush(f);
@@ -129,6 +134,7 @@ int32_t HostStorage::size(Handle h) {
 }
 
 void HostStorage::close(Handle h) {
+    if (refuse()) return;
     if (std::FILE* f = get(h)) {
         std::fclose(f);
         files_[h] = nullptr;
@@ -136,12 +142,14 @@ void HostStorage::close(Handle h) {
 }
 
 bool HostStorage::exists(const char* path) {
+    if (refuse()) return false;
     std::string hp;
     bool ex = false;
     return resolve(path, hp, &ex) && ex;
 }
 
 bool HostStorage::mkdir(const char* path) {
+    if (refuse()) return false;
     std::string hp;
     bool ex = false;
     if (!resolve(path, hp, &ex)) return false;
@@ -150,6 +158,7 @@ bool HostStorage::mkdir(const char* path) {
 }
 
 bool HostStorage::remove(const char* path) {
+    if (refuse()) return false;
     std::string hp;
     bool ex = false;
     if (!resolve(path, hp, &ex) || !ex || hp == root_) return false;
@@ -157,6 +166,7 @@ bool HostStorage::remove(const char* path) {
 }
 
 bool HostStorage::rename(const char* from, const char* to) {
+    if (refuse()) return false;
     std::string a, b;
     bool exA = false, exB = false;
     if (!resolve(from, a, &exA) || !exA || !resolve(to, b, &exB)) return false;
@@ -165,6 +175,7 @@ bool HostStorage::rename(const char* from, const char* to) {
 }
 
 int32_t HostStorage::listDir(const char* path, DirFn fn, void* ctx) {
+    if (refuse()) return -1;
     std::string hp;
     bool ex = false;
     if (!resolve(path, hp, &ex) || !ex || !isDir(hp)) return -1;

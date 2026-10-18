@@ -31,7 +31,7 @@ struct Target {
     int16_t* ptr[kSampleInstrumentCount] = {};
     uint32_t frames[kSampleInstrumentCount] = {};
     bool stereo[kSampleInstrumentCount] = {};
-    std::vector<Pattern> pats = std::vector<Pattern>(kPatternCount);
+    std::vector<PatternStock> pats = std::vector<PatternStock>(kPatternCount);
     bool patPresent[kPatternCount + 1] = {};
     std::vector<uint8_t> scratch = std::vector<uint8_t>(0x10000);
 
@@ -51,14 +51,14 @@ struct Target {
             s->used += n;
             return s->ptr[slot];
         };
-        t.pattern = [](void* c, int n) -> Pattern* {
+        t.pattern = [](void* c, int n) -> PatternStock* {
             auto* s = static_cast<Target*>(c);
             s->patPresent[n] = true;
             return &s->pats[n - 1];
         };
         return t;
     }
-    Pattern& pat(int n) { return pats[n - 1]; }
+    PatternStock& pat(int n) { return pats[n - 1]; }
     Step& step(int n, int track, int row) { return pats[n - 1].tracks[track].steps[row]; }
 };
 
@@ -972,7 +972,7 @@ struct ExportSrc {
     bool present[kSampleInstrumentCount] = {};
     std::vector<int16_t> data[kSampleInstrumentCount];
     bool stereo[kSampleInstrumentCount] = {};
-    std::vector<Pattern> pats = std::vector<Pattern>(kPatternCount);
+    std::vector<PatternStock> pats = std::vector<PatternStock>(kPatternCount);
     bool patPresent[kPatternCount + 1] = {};
     std::vector<uint8_t> scratch = std::vector<uint8_t>(0x10000);
 
@@ -988,7 +988,7 @@ struct ExportSrc {
             *fr = uint32_t(e->data[slot].size() / (*st ? 2 : 1));
             return *fr ? e->data[slot].data() : nullptr;
         };
-        s.pattern = [](void* c, int n) -> const Pattern* {
+        s.pattern = [](void* c, int n) -> const PatternStock* {
             auto* e = static_cast<ExportSrc*>(c);
             return e->patPresent[n] ? &e->pats[n - 1] : nullptr;
         };
@@ -1033,7 +1033,7 @@ void buildProject(ExportSrc& e) {
     e.ins[2].env[kAutoCutoff].enabled = 1;
     e.ins[2].env[kAutoCutoff].loop = 1;   // filter LFO; envelope 0 is not in LFO mode
     e.patPresent[1] = e.patPresent[2] = true;
-    Pattern& p = e.pats[0];
+    PatternStock& p = e.pats[0];
     p.setDefault();
     for (auto& t : p.tracks) t.lastStep = 15;
     Step* s = p.tracks[0].steps;
@@ -1053,7 +1053,7 @@ void buildProject(ExportSrc& e) {
     s[6].fx[0] = {uint8_t(FxId::BreakPattern), 1};
     p.tracks[11].steps[7].note = 72;
     p.tracks[11].steps[7].instrument = 1;
-    Pattern& q = e.pats[1];
+    PatternStock& q = e.pats[1];
     q.setDefault();
     q.tracks[0].lastStep = 63;
     q.tracks[2].steps[10].note = 48;

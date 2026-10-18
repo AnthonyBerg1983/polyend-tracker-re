@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "fmath.h"
+
 namespace ot {
 namespace wg {
 
@@ -187,50 +189,145 @@ StatusLayout statusLayout(uint32_t seconds) {
     return l;
 }
 
-void titleBar(Gfx& g, const Theme& th, const char* title, const char* right, const TitleStatus* st) {
+// ---------------------------------------------------------------------------
+// 2.x CPU cell [I] (spec 2x-02 §2.2)
+
+CpuCell cpuCell(uint8_t mode, bool hasData, uint32_t peak, bool overrunRecent, bool cutRecent) {
+    CpuCell c;
+    if (mode >= 2 || !hasData) return c;
+    c.overrun = overrunRecent;
+    const uint32_t pct = (peak + 5) / 10;
+    c.percent = uint8_t(pct > 99 ? 99 : pct);
+    if (peak >= 850 || overrunRecent) c.level = CpuLevel::kCritical;
+    else if (peak >= 700 || cutRecent) c.level = CpuLevel::kAlarm;
+    else if (peak >= 600) c.level = CpuLevel::kWarn;
+    else c.level = mode == 1 ? CpuLevel::kNormal : CpuLevel::kHidden;
+    if (c.level == CpuLevel::kHidden) c = CpuCell{};
+    return c;
+}
+
+uint32_t cpuCellColour(const Theme& th, CpuLevel level) {
+    switch (level) {
+    case CpuLevel::kWarn: return th.slot(slot::kYellow);
+    case CpuLevel::kAlarm: return th.slot(slot::kOrange);
+    case CpuLevel::kCritical: return th.slot(slot::kSolidRect);
+    default: return th.dim;
+    }
+}
+
+int cpuCellRight(uint32_t seconds) { return statusLayout(seconds).timeX - kCpuCellGap; }
+
+int titleClipWidth(const CpuCell* cell) {
+    if (!cell || !cell->shown()) return kTitleClipW;
+    const int w = cell->right - kCpuCellW - kCpuTitleGap - kTitleTextX;
+    return w < 0 ? 0 : (w > kTitleClipW ? kTitleClipW : w);
+}
+
+namespace {
+
+// Pen x of the "CPU" label: right-aligned one space before a two-digit
+// value, so it does not move with the value.
+int cpuLabelX(const CpuCell& c) {
+    const int x = c.right - textWidth(kFont4, "00%") - textWidth(kFont4, " ") - textWidth(kFont4, "CPU");
+    return x < c.right - kCpuCellW ? c.right - kCpuCellW : x;
+}
+// Glyph-run top for text centred on the title row like the status group.
+int titleGlyphY() { return kTitleCentreY - fontHeight(kFont4) / 2; }
+
+void cpuLabel(Gfx& g, const Theme& th, const CpuCell& c) {
+    if (!c.shown()) return;
+    g.glyphRun(cpuLabelX(c), titleGlyphY(), kFont4, "CPU", cpuCellColour(th, c.level));
+}
+
+// The dynamic part: "nn%" right-aligned at the cell edge, or "!" after the
+// label. One glyph run: colour, BEGIN, <= 3 vertices, END.
+void cpuValue(Gfx& g, const Theme& th, const CpuCell& c) {
+    if (!c.shown()) return;
+    char v[4];
+    int x;
+    if (c.overrun) {
+        v[0] = '!';
+        v[1] = 0;
+        x = cpuLabelX(c) + textWidth(kFont4, "CPU");
+    } else {
+        const unsigned p = c.percent > 99 ? 99u : unsigned(c.percent);
+        int n = 0;
+        if (p >= 10) v[n++] = char('0' + p / 10);
+        v[n++] = char('0' + p % 10);
+        v[n++] = '%';
+        v[n] = 0;
+        x = c.right - textWidth(kFont4, v);
+    }
+    g.glyphRun(x, titleGlyphY(), kFont4, v, cpuCellColour(th, c.level));
+}
+
+void titleBand(Gfx& g, const Theme& th, const char* title, int clipW = kTitleClipW) {
     const uint32_t bg = th.slot(slot::kTitle + 1);
     const uint32_t tc = th.slot(slot::kTitle);
     g.fill(0, 0, kScreenW, kTitleBandH, bg);
     if (title && *title) {
-        g.clip(kTitleTextX, 0, kTitleClipW, kHairlineY - 1);
+        g.clip(kTitleTextX, 0, clipW, kHairlineY - 1);
         g.text(kTitleTextX, kTitleCentreY, kFont4, tc, title, IDisplay::kOptCenterY);
         g.noClip();
     }
-    if (st) {
-        const uint32_t sc = th.slot(slot::kStatus);
-        char buf[24];
-        formatStatusTime(buf, sizeof(buf), st->seconds);
-        const StatusLayout l = statusLayout(st->seconds);
-        g.text(l.timeX, kTitleCentreY, kFont4, sc, buf, IDisplay::kOptCenterY);
-        // Transport glyph pair (2 symbol cells): two 3 x 12 bars when
-        // stopped/paused, at the right edge of each cell less 6 / 1 px
-        // (set 0: 376 / 381, set 1: 364 / 369); a play glyph otherwise.
-        if (st->transport == Transport::kStopped) {
-            g.rectsBegin(sc);
-            g.rectsAdd(l.iconX + l.symW - 6, kTitleCentreY - 5, 3, 12);
-            g.rectsAdd(l.iconX + l.symW - 1, kTitleCentreY - 5, 3, 12);
-            g.rectsEnd();
-        } else {
-            g.icon(l.iconX + l.symW - 6, kTitleCentreY - 5, kIconPlay, sc);
-        }
-        formatStatusPosition(buf, sizeof(buf), st->pattern, st->step, st->hex);
-        g.text(l.posX, kTitleCentreY, kFont4, sc, buf, IDisplay::kOptCenterY);
-        if (st->recording) {
-            const int rx = l.posX + textWidth(kFont4, buf);
-            g.icon(rx + l.symW - 6, kTitleCentreY - 5, kIconRec, th.slot(slot::kSolidRect));
-        }
+}
+
+void titleRight(Gfx& g, const Theme& th, const char* right, bool status) {
+    if (!right || !*right) return;
+    const uint32_t tc = th.slot(slot::kTitle);
+    char buf[64];
+    copyFit(buf, sizeof(buf), right);
+    const int minX = status ? kRightTextMinX : kTitleTextX + kTitleClipW + 10;
+    int n = int(std::strlen(buf));
+    while (n > 0 && textWidth(kFont4, buf, n) > kRightTextX - minX) --n;
+    buf[n] = 0;
+    g.clip(minX, 0, kRightTextX - minX + 1, kHairlineY - 1);
+    g.text(kRightTextX, kTitleCentreY, kFont4, tc, buf, IDisplay::kOptRightX | IDisplay::kOptCenterY);
+    g.noClip();
+}
+
+}  // namespace
+
+void titleBarStatus(Gfx& g, const Theme& th, const TitleStatus& s) {
+    const TitleStatus* st = &s;
+    const uint32_t sc = th.slot(slot::kStatus);
+    char buf[24];
+    formatStatusTime(buf, sizeof(buf), st->seconds);
+    const StatusLayout l = statusLayout(st->seconds);
+    g.text(l.timeX, kTitleCentreY, kFont4, sc, buf, IDisplay::kOptCenterY);
+    // Transport glyph pair (2 symbol cells): two 3 x 12 bars when
+    // stopped/paused, at the right edge of each cell less 6 / 1 px
+    // (set 0: 376 / 381, set 1: 364 / 369); a play glyph otherwise.
+    if (st->transport == Transport::kStopped) {
+        g.rectsBegin(sc);
+        g.rectsAdd(l.iconX + l.symW - 6, kTitleCentreY - 5, 3, 12);
+        g.rectsAdd(l.iconX + l.symW - 1, kTitleCentreY - 5, 3, 12);
+        g.rectsEnd();
+    } else {
+        g.icon(l.iconX + l.symW - 6, kTitleCentreY - 5, kIconPlay, sc);
     }
-    if (right && *right) {
-        char buf[64];
-        copyFit(buf, sizeof(buf), right);
-        const int minX = st ? kRightTextMinX : kTitleTextX + kTitleClipW + 10;
-        int n = int(std::strlen(buf));
-        while (n > 0 && textWidth(kFont4, buf, n) > kRightTextX - minX) --n;
-        buf[n] = 0;
-        g.clip(minX, 0, kRightTextX - minX + 1, kHairlineY - 1);
-        g.text(kRightTextX, kTitleCentreY, kFont4, tc, buf, IDisplay::kOptRightX | IDisplay::kOptCenterY);
-        g.noClip();
+    formatStatusPosition(buf, sizeof(buf), st->pattern, st->step, st->hex);
+    g.text(l.posX, kTitleCentreY, kFont4, sc, buf, IDisplay::kOptCenterY);
+    if (st->recording) {
+        const int rx = l.posX + textWidth(kFont4, buf);
+        g.icon(rx + l.symW - 6, kTitleCentreY - 5, kIconRec, th.slot(slot::kSolidRect));
     }
+    cpuValue(g, th, st->cpu);
+}
+
+void titleBar(Gfx& g, const Theme& th, const char* title, const char* right, const TitleStatus* st) {
+    titleBand(g, th, title, titleClipWidth(st ? &st->cpu : nullptr));
+    if (st) cpuLabel(g, th, st->cpu);
+    if (st) titleBarStatus(g, th, *st);
+    titleRight(g, th, right, st != nullptr);
+}
+
+void titleBarChrome(Gfx& g, const Theme& th, const char* title, const char* right, bool status,
+                    const CpuCell* cpu) {
+    if (!status) cpu = nullptr;
+    titleBand(g, th, title, titleClipWidth(cpu));
+    if (cpu) cpuLabel(g, th, *cpu);
+    titleRight(g, th, right, status);
 }
 
 void titleHairline(Gfx& g, const Theme& th) { titleHairline(g, th, 0, kScreenW - 1); }
@@ -543,9 +640,9 @@ void valueBar(Gfx& g, const Theme& th, int x, int y, int w, int h, float value, 
     if (value < 0) value = 0;
     if (value > 1) value = 1;
     // Stock rounds the fill up (ceil over a span of h - 24 rows).
-    const int n = int(std::ceil(double(span) * double(value) - 1e-4));
+    const int n = int(fm::ceilD(double(span) * double(value) - 1e-4));
     if (st.ref >= 0 && n > 0) {
-        const int nr = int(std::ceil(double(span) * double(st.ref > 1 ? 1.0f : st.ref) - 1e-4));
+        const int nr = int(fm::ceilD(double(span) * double(st.ref > 1 ? 1.0f : st.ref) - 1e-4));
         const int lo = n < nr ? n : nr;
         if (lo > 0) band(base - lo + 1, base, fc);
         if (n != nr) {

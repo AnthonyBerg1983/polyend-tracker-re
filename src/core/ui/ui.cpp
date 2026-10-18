@@ -36,6 +36,7 @@ int fastDelta(int d) {
 
 constexpr uint32_t kHoldMs = 333;        // spec 05 §2.1.1 hold threshold
 constexpr uint32_t kMinFrameMs = 16;     // render rate limit
+constexpr uint32_t kReadyPollMs = 1;     // frameReady() poll interval while the display is busy
 }  // namespace
 
 int moduleForButton(uint8_t id) {
@@ -586,14 +587,41 @@ void Ui::closeFactoryTest() {
 }
 
 void Ui::setUsbStorageMode(bool on) {
-    // spec 01 §6.1: 0x284f0(on) shows / hides the page. The stock hardware
-    // hook (HW slot 0x58 -> vtable 0x9F424) is an empty stub, so nothing is
-    // released or exported here either.
-    usb.show(on);
+    // spec 01 §6.1: 0x284f0(on) shows / hides the page. 2.x: the page is the
+    // real USB Storage mode (Tracker Mini manual §13.10): the app hands the
+    // card to the computer before the page shows and takes it back (and
+    // reloads the Workspace) when it closes.
+    if (on == usb.active()) return;
+    if (on) {
+        switch (app.enterUsbStorage()) {
+        case App::UsbEnter::kOk: break;
+        case App::UsbEnter::kBusy: notify("Wait for the current operation to finish"); return;
+        case App::UsbEnter::kNoCard: notify("No SD card"); return;
+        default: notify("USB storage not available"); return;
+        }
+        kb.close();
+        picker.close();
+        askOpen_ = false;
+        ++gen_;   // releases of keys held at entry do not reach the module
+        usb.show(true);
+        usb.setHost(app.usbHost());
+    } else {
+        usb.show(false);
+        app.exitUsbStorage();
+    }
     dirty();
 }
 
 void Ui::switchTo(int module, int opt) {
+    // 2.x: Instrument Params on a synth step / synth instrument opens the
+    // synth slot page (Tracker Mini manual p.146).
+    if (module == kModInstrument) {
+        const int s = SynthScreen::entrySlot(app, *this, active_);
+        if (s >= 0) {
+            module = kModSynth;
+            opt = s + 1;
+        }
+    }
     Screen* next = screen(module);
     if (!next) return;
     // spec 05 §1.5 switching procedure.
@@ -618,6 +646,7 @@ void Ui::switchTo(int module, int opt) {
 
 void Ui::notify(const char* text, uint32_t ms) {
     copyStr(note_, text, sizeof(note_));
+    if (platform.notified) platform.notified(note_);
     noteUntil_ = now_ + ms;
     if (!noteUntil_) noteUntil_ = 1;
     dirty();
@@ -748,6 +777,10 @@ void Ui::handle(const InputEvent& ev, uint32_t now) {
     }
     // Telemetry: the oldest event not shown yet dates the next frame's
     // input latency (ev.timeMs = capture time in the driver, 0 = unknown).
+    // The USB storage page takes every event; it is redrawn only when
+    // something on it changes (UsbStorageMode::Action::kRedraw / exit): in
+    // the mode the main loop belongs to the computer's block I/O.
+    if (usb.active() && !factory.active()) return;
     if (!inputPending_) {
         inputPending_ = true;
         inputAtMs_ = ev.timeMs ? ev.timeMs : now;
@@ -784,7 +817,11 @@ void Ui::dispatchButton(uint8_t id, uint8_t state) {
     if (powerOpen_) return;   // state 5 blocks input
     if (usb.active()) {
         // The storage page takes every key; only its Exit is bound.
-        if (usb.onButton(id, state)) dirty();
+        switch (usb.onButton(id, state)) {
+        case UsbStorageMode::Action::kExit: setUsbStorageMode(false); break;
+        case UsbStorageMode::Action::kRedraw: dirty(); break;
+        default: break;
+        }
         return;
     }
     if (factory.active()) {
@@ -886,9 +923,30 @@ void Ui::update(uint32_t now) {
             }
         }
     }
+    if (usb.active() && !factory.active()) {
+        // The storage page covers the screen and the CPU cell: only its own
+        // state (the computer's view of the drive) redraws it.
+        if (usb.setHost(app.usbHost())) dirty();
+        updateLeds();
+        return;
+    }
+    if (usb.active() && usb.setHost(app.usbHost())) dirty();
     if (factory.active()) factory.update(now);
     else if (Screen* s = current()) s->update(now);   // suspended during the factory test
+    pollCpuCell(now);
     updateLeds();
+}
+
+void Ui::pollCpuCell(uint32_t now) {
+    if (now - cpuPollAt_ < kCpuPollMs && cpuPollAt_ != 0) return;
+    cpuPollAt_ = now ? now : 1;
+    const audio::CpuMeter& m = app.engine.cpu();
+    const wg::CpuCell c = wg::cpuCell(app.cfg.cpuMeter, m.hasData(), m.peak(), m.overrunRecent(),
+                                      app.engine.governor().cutRecent());
+    if (c.level != cpuCell_.level || c.percent != cpuCell_.percent || c.overrun != cpuCell_.overrun) {
+        cpuCell_ = c;
+        dirty();
+    }
 }
 
 void Ui::updateLeds() {
@@ -925,10 +983,17 @@ bool Ui::renderIfDirty(uint32_t now) {
     if (now - lastRender_ < kMinFrameMs && frames_ > 0) return false;
     // Non-blocking swap: while the previous frame is still being consumed or
     // swapped in, try again on the next main-loop pass instead of spinning.
+    // The display is polled at most once per millisecond (kReadyPollMs):
+    // each poll is SPI traffic (REG_CMD_READ, REG_DLSWAP), and a busy
+    // display stays busy until the next vsync (up to 18.5 ms at 54 Hz).
+    if (readyRetry_ && int32_t(now - readyRetryAt_) < 0) return false;
     if (!display_->frameReady()) {
         ++deferred_;
+        readyRetry_ = true;
+        readyRetryAt_ = now + kReadyPollMs;
         return false;
     }
+    readyRetry_ = false;
     lastRender_ = now;
     const uint32_t t0 = app.micros();
     // Telemetry: dirty -> frame start, frame -> frame gap, input -> frame.
@@ -964,7 +1029,14 @@ void Ui::drawTitle(Gfx& g, const char* title, const char* right, bool status) {
     const int step0 = !sq.isPlaying() && cursorStep_ >= 0 ? cursorStep_ : sq.step(0);
     st.step = step0 + (app.cfg.numbering == 0 ? 0 : 1);
     st.hex = app.cfg.numbering == 2;
-    wg::titleBar(g, th(), title, right, status && !statusHidden() ? &st : nullptr);
+    // The band, title and right text go through a cached RAM_G fragment
+    // (2.x M0); the status group changes with every step and is drawn inline.
+    const bool showStatus = status && !statusHidden();
+    // 2.x CPU cell next to the play time (hidden: the stock chrome).
+    st.cpu = cpuCell_;
+    st.cpu.right = int16_t(wg::cpuCellRight(st.seconds));
+    g.cached(kFragTitle, [&] { wg::titleBarChrome(g, th(), title, right, showStatus, &st.cpu); });
+    if (showStatus) wg::titleBarStatus(g, th(), st);
     titleDrawn_ = true;
     // Remembered for the keyboard frames (render()); title may already be
     // the remembered copy.
@@ -991,9 +1063,10 @@ void Ui::render() {
     dirty_ = false;
     titleDrawn_ = false;
     const Theme& t = th();
-    Gfx g(*display_);
+    Gfx g(*display_, &fragments);
     // RAM_DL guard (docs/VERIFY_1.9.5.md §6): never send more than the
-    // FT81x can hold next to the driver's per-frame words.
+    // FT81x can hold next to the driver's per-frame words (appended RAM_G
+    // fragments included, Gfx::dlTotalWords).
     g.setWordLimit(dlFrameLimit_);
     g.setLowDetail(lowDetail_);
     g.beginFrame(t.bg);
@@ -1043,7 +1116,7 @@ void Ui::render() {
             BottomBar b;
             for (int i = 0; i < 3; ++i)
                 if (askLabel_[i][0]) b.set(5 + i, askLabel_[i]);
-            b.drawLabels(g, t);
+            g.cached(kFragBar, [&] { b.drawLabels(g, t); });
         } else if (barShown) {
             if (ph == PopupHeader::kRight) {
                 // F7 / F8 lie under the popup panel (015 / 018); the x 600
@@ -1055,15 +1128,17 @@ void Ui::render() {
                 g.fill(wg::kRightPopupX + 1, kBarY, kScreenW - wg::kRightPopupX - 1, kScreenH - kBarY,
                        t.slot(slot::kEmptyPanel + 1));
             } else {
-                bar.drawLabels(g, t);
+                g.cached(kFragBar, [&] { bar.drawLabels(g, t); });
             }
         }
     }
     if (titleDrawn_ && !factory.active() && !usbPage && !(s && s->fullScreen() && !kb.isOpen()) &&
         ph != PopupHeader::kFull)
-        wg::titleHairline(g, t, 0, ph == PopupHeader::kRight ? wg::kRightPopupX - 1 : kScreenW - 1, hairline_);
+        wg::titleHairline(g, t, 0,
+                          ph == PopupHeader::kRight || ph == PopupHeader::kRightBar ? wg::kRightPopupX - 1 : kScreenW - 1,
+                          hairline_);
     if (!usbPage) {
-        if (ph == PopupHeader::kRight) wg::rightPopupHeader(g, t, popupTitle_);
+        if (ph == PopupHeader::kRight || ph == PopupHeader::kRightBar) wg::rightPopupHeader(g, t, popupTitle_);
         else if (ph == PopupHeader::kFull) wg::fullPopupHeader(g, t, popupTitle_);
     }
     usb.draw(g, t);   // full screen over the module and its popups
@@ -1078,7 +1153,9 @@ void Ui::render() {
 }
 
 void Ui::finishFrame(Gfx& g, const char* screenName) {
-    lastWords_ = g.dlWords();
+    // RAM_DL words including appended fragments; the command-FIFO upload.
+    lastWords_ = g.dlTotalWords();
+    lastUpload_ = g.dlWords();
     if (lastWords_ > maxWords_) maxWords_ = lastWords_;
     if (g.dropped()) {
         // The frame did not fit RAM_DL: the guard dropped its last

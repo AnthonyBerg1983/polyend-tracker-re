@@ -176,6 +176,30 @@ TEST(pattern_playing_frame_budget) {
     r.h.tap(btn::Play);
 }
 
+// 2.x M1: the same dense page with the window on tracks 13..16 (MIDI
+// channel tags in the Instr column) stays inside the same budget.
+TEST(pattern_playing_frame_budget_tracks_13_16) {
+    Rig r;
+    r.dense();
+    Pattern& p = r.h.app->pattern();
+    for (int t = kMidiTrackStart; t < kTrackCount; ++t)
+        for (int s = 0; s < kStepCount; ++s) p.tracks[t].steps[s].instrument = uint8_t(kFirstMidiInstrument + (s + t) % 16);
+    r.h.tap(btn::Pattern);
+    r.h.run(50);
+    for (int i = 0; i < kTrackCount; ++i) r.h.tap(btn::Right);
+    CHECK_EQ(r.pe().firstTrack, kTrackCount - 4);
+    r.h.tap(btn::Play);
+    r.play(100);
+    r.m.resetMax();
+    r.play(2000);
+    const uint32_t words = r.m.maxWords, bytes = r.m.maxBytes;
+    std::printf("pattern playing tracks 13-16 (dense, custom fonts): max %u DL words, %u FIFO bytes\n",
+                unsigned(words), unsigned(bytes));
+    CHECK(words <= 1750);
+    CHECK(bytes <= 7200);
+    r.h.tap(btn::Play);
+}
+
 // A sparse page (the common case) stays far below the dense one.
 TEST(pattern_playing_sparse_frame_budget) {
     Rig r;
@@ -278,7 +302,7 @@ TEST(render_stats_fields) {
 
 // ---------------------------------------------------------------------------
 // RAM_DL overlay matrix (docs/VERIFY_1.9.5.md §4-§6). Worst-case content
-// (dense 12-track page, 48 instruments with 31-character names, 255 named
+// (dense 16-track page, 48 instruments with 31-character names, 255 named
 // patterns and song slots, long track / file / project names, a stereo
 // sample), custom fonts bound: every screen alone, playing where it
 // matters, and under every overlay (on-screen keyboard, pad-grid chooser,
@@ -287,6 +311,8 @@ TEST(render_stats_fields) {
 // FT81x holds 2048 minus 36 driver words) and the Ui guard never cuts a
 // frame or falls back to low detail.
 
+#include "app/perf_presets.h"
+#include "formats/patch_pb.h"
 #include "formats/wav.h"
 
 namespace {
@@ -313,7 +339,8 @@ struct WorstRig {
     uint64_t acc = 0;
     uint32_t worst = 0;
     std::string worstName;
-    WorstRig() : h(false), a(*h.app) {
+    explicit WorstRig(bool customFonts = true) : h(false), a(*h.app) {
+        setRomTextMode(kRomGlyphs);   // the device / simulator path (OP-6)
         // 101 list entries (the loader's maximum): 3 folders, 97 + 1 files.
         for (int i = 0; i < 97; ++i) {
             char n[64];
@@ -324,13 +351,13 @@ struct WorstRig {
         h.fs.dirs.insert("Projects");
         h.fs.dirs.insert("Workspace");
         for (const char* d : {"instruments", "patterns", "samples"}) h.fs.dirs.insert(std::string("Workspace/") + d);
-        m.customFonts = true;
-        h.disp.customFonts = true;
+        m.customFonts = customFonts;
+        h.disp.customFonts = customFonts;
         m.ui = &a.ui;
         a.ui.attach(&m, &h.leds);
         a.boot();
         applyFontSet(&m, 0);
-        CHECK(customFontsBound());
+        CHECK(customFontsBound() == customFonts);
         h.run(100);
         if (h.fs.files.count("Workspace/project.mt"))
             for (int i = 0; i < 30; ++i) {
@@ -446,10 +473,14 @@ struct WorstRig {
         std::snprintf(n, sizeof(n), "%s + power popup", screen);
         measure(n);
         h.up(btn::Power);
-        ui.setUsbStorageMode(true);
+        // The page alone (no card hand-over: leaving the real mode reloads
+        // the Workspace, usb_storage_budget below measures that path).
+        ui.usb.show(true);
+        ui.usb.setHost(IUsbStorage::Host::kInUse);
+        ui.dirty();
         std::snprintf(n, sizeof(n), "%s + USB storage page", screen);
         measure(n);
-        ui.setUsbStorageMode(false);
+        ui.usb.show(false);
         ui.dirty();
         h.run(40);
     }
@@ -553,6 +584,137 @@ TEST(overlay_matrix_pattern) {
     std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
 }
 
+// OP-6 (docs/OPTIMIZATION_2X.md item 8): the same dense Pattern pages with
+// the custom fonts not bound (CMD_INFLATE / bind failure: ROM fonts). Gfx::
+// glyphRun draws the grid cells as ROM-font VERTEX2II glyphs (handles 16-31),
+// so these frames also stay within Ui::kDlTargetWords without a guard cut.
+TEST(overlay_matrix_pattern_rom_fonts) {
+    Harness::dlOverflowFatal = false;   // TEMP
+    WorstRig r(false);
+    Harness& h = r.h;
+    App& a = r.a;
+    r.screen(btn::Pattern, "ROM fonts: pattern dense");
+    h.tap(btn::Rec);
+    r.measure("ROM fonts: pattern dense edit");
+    h.tap(btn::Instr);
+    h.down(btn::Instr);
+    h.run(250);
+    r.measure("ROM fonts: pattern dense + Instruments popup");
+    h.up(btn::Instr);
+    h.tap(btn::Fx1);
+    h.down(btn::Fx1);
+    h.run(250);
+    r.measure("ROM fonts: pattern dense + Fx popup");
+    h.up(btn::Fx1);
+    h.tap(btn::Rec);
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    r.measure("ROM fonts: pattern dense 8-track view");
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Note);
+    h.up(btn::Pattern);
+    h.tap(btn::Play);
+    r.measure("ROM fonts: pattern dense playing", 1500);
+    h.tap(btn::Play);
+    a.cfg.arrangement = 2;
+    a.ui.dirty();
+    r.measure("ROM fonts: pattern dense horizontal");
+    h.tap(btn::Play);
+    r.measure("ROM fonts: pattern dense horizontal playing", 1500);
+    h.tap(btn::Play);
+    a.cfg.arrangement = 0;
+    for (int i = 0; i < kTrackCount; ++i) h.tap(btn::Right);
+    a.ui.dirty();
+    r.measure("ROM fonts: pattern 13-16 dense");
+    std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
+}
+
+// 2.x M1 (docs/M1_PLAN.md §4): the dense 16-track page with the window on
+// tracks 13..16, bank-B bottom pages, the 8-track view of tracks 9..16,
+// playing, and the Song grid with its window shifted to tracks 5..16.
+TEST(overlay_matrix_tracks_13_16) {
+    WorstRig r;
+    Harness& h = r.h;
+    App& a = r.a;
+    h.tap(btn::Pattern);
+    h.run(200);
+    for (int i = 0; i < kTrackCount; ++i) h.tap(btn::Right);
+    PatternScreen& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    CHECK_EQ(p.firstTrack, kTrackCount - 4);
+    r.measure("pattern 13-16 dense");
+    r.overlays("pattern 13-16 dense");
+    h.tap(btn::Rec);
+    r.measure("pattern 13-16 dense edit");
+    h.tap(btn::Instr);
+    h.down(btn::Instr);
+    h.run(250);
+    r.measure("pattern 13-16 dense + MIDI channel popup");
+    h.up(btn::Instr);
+    h.tap(btn::Fx1);
+    h.down(btn::Fx1);
+    h.run(250);
+    h.tap(btn::F7);
+    r.measure("pattern 13-16 dense + Fx popup + description");
+    h.tap(btn::F7);
+    h.up(btn::Fx1);
+    h.tap(btn::F4);
+    r.measure("pattern 13-16 dense + Fill popup");
+    h.tap(btn::F7);
+    h.down(btn::Shift);
+    r.measure("pattern 13-16 dense + mute page (bank B)");
+    h.tap(btn::Rec);
+    r.measure("pattern 13-16 dense + Live-REC arm page (bank B)");
+    h.up(btn::Shift);
+    h.tap(btn::Rec);
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    CHECK_EQ(p.firstTrack, kTrackCount - 8);
+    r.measure("pattern 9-16 dense 8-track view");
+    h.tap(btn::Play);
+    r.measure("pattern 9-16 dense 8-track view playing", 1500);
+    h.tap(btn::Play);
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Note);
+    h.up(btn::Pattern);
+    h.tap(btn::Rec);
+    h.tap(btn::Play);
+    r.measure("pattern 13-16 dense playing", 1500);
+    h.tap(btn::Play);
+    a.cfg.arrangement = 2;
+    a.ui.dirty();
+    h.tap(btn::Play);
+    r.measure("pattern 13-16 dense horizontal playing", 1500);
+    h.tap(btn::Play);
+    a.cfg.arrangement = 0;
+    // Song: dense ext tracks in every listed pattern, window on 5..16.
+    for (int n = 1; n <= 3; ++n)
+        for (int t = 0; t < kTrackCount; ++t) a.storedTrack(n, t).steps[0].note = 60;
+    a.reloadCurrentFromStore();
+    h.tap(btn::Song);
+    h.run(200);
+    SongScreen& s = *static_cast<SongScreen*>(a.ui.screen(kModSong));
+    h.tap(btn::Rec);
+    h.tap(btn::Left);
+    h.tap(btn::Right);
+    CHECK_EQ(s.firstTrack, kTrackCount - SongScreen::kGridCols);
+    h.down(btn::Shift);
+    h.tap(btn::Down);
+    h.tap(btn::Down);
+    h.up(btn::Shift);
+    r.measure("song shifted window + selection");
+    r.overlays("song shifted window");
+    h.tap(btn::F2);
+    r.measure("song shifted window playing", 1000);
+    h.tap(btn::F2);
+    std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
+}
+
 TEST(overlay_matrix_screens) {
     WorstRig r;
     Harness& h = r.h;
@@ -624,10 +786,193 @@ TEST(overlay_matrix_screens) {
     std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
 }
 
+// 2.x M1-WP6: Track Mixer and Performance bank B (tracks 9-16) reuse the
+// stock geometry; every frame, with the keyboard and choosers over it, stays
+// within the budget (M1 plan §4).
+TEST(overlay_matrix_bank_b) {
+    WorstRig r;
+    Harness& h = r.h;
+    App& a = r.a;
+    for (int t = 8; t < kTrackCount; ++t) trk::setName(a, t, "WWWWWWW");
+    r.screen(btn::Performance, "performance");
+    h.tap(btn::Performance);
+    CHECK_EQ(static_cast<PerformanceScreen*>(a.ui.screen(kModPerformance))->bank, 1);
+    r.measure("performance bank B");
+    r.overlays("performance bank B");
+    h.tap(btn::Rec);
+    r.measure("performance bank B edit");
+    h.tap(btn::Rec);
+    h.down(btn::Shift);
+    r.measure("performance bank B + Shift");
+    h.up(btn::Shift);
+    h.tap(btn::Play);
+    r.measure("performance bank B playing", 1000);
+    h.tap(btn::Play);
+    r.screen(btn::Master, "master");
+    h.tap(btn::Master);
+    h.run(100);
+    h.tap(btn::Right);
+    MixerScreen& m = *static_cast<MixerScreen*>(a.ui.screen(kModMaster));
+    CHECK_EQ(m.page, 1);
+    CHECK_EQ(m.bank, 1);
+    r.measure("track mixer bank B");
+    r.overlays("track mixer bank B");
+    h.tap(btn::Play);
+    r.measure("track mixer bank B playing (activity)", 1000);
+    h.tap(btn::Play);
+    h.tap(btn::Rec);
+    h.tap(btn::F5);
+    CHECK(a.ui.kb.isOpen());
+    r.measure("track mixer bank B + rename keyboard");
+    h.tap(btn::F7);
+    h.tap(btn::Rec);
+    h.down(btn::Shift);
+    r.measure("track mixer bank B + Shift (solo labels)");
+    h.up(btn::Shift);
+    std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
+}
+
+// 2.x WP-G: the synth screens (Synth Parameters, Synth Macros, every Edit
+// Patch section of the densest engines, the patch browser with 128 long
+// names) with the shared overlays, the Save As keyboard and the Init
+// question; slots with 31-character patch names and 31-character macro
+// names whose six targets all name long parameters.
+TEST(overlay_matrix_synth) {
+    WorstRig r;
+    Harness& h = r.h;
+    App& a = r.a;
+    a.setSynthModel(1, int(SynthModel::PERC));
+    a.setSynthModel(2, int(SynthModel::VAP));
+    for (int s = 0; s < kSynthSlotCount; ++s) {
+        SynthSlotRecord rec = a.synthSlot(s);
+        std::snprintf(rec.patchName, sizeof(rec.patchName), "%s", kLong);
+        a.setSynthSlotRecord(s, rec);
+        SynthPatch& p = a.synthPatch(s);
+        for (int k = 0; k < kPatchMacros; ++k) {
+            std::snprintf(p.macros[k].name, sizeof(p.macros[k].name), "%s", kLong);
+            p.macros[k].nameLen = 31;
+            p.macros[k].count = kPatchMacroTargets;
+            for (int t = 0; t < kPatchMacroTargets; ++t) {
+                p.macros[k].targets[t].param = p.engine == kSynthEnginePerc ? 79 : 38;   // "Waveshaper Level" / "Osc Mix Env Amt"
+                p.macros[k].targets[t].amountBits = patchFloatToBits(-1.99f);
+            }
+        }
+        a.markSynthPatchDirty(s);
+    }
+    h.fs.dirs.insert("Patches");
+    h.fs.dirs.insert("Patches/VAP");
+    for (int i = 0; i < SynthScreen::kBrowserMax + 5; ++i) {
+        char n[80];
+        std::snprintf(n, sizeof(n), "Patches/VAP/WWWWWWWWWWWWWWWWWWWWWWWWWWWW%03d.patch", i);   // 31-char names
+        h.fs.files[n] = std::vector<uint8_t>{0};
+    }
+    SynthScreen& sy = *static_cast<SynthScreen*>(a.ui.screen(kModSynth));
+    a.setCurrentInstrument(66);
+    h.tap(btn::Pattern);
+    r.screen(btn::InstrParams, "synth parameters (VAP)");
+    CHECK_EQ(a.ui.active(), int(kModSynth));
+    h.tap(btn::F3);
+    r.measure("synth parameters, Gain selected");
+    r.screen(btn::InstrParams, "synth macros (VAP)");
+    CHECK(sy.view == SynthScreen::View::Macros);
+    h.tap(btn::InstrParams);
+    h.tap(btn::F8);
+    CHECK(sy.view == SynthScreen::View::Edit);
+    const synthui::Section* sec = nullptr;
+    int n = synthui::sections(kSynthEngineVap, &sec);
+    for (int i = 0; i < n; ++i) {
+        sy.section = i;
+        sy.row = sy.rows() - 1;   // scrolled to the end (scroll bar)
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "synth edit patch VAP %s", sec[i].name);
+        r.measure(nm);
+    }
+    sy.section = 0;
+    sy.row = 0;
+    r.overlays("synth edit patch");
+    h.tap(btn::F2);   // Save As (manual p.153: F1 Save, F2 Save As, F3 Init Patch)
+    CHECK(a.ui.kb.isOpen());
+    r.measure("synth edit patch + Save As keyboard");
+    h.tap(btn::F7);
+    h.tap(btn::F3);
+    CHECK(a.ui.askOpen());
+    r.measure("synth edit patch + Init question");
+    h.tap(btn::F7);
+    h.tap(btn::F8);
+    h.tap(btn::F7);
+    CHECK(sy.view == SynthScreen::View::Browser);
+    CHECK_EQ(sy.browserCount, SynthScreen::kBrowserMax);
+    r.measure("synth patch browser (128 long names)");
+    sy.browserSel = sy.browserCount - 1;
+    r.measure("synth patch browser, last entry");
+    r.overlays("synth patch browser");
+    h.tap(btn::F8);
+    // PERC (84 parameters, the 30-row Mixer section).
+    a.setCurrentInstrument(65);
+    h.tap(btn::Pattern);
+    r.screen(btn::InstrParams, "synth parameters (PERC)");
+    h.tap(btn::F8);
+    n = synthui::sections(kSynthEnginePerc, &sec);
+    for (int i = 0; i < n; ++i) {
+        sy.section = i;
+        sy.row = sy.rows() - 1;
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "synth edit patch PERC %s", sec[i].name);
+        r.measure(nm);
+    }
+    // WTFM: "not available" header, read-only.
+    a.setSynthModel(0, int(SynthModel::WTFM));
+    a.setCurrentInstrument(64);
+    h.tap(btn::Pattern);
+    r.screen(btn::InstrParams, "synth parameters (WTFM not available)");
+    CHECK(!sy.available());
+    h.tap(btn::F8);
+    n = synthui::sections(kSynthEngineWtfm, &sec);
+    for (int i = 0; i < n; ++i) {
+        sy.section = i;
+        sy.row = sy.rows() - 1;
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "synth edit patch WTFM %s", sec[i].name);
+        r.measure(nm);
+    }
+    // Global Mixer 3/3 with the synth columns, a column held.
+    r.screen(btn::Master, "master");
+    h.tap(btn::Master);
+    h.tap(btn::Master);
+    h.down(btn::F6);
+    r.measure("global mixer + Synth 2 held");
+    h.up(btn::F6);
+    std::printf("  worst: %s, %u words\n", r.worstName.c_str(), unsigned(r.worst));
+}
+
 // The guard itself (with a lowered limit so an ordinary frame overflows):
 // the frame is cut short instead of being sent past the limit, counted,
 // logged once per screen, and the screen is redrawn at once in low detail
 // (no AA halos, no gradients) until the screen or its overlays change.
+// 2.x USB Storage mode page (Config > USB > USB Storage): every host-state
+// line and the eject reminder stay within the display-list target.
+TEST(usb_storage_mode_budget) {
+    WorstRig r;
+    Harness& h = r.h;
+    App& a = r.a;
+    r.screen(btn::Pattern, "pattern dense");
+    a.ui.setUsbStorageMode(true);
+    CHECK(a.usbStorageActive());
+    for (IUsbStorage::Host st : {IUsbStorage::Host::kNoUsb, IUsbStorage::Host::kWaiting,
+                                 IUsbStorage::Host::kEjected, IUsbStorage::Host::kInUse}) {
+        h.usb.hostState = st;
+        h.run(20);
+        char n[64];
+        std::snprintf(n, sizeof(n), "USB storage mode, host state %d", int(st));
+        r.measure(n);
+    }
+    h.tap(btn::F8);   // in use: the eject reminder
+    CHECK(a.ui.usb.ejectWarningShown());
+    r.measure("USB storage mode + eject reminder");
+    h.tap(btn::F8);
+    CHECK(!a.usbStorageActive());
+}
+
 TEST(guard_cuts_and_falls_back_to_low_detail) {
     Rig r;
     r.dense();

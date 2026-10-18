@@ -27,8 +27,12 @@ region popup.sel @content
   fill 790 89 790 114 FFFFFF 4
 region popup.text @font @content
   bbox 613 42 ~780 52 1
+# 2.x: Synth 1..3 are the first three entries (Tracker+ manual p.100), so
+# the cursor on instrument 5 is entry 7 of 67 and the thumb (placed by the
+# cursor) sits 14 px lower than on the stock card (entry 4): y 71..149 here,
+# 57..131 on the card. The region checks the rows both cover.
 region popup.scroll @content
-  fill 795 60 796 120 333333 4
+  fill 795 74 796 130 333333 4
   fill 794 300 797 400 000000 2
 region grid.threetrack
   fill 475 30 600 40 080808 2

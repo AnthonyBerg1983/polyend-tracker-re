@@ -8,6 +8,7 @@
 #include "ui/config_help.h"
 #include "ui/notes.h"
 #include "ui/screens.h"
+#include "sdram_bss.h"
 
 #ifndef OT_VERSION
 #define OT_VERSION "dev"
@@ -20,7 +21,8 @@ namespace ot {
 
 namespace {
 enum Kind : uint8_t { kNum = 2, kEnum = 3, kText = 5, kAction = 7 };
-enum Store : uint8_t { kCfg = 0, kProj = 1, kNone = 2 };
+// kUsb: the live USB Storage mode state (2.x), never stored anywhere.
+enum Store : uint8_t { kCfg = 0, kProj = 1, kNone = 2, kUsb = 3 };
 
 struct Opt {
     const char* name;
@@ -44,6 +46,7 @@ const char* const kArrange[] = {"Vertical Revolver", "Vertical Original", "Horiz
 const char* const kTopInfo[] = {"Additional info", "Track names", "Off"};
 const char* const kLineIn[] = {"Stereo", "Mono Left", "Mono Right"};
 const char* const kPresets[] = {"Global", "Per Project"};
+const char* const kCpuMeter[] = {"Auto", "Always", "Off"};   // [I] 2.x, spec 2x-02 §2.2
 const char* const kClockIn[] = {"Internal", "USB", "MIDI In jack"};
 const char* const kPortsOut[] = {"Off", "USB", "MIDI Out jack", "USB + MIDI Out jack"};
 const char* const kPortsIn[] = {"Off", "USB", "MIDI In jack", "USB + MIDI In jack"};
@@ -83,6 +86,9 @@ const Opt kGeneral[] = {
     {"Pattern arrangement", kEnum, kCfg, CF(arrangement), 0, 3, kArrange, 0},
     {"Pattern top info", kEnum, kCfg, CF(patternTopInfo), 0, 3, kTopInfo, 0},
     {"Line in channel", kEnum, kCfg, CF(lineInChannel), 0, 3, kLineIn, 0},
+    {"CPU meter", kEnum, kCfg, CF(cpuMeter), 0, 3, kCpuMeter, 0},   // [I] 2.x
+    // [I] 2.x: the synth voice budget (governor budget B, OPTIMIZATION_2X item 10 / OP-8).
+    {"Synth voices", kNum, kCfg, CF(synthVoices), 1, Config::kMaxSynthVoices, nullptr, 0},
 };
 const Opt kMidi[] = {
     {"Clock in", kEnum, kCfg, CF(clockIn), 0, 3, kClockIn, 0},
@@ -96,6 +102,13 @@ const Opt kMidi[] = {
     {"CC in channel", kEnum, kCfg, CF(ccInChannel), 0, 17, kChannels, 0},
     {"Middle C", kEnum, kCfg, CF(middleC), 0, 4, kMiddleC, 0},
     {"Clock sync correction", kEnum, kCfg, CF(clockCorrection), 0, 13, kClockSync, 0},   // spec 15 §2.3: enum
+};
+// 2.x USB (Tracker Mini manual §3 Config options: USB > Storage, USB > Audio;
+// §13.10). [I] The Mini row is "Storage" with Enter; OpenTracker's row is
+// "USB Storage" Off / On (owner request 2026-10-17). Not persisted: the device
+// always boots with it Off. No USB audio on this hardware.
+const Opt kUsbOpts[] = {
+    {"USB Storage", kEnum, kUsb, 0, 0, 2, kOffOn, 0},
 };
 const Opt kMetronome[] = {
     {"State", kEnum, kCfg, CF(metronome), 0, 2, kOffOn, 0},
@@ -112,6 +125,10 @@ const Opt kFirmware[] = {
 };
 const Opt kInfo[] = {
     {"Licenses", kAction, kNone, 3, 0, 0, nullptr, 0},
+    // [I] 2.x (spec 2x-02 §2.2): since boot.
+    {"CPU overruns", kText, kNone, 2, 0, 0, nullptr, 0},
+    {"Governor reductions", kText, kNone, 3, 0, 0, nullptr, 0},
+    {"Synth voice cap", kText, kNone, 4, 0, 0, nullptr, 0},
 };
 #undef CF
 
@@ -124,6 +141,7 @@ const Cat kCats[] = {
     {"Project Settings", kProject, int(sizeof(kProject) / sizeof(Opt))},
     {"General", kGeneral, int(sizeof(kGeneral) / sizeof(Opt))},
     {"MIDI", kMidi, int(sizeof(kMidi) / sizeof(Opt))},
+    {"USB", kUsbOpts, int(sizeof(kUsbOpts) / sizeof(Opt))},   // [I] 2.x, Mini order
     {"Metronome", kMetronome, int(sizeof(kMetronome) / sizeof(Opt))},
     {"Firmware", kFirmware, int(sizeof(kFirmware) / sizeof(Opt))},
     {"Info", kInfo, int(sizeof(kInfo) / sizeof(Opt))},
@@ -189,7 +207,7 @@ constexpr int kLicenseLineCount = int(sizeof(kLicenseLines) / sizeof(kLicenseLin
 
 // Firmware-update file list (spec 06 §7.5): at most 101 entries, sorted.
 constexpr int kFwMax = ConfigScreen::kFwMax;
-char gFw[kFwMax][48];
+OT_SDRAM_BSS char gFw[kFwMax][48];   // SDRAM on the device (OP-5)
 int gFwCount = 0;
 bool gFwMode = false;
 struct FwCtx {
@@ -225,7 +243,15 @@ static int optCount(const Opt& o) { return o.kind == kNum ? o.max - o.min + 1 : 
 
 static void optValueText(App& a, const Opt& o, int index, char* out, int cap) {
     if (o.kind == kText) {
-        std::snprintf(out, size_t(cap), "%s", o.off == 0 ? "OpenTracker " OT_VERSION : OT_BUILD);
+        const audio::Governor& gov = a.engine.governor();
+        switch (o.off) {
+        case 2:
+            std::snprintf(out, size_t(cap), "%lu", static_cast<unsigned long>(a.engine.cpu().overruns()));
+            break;
+        case 3: std::snprintf(out, size_t(cap), "%lu", static_cast<unsigned long>(gov.cuts())); break;
+        case 4: std::snprintf(out, size_t(cap), "%d/%d", gov.cap(), gov.budget()); break;
+        default: std::snprintf(out, size_t(cap), "%s", o.off == 0 ? "OpenTracker " OT_VERSION : OT_BUILD);
+        }
         return;
     }
     if (o.kind == kAction) {
@@ -243,6 +269,7 @@ static void optValueText(App& a, const Opt& o, int index, char* out, int cap) {
 }
 
 static int optIndex(App& a, const Opt& o) {
+    if (o.store == kUsb) return a.usbStorageActive() ? 1 : 0;
     uint8_t* v = optVar(a, o);
     if (!v) return 0;
     return clampi(int(*v) - (o.kind == kNum ? o.min : 0), 0, optCount(o) - 1);
@@ -428,6 +455,13 @@ void ConfigScreen::apply() {
     }
     // Values are stored only on Apply (spec 06 §7.4).
     const Opt& o = kCats[category].opts[option];
+    if (o.store == kUsb) {
+        // 2.x USB Storage: On enters the mode (its page covers the screen),
+        // Off leaves it like the page's Exit. Refusals show a notice.
+        editing = false;
+        ui_.setUsbStorageMode(picker == 1);
+        return;
+    }
     uint8_t* v = optVar(a, o);
     if (v) *v = uint8_t(picker + (o.kind == kNum ? o.min : 0));
     if (o.store == kCfg) {
@@ -670,6 +704,18 @@ void ConfigScreen::optionText(int cat, int i, char* out, int cap) const {
     if (cat < 0 || cat >= kCatCount || i < 0 || i >= kCats[cat].count) return;
     const Opt& o = kCats[cat].opts[i];
     optValueText(app_, o, optIndex(app_, o), out, cap);
+}
+
+void ConfigScreen::applyOption(int cat, int i, int index) {
+    if (cat < 0 || cat >= kCatCount || i < 0 || i >= kCats[cat].count) return;
+    const Opt& o = kCats[cat].opts[i];
+    if (o.kind != kNum && o.kind != kEnum) return;
+    category = cat;
+    option = i;
+    gFwMode = false;
+    picker = clampi(index, 0, optCount(o) - 1);
+    apply();
+    if (ui_.active() == kModConfig) refreshBar();
 }
 
 }  // namespace ot

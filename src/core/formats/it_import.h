@@ -13,7 +13,7 @@
 namespace ot {
 
 namespace itfmt {
-constexpr int kMaxChannels = kTrackCount;   // spec 11 §1.4: 12 channels, more are dropped
+constexpr int kMaxChannels = kStockTrackCount;   // spec 11 §1.4: 12 channels, more are dropped
 constexpr int kMaxRows = kStepCount;        // spec 11 §1.4: <= 128 rows
 constexpr uint32_t kRefRate = 44100;        // C5Speed of unity pitch (8- and 16-bit)
 
@@ -78,8 +78,8 @@ private:
     bool loadInstrument(int i);
     bool sampleChunk(uint32_t& cost);
     bool nextPattern(int& k, bool& inSong);
-    bool convertPattern(int k, bool inSong, Pattern& pat, uint32_t& cost);
-    void storeCell(Pattern& pat, int row, int ch, int note, int ins, int vol, int cmd, int par, bool& row0Tempo);
+    bool convertPattern(int k, bool inSong, PatternStock& pat, uint32_t& cost);
+    void storeCell(PatternStock& pat, int row, int ch, int note, int ins, int vol, int cmd, int par, bool& row0Tempo);
     void finish();
     bool fail(const char* msg);
 

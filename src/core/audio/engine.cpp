@@ -1,9 +1,12 @@
 // Audio engine root (spec 04 §1, §5, §6).
 #include "audio/engine.h"
+#include "fastrun.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "audio/ring_io.h"
 #include "audio/zero_snap.h"
@@ -219,7 +222,11 @@ void buildClick() {
 // AudioEngine
 // ---------------------------------------------------------------------------
 
-AudioEngine::AudioEngine() { initTables(); }
+AudioEngine::AudioEngine() {
+    initTables();
+    gov_.setPool(&synth_);   // the governor only ever reduces synth voices (2x-02 §3.1)
+    synth_.setGovernor(&gov_);
+}
 
 bool AudioEngine::init(int16_t* fx, size_t fxSamples, int16_t* pool, size_t poolSamples, const Instrument* ins) {
     initTables();
@@ -264,7 +271,9 @@ bool AudioEngine::init(int16_t* fx, size_t fxSamples, int16_t* pool, size_t pool
 
 void AudioEngine::stopAll() {
     raw_.active = false;
+    gov_.reset();
     for (auto& v : voices_) v.stop();
+    synth_.stopAll();
 }
 
 void AudioEngine::clearEffects() {
@@ -279,25 +288,44 @@ void AudioEngine::clearEffects() {
 
 // --- ISequencerSink ----------------------------------------------------------
 
+// Note work inside the pre-block hook is attributed to smpOn / synOn of the
+// block profile (block_profile.h); main-loop calls (auditions) are not.
+namespace {
+struct NoteStamp {
+    uint32_t* acc;
+    uint32_t c0;
+    explicit NoteStamp(uint32_t* a) : acc(a), c0(a ? CpuMeter::stampCycles() : 0u) {}
+    ~NoteStamp() {
+        if (acc) *acc += CpuMeter::stampCycles() - c0;
+    }
+};
+}  // namespace
+
 void AudioEngine::voiceNoteOn(uint8_t track, const VoiceNoteOn& n) {
+    NoteStamp st(inHook_ ? &prof_.smpOn : nullptr);
     if (!ready_ || track >= kVoices || n.instrument >= kSampleInstrumentCount) return;
     const Instrument& ins = instruments_[n.instrument];
     if (!ins.active || !bank_.loaded(n.instrument)) return;   // spec 03 §6: ignored if not loaded
-    // The player is mono: stereo instruments play their left channel only
-    // (spec 07 Q1: one player per track, channel 0).
+    // 2.x: a planar stereo instrument plays both channels (2x-04 §3; stock
+    // 1.9.x played channel 0 only, spec 07 Q1). The voice falls back to the
+    // left channel for wavetable / granular.
     int16_t step0 = 0;
     uint32_t tick = 0;
     transportPlaying(&tick, &step0);
     voices_[track].setLfoStepLatch(step0);
+    if (inHook_) BlockProfile::inc(prof_.nSmpOn);
     voices_[track].noteOn(&ins, bank_.left(n.instrument), bank_.frames(n.instrument), n.note, n.volume,
-                          n.fxA.type, n.fxA.value, n.fxB.type, n.fxB.value);
+                          n.fxA.type, n.fxA.value, n.fxB.type, n.fxB.value,
+                          bank_.stereo(n.instrument) ? bank_.right(n.instrument) : nullptr);
 }
 
 void AudioEngine::voiceNoteOff(uint8_t track, NoteOffMode mode) {
+    NoteStamp st(inHook_ ? &prof_.smpOn : nullptr);
     if (track < kVoices) voices_[track].noteOff(int8_t(mode));
 }
 
 void AudioEngine::voiceApplyFx(uint8_t track, uint8_t slot, uint8_t type, uint8_t value) {
+    NoteStamp st(inHook_ ? &prof_.smpOn : nullptr);
     if (track >= kVoices) return;
     int16_t step0 = 0;
     uint32_t tick = 0;
@@ -314,7 +342,27 @@ bool AudioEngine::transportPlaying(uint32_t* tick, int16_t* step0) const {
 
 void AudioEngine::resetAllVoiceFx() {
     for (int t = 0; t < kVoices; ++t) voices_[t].resetFx();
+    synth_.resetFx();
 }
+
+// 2.x synth slots (synth_bank.h): instruments 64..66 on any track.
+void AudioEngine::synthNoteOn(uint8_t track, const SynthNoteOn& n) {
+    NoteStamp st(inHook_ ? &prof_.synOn : nullptr);
+    if (ready_) synth_.noteOn(track, n);
+}
+void AudioEngine::synthNoteOff(uint8_t track, NoteOffMode mode) {
+    NoteStamp st(inHook_ ? &prof_.synOn : nullptr);
+    synth_.noteOff(track, mode);
+}
+void AudioEngine::synthApplyFx(uint8_t track, uint8_t type, uint8_t value) {
+    NoteStamp st(inHook_ ? &prof_.synOn : nullptr);
+    synth_.applyFx(track, type, value);
+}
+void AudioEngine::synthMacroFx(uint8_t slot, uint8_t macro, uint8_t value) {
+    NoteStamp st(inHook_ ? &prof_.synOn : nullptr);
+    synth_.macroFx(slot, macro, value);
+}
+void AudioEngine::synthTransportStop() { synth_.transportStop(); }
 
 void AudioEngine::metronomeClick(bool accent, uint8_t velocity) {
     // Built-in click on the ninth player (spec 07 Q10): note index 30, accent
@@ -328,6 +376,7 @@ void AudioEngine::metronomeClick(bool accent, uint8_t velocity) {
 
 void AudioEngine::midiSend(uint8_t portMask, const uint8_t* bytes, uint8_t len) {
     if (offline_ || !midi_) return;   // MIDI is suppressed while rendering (spec 03 §1.1)
+    if (inHook_) BlockProfile::inc(prof_.nMidiOut);
     routeMidi(*midi_, portMask, bytes, len);
 }
 
@@ -407,6 +456,7 @@ void AudioEngine::controlBlock(float blockUs) {
     uint32_t tick = 0;
     int16_t step0 = 0;
     const bool playing = transportPlaying(&tick, &step0);
+    playing_ = playing;
 
     const MixerSettings& m = mix_;
     bool anySolo = false;
@@ -439,15 +489,20 @@ void AudioEngine::controlBlock(float blockUs) {
             c.reverbLevel = rl;
             c.postFaderSends = m.postFaderSends;
         }
+        c.ampTap = t == kMetronomeVoice;   // o.amp of stereo voices: metronome + side-chain track
         voices_[t].control(c);
     }
+    synthIn_.delayLevel = dl;   // synth sends scale with the Global Mixer like track sends
+    synthIn_.reverbLevel = rl;
+    synth_.setTempo(tempo_);
+    if (m.sidechain >= 1 && m.sidechain <= kVoices) vc_[m.sidechain - 1].ampTap = true;   // §5.3 source
 }
 
 // --- block render (spec 04 §1.3 graph) ----------------------------------------
 
 // Step 6 of renderBlock for one saturation mode (spec 04 §5.4).
 template <int kMode>
-void AudioEngine::masterSum(float l0, float li) {
+inline __attribute__((always_inline)) void AudioEngine::masterSum(float l0, float li) {
     for (uint32_t i = 0; i < kBlock; ++i) {
         l0 += li;
         const float dl = saturate(mL_[i], kMode), dr = saturate(mR_[i], kMode);
@@ -456,29 +511,56 @@ void AudioEngine::masterSum(float l0, float li) {
     }
 }
 
+// Saturation mode 0 (the default) runs from SRAM_L (fastrun.h); the other
+// modes stay inlined in renderBlock (flash).
+OT_FASTRUN_FN void AudioEngine::masterSumClean(float l0, float li) { masterSum<0>(l0, li); }
+
 void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
     const float blockSeconds = offline ? kRenderBlockSeconds : kLiveBlockSeconds;
     const float blockUs = offline ? kRenderBlockUs : kLiveBlockUs;
+    // Phase stamps of the block profile (block_profile.h), live + timed only.
+    const bool prof = profOn_ && !offline;
+    auto stamp = [prof]() { return prof ? CpuMeter::stampCycles() : 0u; };
+    synth_.setProfile(prof ? &prof_ : nullptr);
+    const uint32_t pc0 = stamp();
     // 1. sequencer advance (spec 04 §1.1 step 1 / §6.1)
+    inHook_ = prof;
     if (hook_) hook_(hookCtx_, blockSeconds);
+    inHook_ = false;
+    const uint32_t pc1 = stamp();
     // 2. per-block control (§4.9)
     (void)blockSeconds;
     controlBlock(blockUs);
+    const uint32_t pc2 = stamp();
     // 3. voices
     zeroWords(dsend_, sizeof(dsend_));
     zeroWords(rsend_, sizeof(rsend_));
     zeroWords(mL_, sizeof(mL_));
     zeroWords(mR_, sizeof(mR_));
     bool anyVoice = false;
+    uint32_t sendsTouched = 0;   // bit 0 dsend_, bit 1 rsend_ (else still all zero)
     for (int t = 0; t < kVoices; ++t) {
         if (voices_[t].render(vc_[t], vout_[t], dsend_, rsend_, mL_, mR_, stems != nullptr)) {
             anyVoice = true;
+            sendsTouched |= voices_[t].sendsTouched();
             float pk = peak_[t];
             const float b = voices_[t].blockPeak();
             pk = b > pk ? b : pk;
             peak_[t] = pk > 1.0f ? 1.0f : pk;
+            if (prof) BlockProfile::inc(prof_.nSmpVoices);
         }
     }
+    const uint32_t pc3 = stamp();
+    // 3b. synth slots (2.x M3): voices -> slot gain / pan -> main bus and
+    //     sends; the Synth 1..3 stems are tapped from the slot buses.
+    if (synth_.active() || stems) {
+        int16_t* synthStems[kSynthSlots] = {};
+        if (stems)
+            for (int s = 0; s < kSynthSlots; ++s) synthStems[s] = stems->data[StemBlock::kFirstSynthStem + s];
+        anyVoice |= synth_.render(synthIn_, mL_, mR_, dsend_, rsend_, synthStems);
+        sendsTouched = 3;   // (the slots' send taps: not tracked)
+    }
+    const uint32_t pc4 = stamp();
     // 4. line input (§1.3 IG): channel mode, direct level, sends. A block of
     //    digital silence is treated like no input (identical result).
     const MixerSettings& m = mix_;
@@ -529,8 +611,8 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
             for (uint32_t i = 0; i < kBlock; ++i) {
                 d0 += di;
                 r0 += ri;
-                dsend_[i] = clampUnit(dsend_[i] + (dynL[i] + dynR[i]) * d0);
-                rsend_[i] = clampUnit(rsend_[i] + (dynL[i] + dynR[i]) * r0);
+                dsend_[i] = clampUnitFast(dsend_[i] + (dynL[i] + dynR[i]) * d0);
+                rsend_[i] = clampUnitFast(rsend_[i] + (dynL[i] + dynR[i]) * r0);
             }
         } else {
             if (dynActive_) {
@@ -538,17 +620,24 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
                 dynR_.idle();
                 dynActive_ = !(dynL_.settled() && dynR_.settled());
             }
-            if (anyVoice) {   // a zero send gain adds nothing
+            // A send no voice added into is still all zero: no clamp pass.
+            if (sendsTouched == 3) {
                 for (uint32_t i = 0; i < kBlock; ++i) {
-                    dsend_[i] = clampUnit(dsend_[i]);
-                    rsend_[i] = clampUnit(rsend_[i]);
+                    dsend_[i] = clampUnitFast(dsend_[i]);
+                    rsend_[i] = clampUnitFast(rsend_[i]);
                 }
+            } else if (sendsTouched) {
+                float* s = sendsTouched == 1 ? dsend_ : rsend_;
+                for (uint32_t i = 0; i < kBlock; ++i) s[i] = clampUnitFast(s[i]);
             }
         }
     }
     // 5. effects (false: bypassed, outputs all zero)
+    const uint32_t pc5 = stamp();
     const bool dly = delay_.process(dsend_, dL_, dR_);
+    const uint32_t pc6 = stamp();
     const bool rev = reverb_.process(rsend_, rL_, rR_);
+    const uint32_t pc7 = stamp();
     // 6. DRY (shaped) + returns (MSUM gains 1/2 fixed at 1.0, spec 07 Q3)
     //    + line-in -> MSUM (shaped) (§5.4). All inputs zero -> zero (every
     //    shaper maps 0 to 0), mL_/mR_ already are.
@@ -561,7 +650,7 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
                 case 2: masterSum<2>(l0, li); break;
                 case 3: masterSum<3>(l0, li); break;
                 case 4: masterSum<4>(l0, li); break;
-                default: masterSum<0>(l0, li); break;
+                default: masterSumClean(l0, li); break;   // the default mode, from SRAM_L (.fastrun)
             }
         }
     }
@@ -630,7 +719,9 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
             master[2 * i + 1] = toS16(r);
         }
     }
-    // 9. stem taps (§1.3 record queues; §6.1)
+    // 9. stem taps (§1.3 record queues; §6.1). Track stems carry the voice's
+    //    post-pan / post-balance o.l / o.r, so stereo instruments keep their
+    //    image (2x-04 §6). The Synth 1-3 stems (11..13) were written in 3b.
     if (stems) {
         for (int t = 0; t < kVoices; ++t) {
             int16_t* s = stems->data[t];
@@ -649,6 +740,20 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
         std::memcpy(stems->data[10], master, sizeof(stems->data[10]));
     }
     ++blocks_;
+    if (prof) {
+        const uint32_t pc8 = stamp();
+        const uint32_t notes = prof_.smpOn + prof_.synOn;
+        prof_.seq = pc1 - pc0 > notes ? pc1 - pc0 - notes : 0u;
+        prof_.ctrl = pc2 - pc1;
+        prof_.smp = pc3 - pc2;
+        uint32_t eng = 0;
+        for (uint32_t c : prof_.slot) eng += c;
+        prof_.synFw = pc4 - pc3 > eng ? pc4 - pc3 - eng : 0u;
+        prof_.dly = pc6 - pc5;
+        prof_.rev = pc7 - pc6;
+        prof_.out = (pc5 - pc4) + (pc8 - pc7);   // line / sends; master, limiter, metronome, output
+        synth_.setProfile(nullptr);
+    }
 }
 
 void AudioEngine::renderLive(int16_t* out) {
@@ -662,9 +767,22 @@ void AudioEngine::renderLive(int16_t* out) {
 void AudioEngine::fillCallback(int16_t* out, uint32_t frames, void* ctx) {
     AudioEngine* e = static_cast<AudioEngine*>(ctx);
     uint32_t done = 0;
+    const bool timed = CpuMeter::cycleSource() != nullptr;
     while (done + kBlock <= frames) {
+        if (timed) e->prof_ = BlockProfile{};
+        e->profOn_ = timed;
+        const uint32_t c0 = timed ? CpuMeter::cycles() : 0u;
         e->renderLive(out + 2 * done);
         done += kBlock;
+        if (!timed) continue;
+        // 2.x CPU meter + governor (spec 2x-02 §3.2: after render, per block).
+        const uint32_t cyc = CpuMeter::cycles() - c0;
+        e->cpu_.addBlock(cyc);
+        e->prof_.total = cyc;
+        e->profWin_.add(e->prof_, e->cpu_.windowEnded());
+        if (e->govPlaying_ && !e->playing_) e->gov_.reset();   // Stop
+        e->govPlaying_ = e->playing_;
+        e->gov_.evaluate(e->cpu_);
     }
     if (done < frames) std::memset(out + 2 * done, 0, (frames - done) * 2 * sizeof(int16_t));
 }
@@ -673,6 +791,7 @@ void AudioEngine::fillCallback(int16_t* out, uint32_t frames, void* ctx) {
 
 void AudioEngine::beginOffline() {
     callbackDisabled_ = true;
+    gov_.setEnabled(false);   // spec 2x-02 §3.5
     offline_ = true;
     clearEffects();
     stopAll();
@@ -688,6 +807,8 @@ void AudioEngine::renderOfflineBlock(int16_t* master, StemBlock* stems) {
 }
 
 void AudioEngine::endOffline() {
+    gov_.reset();
+    gov_.setEnabled(true);
     offline_ = false;
     callbackDisabled_ = false;
 }
@@ -717,8 +838,16 @@ int32_t AudioEngine::exportWav(IStorage& fs, const char* path, bool stems, uint3
                                bool (*running)(void*), void* ctx) {
     static const char* const kNames[StemBlock::kStems] = {"track1.wav", "track2.wav", "track3.wav", "track4.wav",
                                                           "track5.wav", "track6.wav", "track7.wav", "track8.wav",
-                                                          "reverb.wav", "delay.wav",  "master.wav"};
+                                                          "reverb.wav", "delay.wav",  "master.wav", "synth_1.wav",
+                                                          "synth_2.wav", "synth_3.wav"};
     const int nw = stems ? StemBlock::kStems : 1;
+    StemBlock* stemBuf = exportScratch_;
+    std::unique_ptr<StemBlock> ownStems;
+    if (stems && !stemBuf) {
+        ownStems.reset(new (std::nothrow) StemBlock);
+        stemBuf = ownStems.get();
+        if (!stemBuf) return -1;
+    }
     WavWriter writers[StemBlock::kStems];
     char names[StemBlock::kStems][160];
     if (stems) fs.mkdir(path);
@@ -731,14 +860,13 @@ int32_t AudioEngine::exportWav(IStorage& fs, const char* path, bool stems, uint3
         }
     }
     beginOffline();
-    static StemBlock stemBuf;   // ~5.6 KB, keep off the stack
     int16_t masterBuf[kBlock * 2];
     uint32_t n = 0;
     bool ok = true;
     while (n < maxBlocks && (!running || running(ctx))) {
-        renderOfflineBlock(masterBuf, stems ? &stemBuf : nullptr);
+        renderOfflineBlock(masterBuf, stems ? stemBuf : nullptr);
         if (stems) {
-            for (int i = 0; i < nw && ok; ++i) ok = writers[i].write(stemBuf.data[i], kBlock);
+            for (int i = 0; i < nw && ok; ++i) ok = writers[i].write(stemBuf->data[i], kBlock);
         } else {
             ok = writers[0].write(masterBuf, kBlock);
         }

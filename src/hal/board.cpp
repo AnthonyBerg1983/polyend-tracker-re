@@ -16,11 +16,22 @@
 #include "pad_leds.h"
 #include "radio_si4703.h"
 #include "sd_storage.h"
+#include "sdram_cache.h"
+#include "sdhc.h"
+#include "telemetry.h"
+#include "app/project_io.h"
+#include "audio/cpu_meter.h"
 
 static_assert(F_CPU == ot::board::kCoreHz && F_BUS == ot::board::kBusHz, "spec 01 §1 clocks");
 static_assert(ot::hal::hw::sdramRefreshCount(ot::board::kFlexBusHz, 15625) ==
                   (ot::board::kSdramCtrl & 0x1FFu),
               "spec 01 §2: SDRAMC_CTRL.RC for 15625 ns at the FlexBus clock");
+
+// Linker script symbols (opentracker.ld): the .fastrun code in SRAM_L.
+extern "C" char __fastrun_start[], __fastrun_end[];
+// Area boundaries inside .fastrun (opentracker.ld), in link order.
+extern "C" char __fastrun_smp[], __fastrun_fx[], __fastrun_mix[], __fastrun_vap[], __fastrun_acd[],
+    __fastrun_perc[], __fastrun_other[];
 
 namespace ot {
 namespace hal {
@@ -54,6 +65,39 @@ void (*gPowerOffHook)() = nullptr;
 int8_t gInputSource = -1;
 uint8_t gInputGain = 0;
 bool gInputOk = false;
+
+// Telemetry "io" line (telemetry.h formatIo): SD commands / bytes per window and
+// the cache state, logged right before the app's render line of the same window.
+sdhc::Counters gIoLast;
+void ioTelemetry(uint32_t windowMs) {
+    const sdhc::Counters c = sdhc::counters();
+    diag::IoSample s;
+    s.windowMs = windowMs;
+    s.sdCmds = c.cmds - gIoLast.cmds;
+    s.sdReadBytes = c.readBytes - gIoLast.readBytes;
+    s.sdWriteBytes = c.writeBytes - gIoLast.writeBytes;
+    s.sdDirect = c.direct - gIoLast.direct;
+    s.sdBounced = c.bounced - gIoLast.bounced;
+    gIoLast = c;
+    if (!diagTerminalOpen()) return;
+    s.cacheOn = cache::sdramCached();
+    s.cacheTest = cache::testName(cache::status().test);
+    s.sdDirectRead = sdhc::sdramDirectRead();
+    s.sdDirectWrite = sdhc::sdramDirectWrite();
+    char line[240];
+    diag::formatIo(line, sizeof line, s);
+    diagLog(line);
+    // Background project job profile: while one runs, and once more after it ended.
+    const JobProfile& jp = jobProfile();
+    static uint32_t lastPasses = 0;
+    if (jp.running || jp.passes != lastPasses) {
+        lastPasses = jp.passes;
+        diag::formatLoad(line, sizeof line, jp);
+        diagLog(line);
+    }
+}
+
+uint32_t dwtCycles() { return ARM_DWT_CYCCNT; }
 
 void sdramInit() {
     // spec 01 §2 sequence
@@ -263,6 +307,40 @@ const BootReport& boardInit() {
     ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
     ARM_DWT_CYCCNT = 0;
 
+    // Background job profile in DWT cycles (core app/project_io.h).
+    setJobProfileCycles(&dwtCycles, board::kCoreHz / 1000000u);
+    // 2.x CPU meter / governor: render cycles per block (core audio/cpu_meter.h).
+    audio::CpuMeter::setCycleSource(&dwtCycles);
+    {   // Hot audio code copied to SRAM_L with .data (core fastrun.h, OT_FASTRUN).
+        const uint32_t n = uint32_t(__fastrun_end - __fastrun_start);
+#if defined(OT_FASTRUN) && OT_FASTRUN
+        // Per area (opentracker.ld): sample voices, delay / reverb / limiter,
+        // master sum + synth framework, the three engines, the rest (memset,
+        // veneers). docs/OPTIMIZATION_2X.md "CPU round 3" lists the functions.
+        auto sz = [](const char* a, const char* b) { return static_cast<unsigned long>(b - a); };
+        diagLogf("fastrun: %lu B of audio code in SRAM_L at 0x%08lX (OT_FASTRUN=1): smp %lu fx %lu mix %lu vap %lu "
+                 "acd %lu perc %lu other %lu",
+                 static_cast<unsigned long>(n), static_cast<unsigned long>(reinterpret_cast<uintptr_t>(__fastrun_start)),
+                 sz(__fastrun_smp, __fastrun_fx), sz(__fastrun_fx, __fastrun_mix), sz(__fastrun_mix, __fastrun_vap),
+                 sz(__fastrun_vap, __fastrun_acd), sz(__fastrun_acd, __fastrun_perc), sz(__fastrun_perc, __fastrun_other),
+                 sz(__fastrun_other, __fastrun_end));
+#else
+        diagLogf("fastrun: off (OT_FASTRUN=0), %lu B in SRAM_L", static_cast<unsigned long>(n));
+#endif
+    }
+
+    // 2.x performance workstream: system cache for the SDRAM (write-through,
+    // coherency self-test, sdram_cache.h), then ADMA2 straight into SDRAM behind
+    // its own check (sdhc.h). Both use SDRAM the quick test just overwrote.
+    if (r.sdramOk) {
+        diagStage("step 6b: SDRAM cache + coherency selftest");
+        cache::initSdram(reinterpret_cast<uint8_t*>(board::kSdramCheckScratch));
+        if (r.sdMounted) {
+            diagStage("step 6c: SD ADMA2 direct-to-SDRAM check");
+            gStorage.checkDirectDma(reinterpret_cast<uint8_t*>(board::kSdramSdScratch));
+        }
+    }
+
     r.stage = 7;
     diagStage("step 7: FT81x display");
     // step 7: display.
@@ -302,6 +380,9 @@ const BootReport& boardInit() {
     r.ledsOk = gLeds.init();
     diagLogf("leds: ok %d, i2c0 errors %lu i2c2 errors %lu", int(r.ledsOk),
              static_cast<unsigned long>(i2c0().errorCount()), static_cast<unsigned long>(i2c2().errorCount()));
+
+    gIoLast = sdhc::counters();
+    diag::Telemetry::setReportHook(&ioTelemetry);
 
     // MIDI (spec 01 §8).
     diagStage("MIDI init");

@@ -1,6 +1,8 @@
 // Performance screen: preset storage (spec 12 §A), per-track patterns (§C),
 // MIDI CC 41-48 / 51-62 (§B), FX conversion (§E.2), value labels and
 // start / type-change rules (spec 06 §3). VERIFICATION_1TO1 P1-P3, P12-P14.
+#include <cstring>
+
 #include "test.h"
 #include "ui_fakes.h"
 #include "nvstore_fake.h"
@@ -33,8 +35,8 @@ int16_t imgValue(const std::vector<uint8_t>& m, int s, int r) {
 }
 
 void putPattern(App& a, int num, uint8_t note0) {
-    Pattern& p = a.stored(num);
-    p = a.pattern();
+    a.storePattern(num, a.pattern());
+    PatternStock& p = a.storedStock(num);
     for (auto& t : p.tracks) t.steps[0].note = kNoteEmpty;
     p.tracks[0].steps[0].note = int8_t(note0);
     a.markPatternDirty(num);
@@ -336,4 +338,121 @@ TEST(perf_start_and_type_change_rules) {
     CHECK_EQ(p.src.row(1), 0);
     CHECK(p.fxOn[1]);
     CHECK(!p.edit);
+}
+
+// ---- 2.x M1-WP6: bank B (docs/specs/2x-01 §5, M1 plan §4) -------------------
+
+TEST(perf_bank_toggle_by_performance_key) {
+    PerfRig r;
+    App& a = r.a();
+    r.h.tap(btn::Performance);
+    PerformanceScreen& p = r.p();
+    CHECK(a.ui.active() == kModPerformance);
+    CHECK_EQ(p.bank, 0);
+    CHECK_STR(a.ui.bar.label[0].top, "Track 1");
+    r.h.tap(btn::Performance);   // on the screen: toggles the bank
+    CHECK(a.ui.active() == kModPerformance);
+    CHECK_EQ(p.bank, 1);
+    CHECK_STR(a.ui.bar.label[0].top, "Midi 9");
+    CHECK_STR(a.ui.bar.label[7].top, "Midi 16");
+    CHECK_STR(a.ui.bar.label[4].bottom, "Patt: 1");
+    // Shift shows the mute action; Shift + F6 mutes track 14 (project.mt 0x742[5]).
+    r.h.down(btn::Shift);
+    CHECK_STR(a.ui.bar.label[5].bottom, "Mute");
+    r.h.tap(btn::F6);
+    CHECK_STR(a.ui.bar.label[5].bottom, "Unmute");
+    r.h.up(btn::Shift);
+    CHECK(trk::muted(a, 13));
+    CHECK_EQ(a.project.u8(0x742 + 5), 1);      // project.mt (Tracker Mini, U13)
+    CHECK(!a.trackMuted(5));
+    // Shift + F1 in bank B: track 9 (stock mute byte).
+    r.h.down(btn::Shift);
+    r.h.tap(btn::F1);
+    r.h.up(btn::Shift);
+    CHECK(a.trackMuted(8));
+    CHECK(!a.trackMuted(0));
+    r.h.tap(btn::Performance);
+    CHECK_EQ(p.bank, 0);
+    CHECK_STR(a.ui.bar.label[0].top, "Track 1");
+}
+
+TEST(perf_bank_b_no_pattern_overrides) {
+    // The Tracker Mini stores per-track patterns for tracks 1-8 only: bank B
+    // keys show the current pattern and only toggle the FX (session state,
+    // reset at every entry like tracks 1-8).
+    PerfRig r;
+    App& a = r.a();
+    putPattern(a, 2, 40);
+    putPattern(a, 5, 41);
+    r.h.tap(btn::Performance);
+    PerformanceScreen& p = r.p();
+    r.h.tap(btn::Performance);
+    CHECK_EQ(p.bank, 1);
+    static Project before;
+    before = a.project;
+    // Hold F5 + encoder / F8 + Right / F6 + Up: nothing changes.
+    r.h.down(btn::F5);
+    r.h.enc(1);
+    r.h.up(btn::F5);
+    CHECK_EQ(p.shownPattern(12), 1);
+    CHECK(p.fxOn[12]);                        // key used: no FX toggle
+    r.h.down(btn::F8);
+    for (int i = 0; i < 4; ++i) r.h.tap(btn::Right);
+    CHECK_EQ(p.shownPattern(15), 1);
+    r.h.up(btn::F8);
+    CHECK(p.fxOn[15]);
+    CHECK_STR(a.ui.bar.label[7].bottom, "Patt: 1");
+    r.h.down(btn::F6);
+    r.h.tap(btn::Up);
+    r.h.up(btn::F6);
+    CHECK_EQ(p.shownPattern(13), 1);
+    CHECK(std::memcmp(before.values, a.project.values, sizeof(before.values)) == 0);
+    // Plain tap: FX enable of tracks 13-16 (owner decision), not stored.
+    r.h.tap(btn::F7);
+    CHECK(!p.fxOn[14]);
+    CHECK(std::memcmp(before.values, a.project.values, sizeof(before.values)) == 0);
+    // Bank A keys still address tracks 1-8.
+    r.h.tap(btn::Performance);
+    r.h.down(btn::F1);
+    r.h.enc(1);
+    r.h.up(btn::F1);
+    CHECK_EQ(a.project.u16(pf::kPerfPatterns + 0), 2);
+    // A fresh entry: FX enabled again on every track.
+    r.h.tap(btn::Pattern);
+    r.h.tap(btn::Performance);
+    CHECK(r.p().fxOn[14]);
+    CHECK_EQ(r.p().shownPattern(15), 1);
+}
+
+TEST(perf_apply_all_covers_16_tracks) {
+    PerfRig r;
+    App& a = r.a();
+    a.cfg.perfPresets = 1;
+    r.h.tap(btn::Performance);
+    PerformanceScreen& p = r.p();
+    // Slot 0 = Play mode, row 1 = 3 (spec 12 §D): a sequencer-side FX.
+    r.h.tap(btn::Rec);
+    for (int i = 0; i < perf::kPlayMode - 1; ++i) r.h.tap(btn::Up);
+    CHECK_EQ(p.src.type(0), perf::kPlayMode);
+    r.h.push(InputEvent::kPadDown, 12);
+    r.h.enc(3);
+    r.h.push(InputEvent::kPadUp, 12);
+    r.h.tap(btn::Rec);
+    r.h.pad(12);
+    CHECK_EQ(p.cur[0], 3);
+    // Tracks 1-8 and the MIDI tracks of the sequencer take it.
+    CHECK_EQ(a.seq.perfPlayMode(0), 3);
+    CHECK_EQ(a.seq.perfPlayMode(8), 3);
+    CHECK_EQ(a.seq.perfPlayMode(11), 3);
+    // Disable track 10 in bank B: reverted there only.
+    r.h.tap(btn::Performance);
+    r.h.tap(btn::F2);
+    CHECK(!p.fxOn[9]);
+    CHECK_EQ(a.seq.perfPlayMode(9), 0);
+    CHECK_EQ(a.seq.perfPlayMode(8), 3);
+    r.h.tap(btn::F2);
+    CHECK_EQ(a.seq.perfPlayMode(9), 3);
+    // Leaving reverts every track.
+    r.h.tap(btn::Pattern);
+    for (int t = 0; t < 12; ++t) CHECK_EQ(a.seq.perfPlayMode(t), 0);
 }

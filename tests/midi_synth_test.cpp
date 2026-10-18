@@ -82,20 +82,21 @@ TEST(sample_instrument_polyphony_8_no_stealing) {
     noteOff(h, 60);
 }
 
-TEST(midi_instrument_polyphony_12_and_velocity) {
+// Stock: 12 (one per track); 2.x: one per track of all 16 (2x-01 §6).
+TEST(midi_instrument_polyphony_16_and_velocity) {
     Harness h;
     App& a = *h.app;
     a.cfg.notesIn = 1;
     a.cfg.midiOut = 3;   // USB + jack
     a.setCurrentInstrument(kFirstMidiInstrument);
-    for (int i = 0; i < 13; ++i) noteOn(h, uint8_t(40 + i));
+    for (int i = 0; i < kTrackCount + 1; ++i) noteOn(h, uint8_t(40 + i));
     int n = 0;
-    for (int i = 0; i < 13; ++i)
+    for (int i = 0; i < kTrackCount + 1; ++i)
         if (a.auditionTrack(uint16_t(App::kAuditionMidiIn + 40 + i)) >= 0) ++n;
-    CHECK_EQ(n, 12);
+    CHECK_EQ(n, kTrackCount);
     // Velocity is fixed (127 * default velocity / 127) outside a velocity mode.
     CHECK_EQ(lastNoteOnVelocity(h), 127);
-    for (int i = 0; i < 13; ++i) noteOff(h, uint8_t(40 + i));
+    for (int i = 0; i < kTrackCount + 1; ++i) noteOff(h, uint8_t(40 + i));
     MidiInstrument mi = a.project.midiInstrument(0);
     mi.velocity = 100;
     a.project.setMidiInstrument(0, mi);

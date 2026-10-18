@@ -76,9 +76,9 @@ struct VoiceRig {
 
 }  // namespace
 
-// --- Q1: stereo instruments play their left channel only ----------------------
+// --- Q1: stock 1.9.x played the left channel only; 2.x plays both (2x-04 §3) ---
 
-TEST(q1_track_voice_plays_left_channel) {
+TEST(q1_track_voice_plays_both_channels_2x) {
     Rig r;
     std::vector<int16_t> st(2 * 20000);
     for (size_t i = 0; i < 20000; ++i) {
@@ -90,8 +90,8 @@ TEST(q1_track_voice_plays_left_channel) {
     int16_t out[kBlock * 2];
     for (int b = 0; b < 3; ++b) r.eng->renderLive(out);
     for (uint32_t i = 0; i < kBlock; ++i) {
-        CHECK(out[2 * i] > 7000);       // left data, centred mono voice
-        CHECK(out[2 * i + 1] > 7000);
+        CHECK(out[2 * i] > 7000);        // left block on the left output
+        CHECK(out[2 * i + 1] < -7000);   // right block on the right output
     }
 }
 

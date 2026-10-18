@@ -10,7 +10,9 @@
 using namespace ot;
 
 TEST(constants) {
-    CHECK_EQ(kTrackCount, 12);
+    CHECK_EQ(kTrackCount, 16);
+    CHECK_EQ(kStockTrackCount, 12);
+    CHECK_EQ(kMidiTrackStart, 8);
     CHECK_EQ(kStepCount, 128);
     CHECK_EQ(kInstrumentCount, 64);
     CHECK_EQ(int(kNoteEmpty), -1);

@@ -84,6 +84,7 @@ public:
         masterDsp.set(eq, bassBoost, space);
     }
     MasterDspRecord masterDsp;
+    int peak = 0;   // largest |sample| pulled since the script reset it
     void pull();
     bool recordWav(const char* path);
 

@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "sdram_bss.h"
 
 namespace ot {
 
@@ -23,8 +24,9 @@ void put32(uint8_t* p, uint32_t v) {
     for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (8 * i));
 }
 
-uint32_t gRow[kW];   // one row of pixels (static: no large stack frame)
-uint8_t gRowBytes[kW * 4];
+// One row of pixels (static: no large stack frame; SDRAM on the device, OP-5).
+OT_SDRAM_BSS uint32_t gRow[kW];
+OT_SDRAM_BSS uint8_t gRowBytes[kW * 4];
 }  // namespace
 
 // BITMAPFILEHEADER + BITMAPINFOHEADER, bottom-up rows, BI_RGB 32 bpp.

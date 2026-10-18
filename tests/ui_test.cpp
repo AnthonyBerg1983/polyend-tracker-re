@@ -386,8 +386,8 @@ TEST(config_apply_and_firmware_update) {
     h.fs.files["Firmware/PolyendTracker_1.9.2.ptf"] = {1, 2, 3};
     h.fs.files["Firmware/readme.txt"] = {1};
     h.tap(btn::Config);
-    for (int i = 0; i < 6 && c.category != 4; ++i) h.tap(btn::Down);   // Firmware (Info is last)
-    CHECK(c.category == 4);
+    for (int i = 0; i < 7 && c.category != 5; ++i) h.tap(btn::Down);   // Firmware (Info is last)
+    CHECK(c.category == 5);
     h.tap(btn::Right);
     h.tap(btn::F8);
     CHECK(c.editing);
@@ -484,8 +484,8 @@ TEST(export_pattern_stems) {
     h.tap(btn::File);
     h.tap(btn::F6);
     h.tap(btn::F4);   // export pattern stems
-    static const char* kStems[11] = {"track1", "track2", "track3", "track4", "track5", "track6",
-                                     "track7", "track8", "reverb", "delay",  "master"};
+    static const char* kStems[14] = {"track1", "track2", "track3", "track4", "track5", "track6", "track7",
+                                     "track8", "reverb", "delay",  "master", "synth_1", "synth_2", "synth_3"};   // Mini synth_%d (spec 21 §2)
     std::string dir;
     for (auto& f : h.fs.files)
         if (f.first.find("_S0") != std::string::npos) dir = f.first.substr(0, f.first.rfind('/'));
@@ -493,7 +493,7 @@ TEST(export_pattern_stems) {
     int count = 0;
     for (auto& f : h.fs.files)
         if (f.first.compare(0, dir.size() + 1, dir + "/") == 0) ++count;
-    CHECK(count == 11);
+    CHECK(count == 14);
     for (const char* n : kStems) {
         const std::string p = dir + "/" + n + ".wav";
         CHECK(h.fs.files.count(p));

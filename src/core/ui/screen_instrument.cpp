@@ -658,6 +658,7 @@ void InstrumentScreen::draw(Gfx& g) {
     else if (effects) std::snprintf(title, sizeof(title), "Instrument Effects");
     else std::snprintf(title, sizeof(title), "Instrument Parameters 1/2");
     if (ci < kSampleInstrumentCount) std::snprintf(sub, sizeof(sub), "%d. %s", ci + 1, a.instrPresent[ci] ? a.instruments[ci].name : "(empty)");
+    else if (isSynthInstrument(ci)) synthui::slotLabel(a, synthSlotOf(ci), sub, sizeof(sub));
     else std::snprintf(sub, sizeof(sub), "MIDI %d", ci - 47);
     ui_.drawTitle(g, title, sub);
     char v[24];

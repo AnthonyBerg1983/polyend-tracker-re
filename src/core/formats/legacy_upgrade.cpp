@@ -218,9 +218,9 @@ bool upgradeProjectImage(uint8_t* img, uint8_t fromVersion) {
 // steps 0..lastStep; sample instruments only.
 namespace {
 template <typename F>
-void scanSteps(Pattern& p, F fn) {
+void scanSteps(Track* tracks, F fn) {
     for (int t = 0; t < kLegacyTrackCount; ++t) {
-        Track& tr = p.tracks[t];
+        Track& tr = tracks[t];
         if (tr.lastStep == 0xFF) continue;
         // SPEC GAP: lastStep 128..254 would run past the track in the
         // firmware's RAM layout; OpenTracker stops at step 127.
@@ -234,14 +234,14 @@ void scanSteps(Pattern& p, F fn) {
 }
 }  // namespace
 
-void patternStepVolume(Pattern& p, uint8_t (*curve)(uint8_t)) {
+void patternStepVolume(Track* p, uint8_t (*curve)(uint8_t)) {
     scanSteps(p, [&](Step& st) {
         for (auto& f : st.fx)
             if (f.type == uint8_t(FxId::Volume)) f.value = curve(f.value);
     });
 }
 
-void patternStepBeatSlice(Pattern& p, const uint8_t* modes, uint8_t ref117) {
+void patternStepBeatSlice(Track* p, const uint8_t* modes, uint8_t ref117) {
     const int d = 12 - int(ref117);
     scanSteps(p, [&](Step& st) {
         if (st.note < 0) return;
@@ -251,16 +251,16 @@ void patternStepBeatSlice(Pattern& p, const uint8_t* modes, uint8_t ref117) {
     });
 }
 
-void patternStepExpandTracks(Pattern& p) {
-    for (int t = kLegacyTrackCount; t < kTrackCount; ++t) p.tracks[t].clear(p.tracks[0].lastStep);
+void patternStepExpandTracks(Track* p, int trackCount) {
+    for (int t = kLegacyTrackCount; t < trackCount; ++t) p[t].clear(p[0].lastStep);
 }
 
-bool upgradePattern(Pattern& p, uint8_t v, const PatternUpgradeParams& prm) {
+bool upgradePattern(Track* p, uint8_t v, const PatternUpgradeParams& prm, int trackCount) {
     if (v >= 5) return false;
     if (v < 2) patternStepVolume(p, prm.curveV2 ? prm.curveV2 : gainG2);
     if (v < 3 && prm.instrumentPlayModes) patternStepBeatSlice(p, prm.instrumentPlayModes, prm.beatSliceReference);
     if (v < 4) patternStepVolume(p, prm.curveV4 ? prm.curveV4 : gainG4);
-    patternStepExpandTracks(p);
+    patternStepExpandTracks(p, trackCount);
     return true;
 }
 

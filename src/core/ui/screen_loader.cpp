@@ -1,4 +1,5 @@
 // Sample Loader (spec 06 §5).
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -200,7 +201,7 @@ void LoaderScreen::refreshBar() {
     b.set(5, "Delete", "unused", focus == 1);
     const float g = audio::trkGain(a.cfg.previewVolume);
     if (g <= 0) std::snprintf(v, sizeof(v), "-inf dB");
-    else std::snprintf(v, sizeof(v), "%.2f dB", 20.0 * __builtin_log10(double(g)));
+    else std::snprintf(v, sizeof(v), "%.2f dB", double(20.0f * std::log10(g)));
     b.set(6, "Preview Vol", v);
     std::snprintf(v, sizeof(v), "%u%%", unsigned(uint64_t(projected_) * 100 / (a.bank.capacityBytes() ? a.bank.capacityBytes() : 1)));
     b.set(7, "Memory", v);
@@ -488,12 +489,16 @@ void LoaderScreen::onButton(uint8_t id, uint8_t state) {
                             auto* self = static_cast<LoaderScreen*>(ctx);
                             App& ap = self->app_;
                             bool used[kSampleInstrumentCount] = {};
-                            ap.stored(ap.patternNumber()) = ap.pattern();
+                            ap.commitCurrentPattern();
                             for (int n = 1; n <= kPatternCount; ++n) {
                                 if (!ap.patternPresent(n)) continue;
-                                for (const auto& t : ap.stored(n).tracks)
-                                    for (const auto& s : t.steps)
+                                // All 16 tracks (2.x): tracks 12..15 only when they hold a pool block.
+                                for (int t = 0; t < kTrackCount; ++t) {
+                                    const Track* tr = ap.findStoredTrack(n, t);
+                                    if (!tr) continue;
+                                    for (const auto& s : tr->steps)
                                         if (s.note >= 0 && s.instrument < kSampleInstrumentCount) used[s.instrument] = true;
+                                }
                             }
                             int removed = 0;
                             for (int i = 0; i < kSampleInstrumentCount; ++i)

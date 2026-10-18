@@ -92,6 +92,41 @@ void dot(Gfx& g, int cx, int cy, float r, uint32_t c);
 
 // --- title bar (spec 20 §1.2) ------------------------------------------------
 enum class Transport : uint8_t { kStopped, kPlayingSong, kPlayingPattern };
+
+// 2.x CPU load cell [I] (docs/specs/2x-02 §2.2; stock has no CPU meter):
+// "CPU nn%" (P, the 1 s peak) or "CPU!" after an overrun, 60 x 24 px,
+// right-aligned at the play time's ink x - 4. The "CPU" label is drawn with
+// the title chrome (cached fragment), the value with the status group (<= 6
+// display-list words). While shown the title clip narrows to end 10 px before
+// the cell (217 px with font set 0). Font 4 like the status group; colours:
+// normal = theme dim text, warn = slot kYellow, alarm = slot kOrange,
+// critical = slot kSolidRect (red).
+enum class CpuLevel : uint8_t { kHidden, kNormal, kWarn, kAlarm, kCritical };
+struct CpuCell {
+    CpuLevel level = CpuLevel::kHidden;
+    uint8_t percent = 0;      // P rounded to whole percent, 0..99
+    bool overrun = false;     // "CPU!" (an overrun in the last 2 s)
+    int16_t right = 0;        // right edge x (cpuCellRight)
+    bool shown() const { return level != CpuLevel::kHidden; }
+    bool operator==(const CpuCell& o) const {
+        return level == o.level && percent == o.percent && overrun == o.overrun && right == o.right;
+    }
+    bool operator!=(const CpuCell& o) const { return !(*this == o); }
+};
+constexpr int kCpuCellW = 60;
+constexpr int kCpuCellH = 24;
+constexpr int kCpuCellGap = 4;      // cell right edge = time ink x - 4
+constexpr int kCpuTitleGap = 10;    // title clip ends this far before the cell
+// Display state from the meter (mode: Config "CPU meter" 0 Auto, 1 Always,
+// 2 Off). Auto: hidden below 60 % unless an overrun / governor cut in the
+// last 2 s; Off or no data: hidden. right is left 0 (the caller sets it).
+CpuCell cpuCell(uint8_t mode, bool hasData, uint32_t peakPermille, bool overrunRecent, bool cutRecent);
+uint32_t cpuCellColour(const Theme& th, CpuLevel level);
+// Right edge of the cell for the play time `seconds` (statusLayout(seconds).timeX - 4).
+int cpuCellRight(uint32_t seconds);
+// Title clip width with the cell shown (or kTitleClipW when cell is null / hidden).
+int titleClipWidth(const CpuCell* cell);
+
 struct TitleStatus {
     uint32_t seconds = 0;          // play time
     Transport transport = Transport::kStopped;
@@ -99,6 +134,7 @@ struct TitleStatus {
     int pattern = 1;               // "P%i.%03i" (hex: "P%02X.%02X")
     int step = 1;
     bool hex = false;
+    CpuCell cpu;                   // 2.x CPU cell (hidden by default)
 };
 // "%im:%02is" (the stock field is %3i, right-anchored at kStatusTimeEnd).
 void formatStatusTime(char* out, int cap, uint32_t seconds);
@@ -111,6 +147,15 @@ void formatStatusPosition(char* out, int cap, int pattern, int step, bool hex);
 // glyph pair and "P%i.%03i" laid out with the active font set's advances from
 // x 280: ink at 300 with set 0 and at 288 with set 1 ("New", C10).
 void titleBar(Gfx& g, const Theme& th, const char* title, const char* right, const TitleStatus* status);
+// titleBar() in two parts (2.x: the static part goes through a cached RAM_G
+// fragment, the status changes every step): band, title and right text laid
+// out for a status group present or not; then the status group. The status
+// and the right text never overlap, so the pixels match titleBar().
+// cpu: the 2.x CPU cell (null or hidden: stock chrome) -- narrows the title
+// clip and draws the cell's "CPU" label.
+void titleBarChrome(Gfx& g, const Theme& th, const char* title, const char* right, bool status,
+                    const CpuCell* cpu = nullptr);
+void titleBarStatus(Gfx& g, const Theme& th, const TitleStatus& status);
 // x of the status parts for the active font set (host tests): time string,
 // transport glyph pair (2 symbol cells), position string.
 struct StatusLayout { int timeX, iconX, symW, posX; };   // timeX: after the pad spaces

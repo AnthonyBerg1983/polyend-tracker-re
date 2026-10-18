@@ -7,6 +7,7 @@
 #include "app/midi_cc.h"
 #include "app/pattern_ops.h"
 #include "app/perf_presets.h"
+#include "model/synth_patch.h"
 #include "ui/ui.h"
 #include "ui/wave.h"
 
@@ -50,7 +51,9 @@ public:
     pops::FillParams fill[4];
     uint8_t colMask = 0;            // column-view mask (spec 06 §1.9)
     bool recArmPage = false;
-    bool armed[12] = {true, true, true, true, true, true, true, true, true, true, true, true};
+    // Live-REC arm per track (spec 06 §1.3; 2.x: 16 tracks, 2x-01 §2.4).
+    bool armed[kTrackCount] = {true, true, true, true, true, true, true, true,
+                               true, true, true, true, true, true, true, true};
 
     SelRect target() const;
     bool edit() const;
@@ -171,6 +174,10 @@ public:
     bool edit = false;
     int focus = 1;                 // 0 grid, 1 list, 2 tempo
     int selRow0 = 0, selRows = 1, selTrack0 = 0, selTracks = 1;
+    // 2.x (docs/M1_PLAN.md §4, spec gap 4): the grid shows 12 of the 16
+    // tracks; the first shown track is 0 or 4 and follows the grid cursor.
+    static constexpr int kGridCols = 12;
+    int firstTrack = 0;
     int tapCount = 0;
     uint32_t tapT0 = 0;
     bool tapShown = false;         // "TAP n/4" display flag SO+0x131 (spec 06 §2.4)
@@ -186,6 +193,7 @@ private:
     void deleteSlot();
     void copyJob(bool paste);
     void deleteJob();
+    void followGridCursor(int edge);   // window so that track `edge` is shown
     void applyLoopToggle();
     void reloadPlayingSlot();
     int savedFocus_ = 1;
@@ -317,6 +325,13 @@ public:
     int sub = 0;            // master sub-page: 0 main, 1 reverb, 2 delay, 3 limiter, 4 EQ
     int param = 0;          // selected parameter on the (sub-)page
     bool rename = false;
+    // 2.x Track Mixer bank (docs/specs/2x-01 §4): 0 = tracks 1-8, 1 = tracks
+    // 9-16; Left / Right switch it.
+    int bank = 0;
+    // Bank B note-activity dots (tracks 9-16 have no audio meter in M1):
+    // lit for kActivityMs after a step with a note starts on the track.
+    static constexpr uint32_t kActivityMs = 150;
+    bool activity[8] = {};
 
     // Track Mixer level meter law (spec 06 §4.4, 0x35454): mean of the last
     // 10 level readings / 0.71 -> dB; -3.6..+0.6 dB maps linearly onto 0..100
@@ -330,12 +345,20 @@ public:
     static constexpr float kGrRangeDb = 24.0f;
     static float reductionDb(float meanGain);
     float gainReduction = 0.0f;   // dB, >= 0
+    // 2.x Global Mixer 3/3 synth meters (manual p.220, "right is the
+    // actual"): mean of the last 10 slot-bus peaks (10 ms apart), -48..0 dBFS
+    // onto 0..100 [I] (the stock track law spans only -3.6..+0.6 dB).
+    static int synthMeterBar(float meanPeak);
+    int synthMeter[3] = {};
+    float synthHist_[3][10] = {};
 
 private:
     void refreshBar();
     void change(int d);
     void masterChange(int d);
     void mixerKey(int i, uint8_t state);
+    void updateActivity(uint32_t now);
+    void drawBankB(Gfx& g, uint32_t off);
     bool held_[8] = {};
     bool changed_[8] = {};
     // Master key (spec 06 §4.1): snapshot taken on press.
@@ -351,6 +374,9 @@ private:
     uint32_t lastGr_ = 0;
     float hist_[8][10] = {};
     int histPos_ = 0;
+    // Bank B activity (update()): last step seen and the dot's end time.
+    int16_t actStep_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    uint32_t actUntil_[8] = {};
 };
 
 // ---------------------------------------------------------------------------
@@ -437,7 +463,7 @@ public:
     struct OptionInfo {
         const char* name;
         uint8_t kind;       // 2 numeric, 3 enum, 5 text, 7 action (spec 06 §7.1)
-        uint8_t store;      // 0 global config, 1 project, 2 none
+        uint8_t store;      // 0 global config, 1 project, 2 none, 3 live USB storage state (2.x)
         int count;          // picker entries (numeric: max - min + 1)
         int min;            // numeric minimum (stored value of picker index 0)
         int displayOffset;  // numeric: shown value = stored + displayOffset
@@ -449,6 +475,9 @@ public:
     static bool optionInfo(int cat, int i, OptionInfo* out);
     int optionIndex(int cat, int i) const;   // current picker index of the value
     void optionText(int cat, int i, char* out, int cap) const;
+    // Select option i of category cat, pick `index` and Apply, like the keys
+    // do (tests/tools; also the way to reach a row under a full-screen page).
+    void applyOption(int cat, int i, int index);
 
 private:
     void refreshBar();
@@ -525,6 +554,8 @@ public:
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
     bool encoderFast() const override { return true; }
+    // 2.x: the Performance key toggles the track bank (docs/specs/2x-01 §5).
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::Performance; }
     void padLeds(uint8_t* levels) override;
     // MIDI CC 41-48 / 51-62 (spec 12 §B.2, §B.3); handled at the next update.
     void perfTrackPatternCc(uint8_t track, uint8_t value) override;
@@ -538,7 +569,10 @@ public:
 
     bool edit = false;
     int column = 0;
-    bool fxOn[8] = {true, true, true, true, true, true, true, true};
+    int bank = 0;                   // 2.x: F1..F8 = tracks 1-8 (0) or 9-16 (1)
+    // FX enabled per track (session state; every track on at screen start).
+    bool fxOn[kTrackCount] = {true, true, true, true, true, true, true, true,
+                              true, true, true, true, true, true, true, true};
     perf::Source src;               // active preset source (spec 12 §A.1)
     uint8_t sourceIndex = 0;        // 0 global (config), 1 per project
     int16_t cur[12] = {};           // current value per slot (what is applied)
@@ -559,10 +593,12 @@ private:
     bool anyTrackKey() const;
     void trackPatternNow(int t, int num);
     void trackPatternQueued(int t, int num);
+    uint8_t trackPatternOf(int t) const;
+    void storeTrackPattern(int t, uint8_t num);
     bool held_[12] = {};
-    bool keyHeld_[8] = {};
+    bool keyHeld_[8] = {};   // per F key
     bool keyUsed_[8] = {};
-    uint8_t pending_[8] = {};
+    uint8_t pending_[kTrackCount] = {};   // per track
     int copySrc_ = -1;
     bool ccPending_[12] = {};
     uint8_t ccVal_[12] = {};
@@ -685,6 +721,176 @@ private:
     bool configReturn_ = false;   // stock flag +0x71a (appendix C §2.9)
     int playPad_ = -1;            // pad holding the playback, -1 = b0 Preview, -2 = MIDI note
     uint8_t lastMidi_ = 48;       // last MIDI instrument used here (stock +0x709)
+};
+
+// ---------------------------------------------------------------------------
+// Synth slots (2.x WP-G; Tracker Mini manual p.147-153, docs/MINI_PLAN.md §3
+// UI). One screen with four views over slot `slot` (instruments 64..66):
+//   Synth Parameters 1/2: F1 Model, F2 Polyphony, F3 Gain, F4 Panning,
+//     F5 Reverb Send, F6 Delay Send, F7 Load Patch, F8 Edit Patch;
+//   Synth Macros 2/2: F1..F6 macro M1..M6 page values, legend below;
+//   Edit Patch: sections (pads / Left, Right), parameters (Up / Down),
+//     value (encoder); F1 Init, F2 Save, F3 Save As, F7 section, F8 Back;
+//   Load Patch: a popup list of Patches/<MODEL>/ at x 600..799 over the
+//     dimmed page 1/2 (Tracker+ 1.0, docs/SYNTH_UX_MINI_VS_OT.md row 24):
+//     F5-F6 Preview, F7 Cancel, F8 Confirm; Preview and the pads play the
+//     highlighted patch in the slot (App::previewSynthLibraryPatch), Cancel
+//     restores the slot's patch byte for byte.
+// The Instrument Params key toggles pages 1/2 (and leaves Edit / Load Patch).
+// A slot whose model has no engine in this build (WTFM, FAT in 2.0) shows
+// "Synth k (MODEL) not available" and is read-only except F1 Model.
+namespace synthui {
+// Value display / step kinds of one engine parameter.
+enum Fmt : uint8_t {
+    kFmtPct,      // v * 100 "%"
+    kFmtVal100,   // v * 100, no unit
+    kFmtSec,      // seconds
+    kFmtHz,       // log frequency (cutoff)
+    kFmtLfoHz,    // log frequency, two decimals
+    kFmtEnum,     // names[]
+    kFmtOnOff,
+    kFmtSemi,     // semitones
+    kFmtCents,
+    kFmtInt,      // plain integer (index without known labels)
+    kFmtMs,
+    kFmtDb,
+    kFmtNote,     // MIDI note name (PERC pitch)
+    kFmtPan,      // -1..1 -> L100..R100
+    kFmtPctMax,   // v / max(|min|, |max|) * 100 % (Resonance 0..1.5, Pitch LFO / Mod Amt bipolar)
+    kFmtMs10,     // stored 0..100 shown as 0..10 ms (PERC Body / Snap Attack)
+    kFmtPercNote, // PERC pitch 12..119 as C0..B8 (manual p.166)
+    kFmtBodyWave, // PERC Body Wave 0..175 = 16 waves x 0..100 % (manual p.166)
+};
+struct ParamUi {
+    const char* label;
+    uint8_t fmt;
+    const char* const* names;   // kFmtEnum
+    uint8_t nameCount;
+};
+// A section of the Edit Patch page: parameter indices in display order, or
+// macro m (0..6) when macro >= 0.
+struct Section {
+    const char* name;       // grid cell ("Osc")
+    const char* longName;   // F6 label ("Oscillator")
+    const uint8_t* params;
+    uint8_t count;
+    int8_t macro;
+};
+constexpr int kMaxSections = 16;              // 4 x 4 grid (pads 0-3, 12-15, 24-27, 36-39)
+// Macro targets shown (manual p.155: Parameter / Amount 1..5). A 6th target
+// that a patch stores stays in the patch, unshown.
+constexpr int kMacroShownTargets = 5;
+constexpr int kMacroRows = 2 + 2 * kMacroShownTargets;   // Name, Bipolar, Param/Amount x 5
+// Parameter descriptor (nullptr: unknown engine / index, or not shown).
+const ParamUi* paramUi(int32_t engine, int index);
+// Sections of an engine's Edit Patch page (macros M1..M7 last).
+int sections(int32_t engine, const Section** out);
+// "Osc Saw Mix" (section + label; macro target names).
+void paramFullName(int32_t engine, int index, char* out, int cap);
+void formatValue(int32_t engine, int index, float v, char* out, int cap);
+float valueFrac(int32_t engine, int index, float v);   // 0..1 (bar position)
+bool valueBipolar(int32_t engine, int index);
+// v moved by d detents (clamped to the range).
+float stepValue(int32_t engine, int index, float v, int d);
+// Macro target choice: -1 ("Unassigned") then every shown parameter in section order.
+int targetChoices(int32_t engine);
+int targetChoice(int32_t engine, int k);        // k-th choice -> param (-1 none)
+int targetChoiceIndex(int32_t engine, int param);
+// Slot record texts.
+void gainText(float db, char* out, int cap);    // "-9.00 dB", "-inf dB" at -96
+void sendText(float v, char* out, int cap);     // SEND law dB, "-inf dB" at 0
+// Pattern Instrument popup order (Tracker+ manual p.100 figure, docs/
+// SYNTH_UX_MINI_VS_OT.md row 1): Synth 1..3 first, then the sample
+// instruments 1..48 and MIDI 1..16 in the stock order. The stored numbers
+// stay 64..66 / 0..63; only the list position differs.
+inline int popupInstrument(int pos) {
+    return pos < kSynthSlotCount ? kFirstSynthInstrument + pos : pos - kSynthSlotCount;
+}
+// "Synth 1 (VAP)": a synth slot named as the Tracker+ popup and title bar
+// do (manual p.100 figure; docs/SYNTH_UX_MINI_VS_OT.md rows 1, 3).
+void slotLabel(const App& a, int slot, char* out, int cap);
+inline int popupPosition(int instrument) {
+    return isSynthInstrument(uint8_t(instrument)) ? instrument - kFirstSynthInstrument : instrument + kSynthSlotCount;
+}
+}  // namespace synthui
+
+class SynthScreen final : public Screen {
+public:
+    using Screen::Screen;
+    const char* name() const override { return "Synth"; }
+    void start(int opt) override;   // opt 1..3 = slot (0: keep)
+    void stop() override;
+    void draw(Gfx& g) override;
+    void onButton(uint8_t id, uint8_t state) override;
+    void onPad(uint8_t pad, uint8_t state) override;
+    void onEncoder(int d) override;
+    bool encoderFast() const override { return true; }
+    bool ownsModuleKey(uint8_t id) const override { return id == btn::InstrParams; }
+    void padLeds(uint8_t* levels) override;
+
+    // Slot the Instrument Params key opens from module `active` (the Pattern
+    // cursor step's synth instrument, else the current instrument), -1 = not
+    // a synth (the sample / MIDI Instrument screen opens).
+    static int entrySlot(App& a, Ui& ui, int active);
+
+    enum class View : uint8_t { Params, Macros, Edit, Browser };
+    View view = View::Params;
+    int slot = 0;           // 0..2
+    int param = 0;          // Params page: F1..F6 (0 model .. 5 delay send)
+    int macro = 0;          // Macros page: M1..M6
+    int section = 0;        // Edit: section index
+    int row = 0;            // Edit: row in the section
+    // Browser (Patches/<MODEL>/*.patch, sorted).
+    static constexpr int kBrowserMax = 128;
+    static constexpr int kBrowserNameMax = 32;
+    int browserCount = 0;
+    int browserSel = 0;
+    char browser[kBrowserMax][kBrowserNameMax + 1] = {};
+
+    int32_t engine() const;
+    bool available() const;   // the model has an engine in this build
+    int rows() const;         // rows of the current Edit section
+    void listBrowser();
+    void openBrowser();       // F7 Load Patch: the popup
+    void closeBrowser();      // Cancel: the slot's patch as before the popup
+    bool previewHighlighted();   // the highlighted patch into the slot (Preview / pads)
+    int previewSel() const { return previewSel_; }
+    bool loadSelected();      // Confirm
+    void initPatch();         // with the confirmation popup
+    void savePatch();         // to the record's name (Save As when "Init" / empty)
+    void savePatchAs();       // keyboard
+
+private:
+    void refreshBar();
+    void paramsChange(int d, bool wrap = false);
+    void macroChange(int d);
+    void editChange(int d);
+    void macroRowChange(int m, int r, int d);
+    void macroRowText(int m, int r, char* label, int lcap, char* value, int vcap) const;
+    void macroNameKeyboard();
+    bool nameRow() const;     // Edit Patch on a macro's Name row (F8 = Edit)
+    void resetSelected();     // Delete on Params / Macros / Edit Patch
+    void resetEditRow();      // Delete in Edit Patch: the Init patch's value
+    void applyModel();        // pendingModel_ -> the slot (after "Discard edits?")
+    bool loadSelectedNow();
+    void saveAsNow();         // pendingName_ (after "Overwrite?")
+    // Patch edits since the last load / init / save / model change, per slot
+    // ("Discard edits?" before Load or a model change).
+    bool edited_[kSynthSlotCount] = {};
+    int pendingModel_ = -1;
+    char pendingName_[kBrowserNameMax + 1] = {};
+    void edited();
+    void drawParams(Gfx& g);
+    void drawMacros(Gfx& g);
+    void drawEdit(Gfx& g);
+    void drawBrowser(Gfx& g);
+    void title(Gfx& g, const char* text);
+    void audition(bool on, uint8_t note);
+    int padNote_ = -1;      // pad holding the audition, -1 none
+    int previewSel_ = -1;   // Load Patch: browser entry playing in the slot, -1 none
+    int previewKey_ = -1;   // Load Patch: F5 / F6 holding the Preview note
+    int browserTop_ = 0;
+    int listTop_ = 0;
 };
 
 }  // namespace ot

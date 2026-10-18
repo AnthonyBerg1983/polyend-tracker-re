@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "fmath.h"
 #include "ui/screens.h"
 
 namespace ot {
@@ -457,7 +458,7 @@ void RecorderScreen::play(int note) {
         // the recording plays at its own pitch.
         int16_t* dst = a.capture.buffer() + a.capture.length();
         const uint32_t avail = a.capture.capacity() - a.capture.length();
-        const double ratio = std::pow(2.0, double(note - 60) / 12.0);
+        const double ratio = fm::kNoteRatio[clampi(note, 0, 127)];
         const uint64_t step = uint64_t(ratio * 4294967296.0);
         uint64_t m = (uint64_t(n - 1) << 32) / step + 1;
         if (m > avail) m = avail;

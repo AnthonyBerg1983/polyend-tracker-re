@@ -3,8 +3,10 @@
 #include <cmath>
 #include <cstdio>
 
+#include "app/app.h"
 #include "app/config.h"
 #include "app/project_fields.h"
+#include "fmath.h"
 #include "model/project.h"
 #include "sequencer/seq_playmodes.h"
 
@@ -76,7 +78,7 @@ int32_t startOffset(int v) {
 int32_t endOffset(int v) {
     if (v < -100) v = -100;
     if (v > 100) v = 100;
-    return int32_t(std::lround(double(v + 100) * 131070.0 / 200.0 - 65535.0));
+    return int32_t(fm::lroundD(double(v + 100) * 131070.0 / 200.0 - 65535.0));
 }
 
 int lengthOverride(int v) { return v >= 1 && v <= 8 ? (1 << (v - 1)) - 1 : -1; }
@@ -120,4 +122,40 @@ uint8_t trackPattern(const Project& p, int t) {
 void setTrackPattern(Project& p, int t, uint8_t num) { p.setU16(pf::kPerfPatterns + 2u * uint32_t(t), num); }
 
 }  // namespace perf
+
+namespace trk {
+
+bool muted(App& a, int t) { return a.trackMuted(t); }
+
+void setMuted(App& a, int t, bool m) {
+    if (t < 0 || t >= kTrackCount || a.trackMuted(t) == m) return;
+    a.setTrackMute(t, m);
+}
+
+uint8_t level(App& a, int t) {
+    if (t < 0 || t >= kMidiTrackStart) return 0;
+    return a.project.u8(pf::kTrackVolume + uint32_t(t));
+}
+
+void setLevel(App& a, int t, uint8_t v) {
+    if (t < 0 || t >= kMidiTrackStart) return;
+    if (v > 100) v = 100;
+    a.project.setU8(pf::kTrackVolume + uint32_t(t), v);
+    a.markProjectDirty();
+}
+
+void name(App& a, int t, char* out, int cap) {
+    if (cap <= 0) return;
+    out[0] = 0;
+    if (t < 0 || t >= kTrackCount) return;
+    a.project.trackName(t, out, uint32_t(cap));
+}
+
+void setName(App& a, int t, const char* s) {
+    if (t < 0 || t >= kTrackCount || !s) return;
+    a.project.setTrackName(t, s);   // "" clears the name (VERIFY_M1 R5)
+    a.markProjectDirty();
+}
+
+}  // namespace trk
 }  // namespace ot

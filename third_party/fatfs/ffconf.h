@@ -34,8 +34,14 @@
 /* This option switches f_mkfs(). (0:Disable or 1:Enable) */
 
 
-#define FF_USE_FASTSEEK	0
+#define FF_USE_FASTSEEK	1
 /* This option switches fast seek feature. (0:Disable or 1:Enable) */
+/* OpenTracker 2.x (docs/PLAN_2X.md "SD and loading"): enabled so the storage
+/  glue can give read-only sample files a cluster link map table (FIL.cltbl +
+/  f_lseek(fp, CREATE_LINKMAP)): f_read/f_lseek then follow the chain without
+/  FAT sector reads. A file without a table (cltbl == 0, the default after
+/  f_open) behaves exactly as before; a file with one cannot grow, so tables
+/  are for files opened read-only. */
 
 
 #define FF_USE_EXPAND	0

@@ -284,12 +284,12 @@ TEST(playmode_fwd_back_rnd) {
     r.seq.setPerformanceMode(true);
     r.seq.setPerfPlayMode(1, seq::kPlayBack);
     r.seq.setPerfPlayMode(2, seq::kPlayRnd);
-    r.seq.setPerfPlayMode(9, seq::kPlayBack);  // tracks 8..11 ignore play modes (spec 12 §D)
+    r.seq.setPerfPlayMode(9, seq::kPlayBack);  // 2.x: tracks 8..15 take play modes too (M1-WP4)
     r.seq.play(0);
     r.steps(0, 14);
     CHECK(eq(r.sink.notes[0], {0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1}));
     CHECK(eq(r.sink.notes[1], {5, 4, 3, 2, 1, 0, 5, 4, 3, 2, 1, 0, 5, 4}));
-    CHECK_EQ(r.seq.step(9), r.seq.step(0));     // forward, like track 0
+    CHECK_EQ(r.seq.step(9), r.seq.step(1));     // backward, like track 1 (stock: forward)
     bool varied = false;
     for (int v : r.sink.notes[2]) {
         CHECK(v >= 0 && v <= 5);
@@ -390,7 +390,7 @@ TEST(track_pattern_needs_memory) {
     r.seq.setPerfPatternMemory(nullptr);
     CHECK(!r.seq.setTrackPattern(0, 2, true));
     r.seq.setPerfPatternMemory(r.mem.get());
-    CHECK(!r.seq.setTrackPattern(8, 2, true));   // voice tracks only
+    CHECK(!r.seq.setTrackPattern(16, 2, true));  // tracks 0..15 (2.x: 8..15 too, M1-WP4)
     CHECK(!r.seq.setTrackPattern(0, 0, true));
     CHECK(r.seq.setTrackPattern(0, 2, true));
     CHECK(r.seq.performanceMode());              // entering sets perf mode

@@ -6,6 +6,7 @@
 
 #include "formats/bytes.h"
 #include "formats/patterns_metadata.h"
+#include "sdram_bss.h"
 
 namespace ot {
 
@@ -13,12 +14,19 @@ namespace {
 // Shared staging buffer sized for the largest fixed-size file
 // (patternsMetadata, 0x3210). Not re-entrant: storage calls run on the main
 // loop only.
-uint8_t g_io[pamd::kFileSize];
+// SDRAM on the device (OP-5; SD transfers go direct or bounce, sdhc.cpp).
+OT_SDRAM_BSS uint8_t g_io[pamd::kFileSize];
 static_assert(sizeof(g_io) >= mtp::kFileSize && sizeof(g_io) >= mt::kFileSize &&
                   sizeof(g_io) >= recents::kFileSize,
               "staging buffer too small");
 
 bool fmt(char*, size_t cap, int n) { return n >= 0 && size_t(n) < cap; }
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+constexpr bool kLittleEndian = true;
+#else
+constexpr bool kLittleEndian = false;
+#endif
 }  // namespace
 
 FmtStatus readWholeFile(IStorage& fs, const char* path, uint8_t* buf, uint32_t requested, uint32_t* bytesRead) {
@@ -92,18 +100,33 @@ FmtStatus saveProjectFile(IStorage& fs, const char* path, const Project& p) {
     return writeWholeFile(fs, path, g_io, mt::kFileSize);
 }
 
+// 2.x: pattern files are the Tracker Mini 16-track layout (spec 21 §4):
+// any stock / legacy size loads (upgraded per §4.2) and saves as 0x3030.
+static_assert(sizeof(g_io) >= mtp::kMiniFileSize, "g_io holds a 16-track pattern");
+FmtStatus loadPatternFile(IStorage& fs, const char* path, PatternStock& p, const PatternUpgradeContext* ctx,
+                          PatternLoadInfo* info) {
+    uint32_t got = 0;
+    FmtStatus st = readWholeFile(fs, path, g_io, mtp::kMiniFileSize, &got);
+    if (st != FmtStatus::Ok) return st;
+    static Track ext[kExtTrackCount];   // tracks 12..15 dropped (stock store)
+    decodePattern16(g_io, got, p, ext, ctx, info);
+    return FmtStatus::Ok;
+}
 FmtStatus loadPatternFile(IStorage& fs, const char* path, Pattern& p, const PatternUpgradeContext* ctx,
                           PatternLoadInfo* info) {
     uint32_t got = 0;
-    FmtStatus st = readWholeFile(fs, path, g_io, mtp::kFileSize, &got);
+    FmtStatus st = readWholeFile(fs, path, g_io, mtp::kMiniFileSize, &got);
     if (st != FmtStatus::Ok) return st;
-    decodePattern(g_io, got, p, ctx, info);
+    decodePattern16(g_io, got, p, ctx, info);
     return FmtStatus::Ok;
 }
-
+FmtStatus savePatternFile(IStorage& fs, const char* path, const PatternStock& p) {
+    const size_t n = encodePattern16(p, nullptr, g_io);
+    return writeWholeFile(fs, path, g_io, uint32_t(n));
+}
 FmtStatus savePatternFile(IStorage& fs, const char* path, const Pattern& p) {
-    encodePattern(p, g_io);
-    return writeWholeFile(fs, path, g_io, mtp::kFileSize);
+    const size_t n = encodePattern16(p, g_io);
+    return writeWholeFile(fs, path, g_io, uint32_t(n));
 }
 
 FmtStatus loadPatternNamesFile(IStorage& fs, const char* path, PatternNames& n) {
@@ -175,8 +198,10 @@ FmtStatus loadInstrumentFile(IStorage& fs, const char* path, Instrument& ins, in
             done += size_t(r);
         }
         if (done < want) std::memset(raw + done, 0, want - done);
-        // Convert LE bytes to native int16 in place.
-        for (size_t i = 0; i < count; ++i) samples[i] = rdI16(raw + 2 * i);
+        // Convert LE bytes to native int16 in place (nothing to do on a
+        // little-endian CPU: the bytes are the samples).
+        if (!kLittleEndian)
+            for (size_t i = 0; i < count; ++i) samples[i] = rdI16(raw + 2 * i);
     }
     fs.close(h);
     ins.lengthFrames = lay.frames;
@@ -193,12 +218,23 @@ FmtStatus saveInstrumentFile(IStorage& fs, const char* path, const Instrument& i
     encodePtiHeader(ins, hdr);
     bool ok = fs.write(h, hdr, sizeof(hdr)) == int32_t(sizeof(hdr));
     const size_t count = size_t(ins.lengthFrames) * (ins.stereo ? 2 : 1);
-    // Sample data in 0x800-byte chunks (spec 02 §1.1).
-    uint8_t buf[0x800];
-    for (size_t i = 0; ok && samples && i < count;) {
-        size_t n = 0;
-        for (; n < sizeof(buf) / 2 && i < count; ++n, ++i) wrU16(buf + 2 * n, uint16_t(samples[i]));
-        ok = fs.write(h, buf, uint32_t(2 * n)) == int32_t(2 * n);
+    if (kLittleEndian) {
+        // The int16 samples are the little-endian file bytes: write them
+        // straight from memory (stock: 0x800-byte chunks, spec 02 §1.1; the
+        // chunking is not visible in the file).
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(samples);
+        for (size_t done = 0, want = count * 2; ok && samples && done < want;) {
+            const uint32_t c = want - done < kIoChunk ? uint32_t(want - done) : kIoChunk;
+            ok = fs.write(h, b + done, c) == int32_t(c);
+            done += c;
+        }
+    } else {
+        uint8_t buf[0x800];
+        for (size_t i = 0; ok && samples && i < count;) {
+            size_t n = 0;
+            for (; n < sizeof(buf) / 2 && i < count; ++n, ++i) wrU16(buf + 2 * n, uint16_t(samples[i]));
+            ok = fs.write(h, buf, uint32_t(2 * n)) == int32_t(2 * n);
+        }
     }
     fs.close(h);
     return ok ? FmtStatus::Ok : FmtStatus::IoError;

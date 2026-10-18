@@ -75,7 +75,10 @@ public:
     virtual void text(int16_t x, int16_t y, uint8_t font, uint16_t options, const char* s) = 0;
     virtual void number(int16_t x, int16_t y, uint8_t font, uint16_t options, int32_t n) = 0;
 
-    // Finish the list (DISPLAY) and swap it in (CMD_SWAP).
+    // Finish the list (DISPLAY) and swap it in (CMD_SWAP). On return the
+    // whole frame is submitted: it reaches the screen at the next vsync
+    // without any further IDisplay call (the UI may not draw again for
+    // seconds; tests/display_busy_test.cpp checks this contract).
     virtual void swap() = 0;
 
     // Read back a rectangle of the frame currently shown, as 0x00RRGGBB
@@ -167,12 +170,32 @@ public:
         (void)x; (void)y; (void)ramgAddr; (void)w; (void)h; (void)scale;
     }
 
-    // --- frame pacing (non-blocking swap) ----------------------------------
+    // --- frame pacing (2.x non-blocking swap) ------------------------------
     // True when a new frame can start without waiting: the coprocessor has
     // consumed the command FIFO and the previous CMD_SWAP has taken effect
     // (REG_DLSWAP == 0 on the FT81x). The UI skips a frame instead of
     // spinning when this is false. Default: always ready.
     virtual bool frameReady() { return true; }
+
+    // --- cached display-list fragments (spec 05 §3.3 stock scheme) --------
+    // The stock firmware keeps each control's display list in RAM_G and
+    // composes frames with CMD_APPEND. Here the UI (Gfx::cached) captures a
+    // run of commands that it draws inline anyway: fragmentBegin(slot) ...
+    // fragmentEnd(slot) stores the display-list words those commands produce
+    // in the slot (FT81x: REG_CMD_DL before/after, then CMD_MEMCPY from RAM_DL
+    // into RAM_G); fragmentAppend(slot) later re-emits them (CMD_APPEND). Only
+    // between dlStart() and swap(); a fragment inherits the graphics state at
+    // the append point like CMD_APPEND does. Default: unsupported.
+    // 16 slots: the FT81x keeps them in RAM_G after the 1.9.5 font image.
+    static constexpr uint8_t kFragmentSlots = 16;
+    virtual bool fragmentsSupported() const { return false; }
+    virtual void fragmentBegin(uint8_t slot) { (void)slot; }
+    // False when the fragment could not be stored (too large, fault); the
+    // slot is then empty and must not be appended.
+    virtual bool fragmentEnd(uint8_t slot) { (void)slot; return false; }
+    virtual void fragmentAppend(uint8_t slot) { (void)slot; }
+    // Display-list words held by a stored fragment (0 = empty slot).
+    virtual uint32_t fragmentWords(uint8_t slot) const { (void)slot; return 0; }
 
     // --- visual-parity primitives (spec 20 §1.5, §2.1) ---------------------
     // Bitmap handles the custom UI fonts are bound to by bindFontSet(): the
@@ -482,6 +505,34 @@ public:
     virtual uint32_t size() const = 0;
     virtual bool read(uint32_t offset, void* dst, uint32_t len) = 0;
     virtual bool write(uint32_t offset, const void* src, uint32_t len) = 0;
+};
+
+// ---------------------------------------------------------------------------
+// IUsbStorage -- 2.x USB Storage mode (Tracker Mini manual §13.10): the SD
+// card is handed to a computer as a USB drive. Device: src/hal/usb_storage.*
+// (USB mass storage, Bulk-Only Transport); outside the mode the drive reports
+// "medium not present". The app calls begin() only after it stopped playback
+// and recording and wrote everything to the card; between begin() and end()
+// the app must not touch IStorage (the implementation refuses it anyway).
+// ---------------------------------------------------------------------------
+class IUsbStorage {
+public:
+    enum class Host : uint8_t {
+        kNoUsb = 0,   // no computer (cable unplugged, host asleep)
+        kWaiting,     // connected; the computer has not used the drive yet
+        kInUse,       // the computer read the drive (it is mounted there)
+        kEjected,     // the computer ejected the drive: safe to exit
+    };
+    virtual ~IUsbStorage() = default;
+    // Unmount the card from the app and present it to the computer (UNIT
+    // ATTENTION "medium changed"). False: no usable card; the app keeps it.
+    virtual bool begin() = 0;
+    // Report the medium removed, let a command in flight finish, take the
+    // card back and remount it. False: the card could not be mounted again.
+    virtual bool end() = 0;
+    virtual Host host() const = 0;
+    // Main loop, every pass: the card reads / writes the computer asked for.
+    virtual void service() = 0;
 };
 
 }  // namespace ot

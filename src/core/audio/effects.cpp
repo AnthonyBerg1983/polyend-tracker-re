@@ -4,6 +4,7 @@
 // reverb (stmlib FxEngine, MIT licence, (c) Emilie Gillet) as adapted in
 // spec 04 §5.2; the code here is written from the spec, not copied.
 #include "audio/effects.h"
+#include "fastrun.h"
 
 #include <cmath>
 #include <cstring>
@@ -47,7 +48,7 @@ void Delay::clear() {
     bypass_ = false;
 }
 
-bool Delay::process(const float* in, float* outL, float* outR) {
+OT_FASTRUN_FN bool Delay::process(const float* in, float* outL, float* outR) {
     if (disabled_ || !a_) {
         {
             zeroFloats(outL, kBlock);
@@ -200,14 +201,27 @@ void Reverb::clear() {
 namespace {
 // Reverb block buffers (SRAM). Taps are read as 128-sample spans at fixed
 // offsets from the block's start pointer P: sample i (pointer P - i) uses
-// index 127 - i of a span read from P + offset - 127. Allpass spans are
-// updated in place (the read of index k precedes its write).
+// index 127 - i of a span read from P + offset - 127; all-pass results go
+// to separate write spans. Every span starts at an odd or even int16 to
+// match the parity of its ring position, so ringIn / ringOut always take
+// their 32-bit word path.
 constexpr uint32_t kModSpan = kBlock + 210;   // modulated del2 read (+-100 + 1)
-int16_t gTap[5][kBlock];      // dap1a, dap1b, del1 tap, dap2a, dap2b
-int16_t gDel1[kBlock], gDel2[kBlock], gPre[kBlock], gPd[kBlock];
-int16_t gMod[kModSpan];
-int32_t gModIdx[kBlock];
-float gModFrac[kBlock];
+constexpr uint32_t kSpanStore = kBlock + 2;
+alignas(4) int16_t gTapIn[5][kSpanStore];   // dap1a, dap1b, del1 tap, dap2a, dap2b
+alignas(4) int16_t gTapOut[6][kSpanStore];  // dap1a, dap1b, del1, dap2a, dap2b, del2
+alignas(4) int16_t gPre[kSpanStore], gPd[kSpanStore];
+alignas(4) int16_t gMod[kModSpan + 2];
+float gAcc[kBlock], gWetL[kBlock];   // pass results
+// The span buffer for ring position pos: the same int16 parity as ring + pos.
+inline int16_t* spanFor(int16_t* store, const int16_t* ring, uint32_t pos) {
+    return store + ((reinterpret_cast<uintptr_t>(ring + (pos & kRMask)) >> 1) & 1u);
+}
+// Modulated del2 read: LFO segments (the offset only changes every 32 samples).
+struct ModSeg {
+    uint32_t i0, n;
+    int32_t oi;
+    float of;
+};
 }  // namespace
 
 void Reverb::stepLfo(uint32_t p) {
@@ -218,7 +232,7 @@ void Reverb::stepLfo(uint32_t p) {
     }
 }
 
-bool Reverb::process(const float* in, float* outL, float* outR) {
+OT_FASTRUN_FN bool Reverb::process(const float* in, float* outL, float* outR) {
     if (!a_) {
         {
             zeroFloats(outL, kBlock);
@@ -232,14 +246,35 @@ bool Reverb::process(const float* in, float* outL, float* outR) {
     const float kap = kap_, klp = klp_, krt = krt_, amount = amount_, gain = gain_;
     const int32_t pre = predelay_ < 0 ? 4999 : predelay_;
     // Pre-delay input (written before its read, spec order) and silence check.
-    bool anyIn = false;
+    const uint32_t prePos = P + 10590u - (kBlock - 1);
+    int16_t* const preBuf = spanFor(gPre, A, prePos);
+    // (q tracks the ring writes for a silent input only, and a silent
+    // input writes zeros here, so this loop does not feed q.)
+    // anyIn = some input sample != 0.0f: its bits without the sign are not
+    // all zero (NaN counts as non-zero, as with != 0.0f).
+    // With no pre-delay the pre-delay output is computed from `in` in the
+    // all-pass loop (kDirect below) and only the silence check runs here.
     uint32_t q = 0;
-    for (uint32_t i = 0; i < kBlock; ++i) {
-        const float L = in[i], R = in[i];
-        anyIn |= L != 0.0f;
-        const int16_t v = toS16((L + R) * gain);
-        gPre[kBlock - 1 - i] = v;
-        q |= mag(v);
+    bool anyIn = false;
+    if (pre != 0) {
+        uint32_t inBits = 0;
+        for (uint32_t i = 0; i < kBlock; ++i) {
+            const float L = in[i], R = in[i];
+            uint32_t b;
+            std::memcpy(&b, &in[i], sizeof(b));
+            inBits |= b << 1;
+            preBuf[kBlock - 1 - i] = toS16((L + R) * gain);
+        }
+        anyIn = inBits != 0;
+    } else {
+        for (uint32_t i = 0; i < kBlock; ++i) {
+            uint32_t b;
+            std::memcpy(&b, &in[i], sizeof(b));
+            if (b << 1) {
+                anyIn = true;
+                break;
+            }
+        }
     }
     constexpr float kQuietF = float(kQuiet) / 32768.0f;
     auto small = [&](float v) { return v <= kQuietF && v >= -kQuietF; };
@@ -262,48 +297,63 @@ bool Reverb::process(const float* in, float* outL, float* outR) {
         return false;
     }
     bypass_ = false;
-    // LFO and the modulated del2 read positions (relative to P).
-    // (The LFO steps every 32 samples, so the offset is piecewise constant.)
+    // LFO and the modulated del2 read positions (relative to P), per
+    // segment: the LFO steps when (pointer & 31) == 0, so the offset is
+    // constant from one such sample to the next.
+    ModSeg seg[kBlock / 32 + 1];
+    uint32_t nSeg = 0;
     int32_t lo = 0x7FFFFFFF, hi = -0x7FFFFFFF;
     {
-        int32_t oi = 0;
-        float of = 0.0f;
         uint32_t p = P;
-        for (uint32_t i = 0; i < kBlock; ++i) {
-            if (i == 0 || (p & 31u) == 0) {
-                if (i > 0) lo = oi - int32_t(i - 1) < lo ? oi - int32_t(i - 1) : lo;   // segment end
-                stepLfo(p);
-                const float off = 4724.0f + 6211.0f + 100.0f * (lfoS_ + 0.5f);
-                const uint32_t u = uint32_t(off);
-                oi = int32_t(u);
-                of = off - float(u);
-                hi = oi - int32_t(i) > hi ? oi - int32_t(i) : hi;                     // segment start
-            }
-            gModIdx[i] = oi - int32_t(i);
-            gModFrac[i] = of;
-            p = (p - 1u) & kRMask;
+        for (uint32_t i = 0; i < kBlock;) {
+            stepLfo(p);
+            const float off = 4724.0f + 6211.0f + 100.0f * (lfoS_ + 0.5f);
+            const uint32_t u = uint32_t(off);
+            uint32_t n = (p & 31u) ? (p & 31u) : 32u;
+            if (n > kBlock - i) n = kBlock - i;
+            ModSeg& s = seg[nSeg++];
+            s.i0 = i;
+            s.n = n;
+            s.oi = int32_t(u);
+            s.of = off - float(u);
+            const int32_t first = s.oi - int32_t(i), last = s.oi - int32_t(i + n - 1);
+            hi = first > hi ? first : hi;
+            lo = last < lo ? last : lo;
+            i += n;
+            p = (p - n) & kRMask;
         }
-        lo = oi - int32_t(kBlock - 1) < lo ? oi - int32_t(kBlock - 1) : lo;
         p_ = p;
     }
     uint32_t modN = uint32_t(hi - lo + 2);
     if (modN > kModSpan) modN = kModSpan;   // cannot happen (|lfo| <= 1)
     // Reads (all before the block's writes: every other tap pair is >= 128
     // samples apart or reads the older value).
-    auto tapIn = [&](const int16_t* ring, uint32_t off, int16_t* buf) {
-        ringIn(ring, kRMask, P + off - (kBlock - 1), buf, kBlock);
+    auto tapIn = [&](const int16_t* ring, uint32_t off, int16_t* store) {
+        const uint32_t pos = P + off - (kBlock - 1);
+        int16_t* buf = spanFor(store, ring, pos);
+        ringIn(ring, kRMask, pos, buf, kBlock);
+        return buf;
     };
-    tapIn(A, 3395, gTap[0]);
-    tapIn(A, 6086, gTap[1]);
-    tapIn(A, 10588, gTap[2]);
-    tapIn(B, 2524, gTap[3]);
-    tapIn(B, 4722, gTap[4]);
-    ringIn(B, kRMask, P + uint32_t(lo), gMod, modN);
+    const int16_t* const r0 = tapIn(A, 3395, gTapIn[0]);
+    const int16_t* const r1 = tapIn(A, 6086, gTapIn[1]);
+    const int16_t* const r2 = tapIn(A, 10588, gTapIn[2]);
+    const int16_t* const r3 = tapIn(B, 2524, gTapIn[3]);
+    const int16_t* const r4 = tapIn(B, 4722, gTapIn[4]);
+    int16_t* const mod = spanFor(gMod, B, P + uint32_t(lo));
+    ringIn(B, kRMask, P + uint32_t(lo), mod, modN);
+    // Write spans (filled by the passes, written to the rings at the end).
+    auto tapPos = [&](uint32_t off) { return P + off - (kBlock - 1); };
+    int16_t* const w0 = spanFor(gTapOut[0], A, tapPos(1214));
+    int16_t* const w1 = spanFor(gTapOut[1], A, tapPos(3397));
+    int16_t* const wd1 = spanFor(gTapOut[2], A, tapPos(6088));
+    int16_t* const w3 = spanFor(gTapOut[3], B, tapPos(0));
+    int16_t* const w4 = spanFor(gTapOut[4], B, tapPos(2526));
+    int16_t* const wd2 = spanFor(gTapOut[5], B, tapPos(4724));
     // Pre-delay: write the block, then read it back pre samples later. The
     // pre-delay region (offsets >= 10590) is read by nothing else and is
     // rewritten by ap1 before the pointer comes round, so with no pre-delay
     // the read returns exactly the block just written: skip both accesses.
-    const int16_t* pd = gPre;
+    const int16_t* pd = preBuf;
     if (pre != 0 && prevPre_ == 0) {
         // Pre-delay switched on: the region was not kept up to date; it
         // starts silent (the first pre samples read zeros).
@@ -311,109 +361,205 @@ bool Reverb::process(const float* in, float* outL, float* outR) {
     }
     prevPre_ = pre;
     if (pre != 0) {
-        ringOut(A, kRMask, P + 10590u - (kBlock - 1), gPre, kBlock);
-        tapIn(A, 10590u + uint32_t(pre), gPd);
-        pd = gPd;
+        ringOut(A, kRMask, prePos, preBuf, kBlock);
+        pd = tapIn(A, 10590u + uint32_t(pre), gPd);
     }
 
     float lp1 = lp1_, lp2 = lp2_, lp3 = lp3_;
     float sumAbs = 0.0f;
+    // Block passes (OpenTracker CPU optimisation, same arithmetic per sample
+    // as the per-sample spec order). Every delay inside the block is longer
+    // than the block (all-passes >= 149, tank lines >= 2181 samples) and the
+    // only recursions are the three one-pole filters, so the chain splits
+    // into passes over the whole block: input filter + four all-passes ->
+    // gAcc, left tank -> gWetL, right tank + output mix.
+    // Each stage still rounds to int16 exactly where the spec writes the
+    // rings, and every read still sees the value the per-sample order would
+    // (a stage reads its own ring 149+ samples back; where an all-pass reads
+    // a cell the next all-pass overwrites two samples later, the read is in
+    // an earlier pass).
     // Quietness is tracked only for a silent input (otherwise quiet_ resets).
     auto run = [&](auto trackTag) {
-    constexpr bool kTrack = decltype(trackTag)::value;
-    for (uint32_t i = 0; i < kBlock; ++i) {
-        const uint32_t k = kBlock - 1 - i;
-        const float L = in[i], R = in[i];
-        lp1 += klp * (s16ToF(pd[k]) - lp1);
-        float acc = lp1;
-        // Four diffusing all-passes.
-        // Four diffusing all-passes (SRAM ring ap_, per sample as in spec order).
-        const uint32_t pi = P - i;
-        static constexpr uint16_t kApBase[4] = {0, 151, 366, 686};
-        static constexpr uint16_t kApTail[4] = {149, 364, 684, 1212};
-#pragma GCC unroll 4
-        for (int a = 0; a < 4; ++a) {
-            const float t = s16ToF(ap_[(pi + kApTail[a]) & (kApLen - 1)]);
-            acc += kap * t;
-            const int16_t v = toS16(acc);
-            ap_[(pi + kApBase[a]) & (kApLen - 1)] = v;
-            if (kTrack) q |= mag(v);
-            acc = t - kap * acc;
-        }
-        const float apout = acc;
-        // Left tank: modulated read of del2 (ring B).
+        constexpr bool kTrack = decltype(trackTag)::value;
+        float* __restrict acc = gAcc;
+        uint32_t qa = 0;
+        // Input one-pole (pre-delay output) and the four diffusing
+        // all-passes (SRAM ring ap_) in one loop over linear chunks: the
+        // ring indices decrease with i, a chunk ends before any of them wraps.
+        // kDirect (no pre-delay): the pre-delay output is the int16-rounded
+        // input of the same sample, rounded in registers.
+        auto ap = [&](auto directTag) {
+            constexpr bool kDirect = decltype(directTag)::value;
+            static constexpr uint16_t kApBase[4] = {0, 151, 366, 686};
+            static constexpr uint16_t kApTail[4] = {149, 364, 684, 1212};
+            constexpr uint32_t kM = kApLen - 1;
+            uint32_t i = 0;
+            while (i < kBlock) {
+                const uint32_t pi = P - i;
+                uint32_t n = kBlock - i;
+                for (int a = 0; a < 4; ++a) {
+                    const uint32_t r = ((pi + kApTail[a]) & kM) + 1u, w = ((pi + kApBase[a]) & kM) + 1u;
+                    n = r < n ? r : n;
+                    n = w < n ? w : n;
+                }
+                const int16_t* __restrict x = pd + (kBlock - 1 - i);
+                const float* __restrict xf = in + i;
+                const int16_t* t0 = ap_ + ((pi + kApTail[0]) & kM);
+                const int16_t* t1 = ap_ + ((pi + kApTail[1]) & kM);
+                const int16_t* t2 = ap_ + ((pi + kApTail[2]) & kM);
+                const int16_t* t3 = ap_ + ((pi + kApTail[3]) & kM);
+                int16_t* b0 = ap_ + ((pi + kApBase[0]) & kM);
+                int16_t* b1 = ap_ + ((pi + kApBase[1]) & kM);
+                int16_t* b2 = ap_ + ((pi + kApBase[2]) & kM);
+                int16_t* b3 = ap_ + ((pi + kApBase[3]) & kM);
+                float* __restrict o = acc + i;
+                for (uint32_t j = 0; j < n; ++j) {
+                    float pdv;
+                    if (kDirect) {
+                        const float L = xf[j], R = xf[j];
+                        pdv = s16Round((L + R) * gain);
+                    } else {
+                        pdv = s16ToF(*x--);
+                    }
+                    lp1 += klp * (pdv - lp1);
+                    float s = lp1;
+                    float t;
+                    int16_t v;
+                    t = s16ToF(*t0--);
+                    s += kap * t;
+                    v = toS16(s);
+                    *b0-- = v;
+                    if (kTrack) qa |= mag(v);
+                    s = t - kap * s;
+                    t = s16ToF(*t1--);
+                    s += kap * t;
+                    v = toS16(s);
+                    *b1-- = v;
+                    if (kTrack) qa |= mag(v);
+                    s = t - kap * s;
+                    t = s16ToF(*t2--);
+                    s += kap * t;
+                    v = toS16(s);
+                    *b2-- = v;
+                    if (kTrack) qa |= mag(v);
+                    s = t - kap * s;
+                    t = s16ToF(*t3--);
+                    s += kap * t;
+                    v = toS16(s);
+                    *b3-- = v;
+                    if (kTrack) qa |= mag(v);
+                    o[j] = t - kap * s;
+                }
+                i += n;
+            }
+        };
+        if (pre == 0) ap(std::true_type{});
+        else ap(std::false_type{});
+        // Left tank: modulated read of del2 (ring B), lp2, dap1a, dap1b, del1.
         {
-            const int32_t m = gModIdx[i] - lo;
-            const float a0 = s16ToF(gMod[m]), a1 = s16ToF(gMod[m + 1]);
-            acc = apout + krt * (a0 + (a1 - a0) * gModFrac[i]);
+            float* __restrict wet = gWetL;
+            const int16_t* __restrict ta = r0 + (kBlock - 1);
+            const int16_t* __restrict tb = r1 + (kBlock - 1);
+            int16_t* __restrict oa = w0 + (kBlock - 1);
+            int16_t* __restrict ob = w1 + (kBlock - 1);
+            int16_t* __restrict od = wd1 + (kBlock - 1);
+            uint32_t ql = 0;
+            for (uint32_t sg = 0; sg < nSeg; ++sg) {
+                const uint32_t i0 = seg[sg].i0, n = seg[sg].n;
+                const float frac = seg[sg].of;
+                const int16_t* __restrict mp = mod + (seg[sg].oi - int32_t(i0) - lo);
+                float a1 = s16ToF(mp[1]);   // the next sample's a1 is this sample's a0
+                for (uint32_t j = 0; j < n; ++j) {
+                    const uint32_t i = i0 + j;
+                    const float a0 = s16ToF(*mp--);
+                    float s = acc[i] + krt * (a0 + (a1 - a0) * frac);
+                    a1 = a0;
+                    lp2 += klp * (s - lp2);
+                    s = lp2;
+                    {   // dap1a: read -kap, write-allpass +kap
+                        const float t = s16ToF(ta[-int32_t(i)]);
+                        s += -kap * t;
+                        const int16_t v = toS16(s);
+                        oa[-int32_t(i)] = v;
+                        if (kTrack) ql |= mag(v);
+                        s = kap * s + t;
+                    }
+                    {   // dap1b: read +kap, write-allpass -kap
+                        const float t = s16ToF(tb[-int32_t(i)]);
+                        s += kap * t;
+                        const int16_t v = toS16(s);
+                        ob[-int32_t(i)] = v;
+                        if (kTrack) ql |= mag(v);
+                        s = t - kap * s;
+                    }
+                    {   // del1
+                        const int16_t v = toS16(s);
+                        od[-int32_t(i)] = v;
+                        if (kTrack) ql |= mag(v);
+                    }
+                    wet[i] = 2.0f * s;
+                }
+            }
+            qa |= ql;
         }
-        lp2 += klp * (acc - lp2);
-        acc = lp2;
-        {   // dap1a: read -kap, write-allpass +kap
-            const float t = s16ToF(gTap[0][k]);
-            acc += -kap * t;
-            const int16_t v = toS16(acc);
-            gTap[0][k] = v;
-            if (kTrack) q |= mag(v);
-            acc = kap * acc + t;
+        // Right tank: fixed del1 tap, lp3, dap2a, dap2b, del2; then the
+        // output mix (mono send in, duplicated to L and R).
+        {
+            const float* __restrict wetL = gWetL;
+            const int16_t* __restrict tc = r2 + (kBlock - 1);
+            const int16_t* __restrict td = r3 + (kBlock - 1);
+            const int16_t* __restrict te = r4 + (kBlock - 1);
+            int16_t* __restrict oc = w3 + (kBlock - 1);
+            int16_t* __restrict oe = w4 + (kBlock - 1);
+            int16_t* __restrict od = wd2 + (kBlock - 1);
+            uint32_t qr = 0;
+            for (uint32_t i = 0; i < kBlock; ++i) {
+                float s = acc[i] + krt * (s16ToF(tc[-int32_t(i)]));
+                lp3 += klp * (s - lp3);
+                s = lp3;
+                {   // dap2a
+                    const float t = s16ToF(td[-int32_t(i)]);
+                    s += kap * t;
+                    const int16_t v = toS16(s);
+                    oc[-int32_t(i)] = v;
+                    if (kTrack) qr |= mag(v);
+                    s = t - kap * s;
+                }
+                {   // dap2b
+                    const float t = s16ToF(te[-int32_t(i)]);
+                    s += -kap * t;
+                    const int16_t v = toS16(s);
+                    oe[-int32_t(i)] = v;
+                    if (kTrack) qr |= mag(v);
+                    s = kap * s + t;
+                }
+                {   // del2
+                    const int16_t v = toS16(s);
+                    od[-int32_t(i)] = v;
+                    if (kTrack) qr |= mag(v);
+                }
+                const float wr = 2.0f * s, wl = wetL[i];
+                const float x = in[i];
+                outL[i] = clampUnitFast(x + amount * (wl - x));
+                outR[i] = clampUnitFast(x + amount * (wr - x));
+                sumAbs += std::fabs(wl);
+            }
+            qa |= qr;
         }
-        {   // dap1b: read +kap, write-allpass -kap
-            const float t = s16ToF(gTap[1][k]);
-            acc += kap * t;
-            const int16_t v = toS16(acc);
-            gTap[1][k] = v;
-            if (kTrack) q |= mag(v);
-            acc = t - kap * acc;
-        }
-        {   // del1
-            const int16_t v = toS16(acc);
-            gDel1[k] = v;
-            if (kTrack) q |= mag(v);
-        }
-        const float wetL = 2.0f * acc;
-        // Right tank: fixed del1 tap.
-        acc = apout + krt * (s16ToF(gTap[2][k]));
-        lp3 += klp * (acc - lp3);
-        acc = lp3;
-        {   // dap2a
-            const float t = s16ToF(gTap[3][k]);
-            acc += kap * t;
-            const int16_t v = toS16(acc);
-            gTap[3][k] = v;
-            if (kTrack) q |= mag(v);
-            acc = t - kap * acc;
-        }
-        {   // dap2b
-            const float t = s16ToF(gTap[4][k]);
-            acc += -kap * t;
-            const int16_t v = toS16(acc);
-            gTap[4][k] = v;
-            if (kTrack) q |= mag(v);
-            acc = kap * acc + t;
-        }
-        {   // del2
-            const int16_t v = toS16(acc);
-            gDel2[k] = v;
-            if (kTrack) q |= mag(v);
-        }
-        const float wetR = 2.0f * acc;
-        outL[i] = clampUnit(L + amount * (wetL - L));
-        outR[i] = clampUnit(R + amount * (wetR - R));
-        sumAbs += (wetL < 0.0f ? -wetL : wetL);
-    }
+        if (kTrack) q |= qa;
     };
     if (anyIn) run(std::false_type{});
     else run(std::true_type{});
     // Writes (disjoint spans).
     auto tapOut = [&](int16_t* ring, uint32_t off, const int16_t* buf) {
-        ringOut(ring, kRMask, P + off - (kBlock - 1), buf, kBlock);
+        ringOut(ring, kRMask, tapPos(off), buf, kBlock);
     };
-    tapOut(A, 1214, gTap[0]);
-    tapOut(A, 3397, gTap[1]);
-    tapOut(A, 6088, gDel1);
-    tapOut(B, 0, gTap[3]);
-    tapOut(B, 2526, gTap[4]);
-    tapOut(B, 4724, gDel2);
+    tapOut(A, 1214, w0);
+    tapOut(A, 3397, w1);
+    tapOut(A, 6088, wd1);
+    tapOut(B, 0, w3);
+    tapOut(B, 2526, w4);
+    tapOut(B, 4724, wd2);
     // Keep the filter states finite and bounded.
     lp1_ = clampUnit(lp1);
     lp2_ = clampUnit(lp2);
@@ -460,7 +606,7 @@ inline float limiterRun(const float* __restrict x, const float* __restrict sc, f
 }
 }  // namespace
 
-bool Limiter::process(const float* x, const float* sc, float* out) {
+OT_FASTRUN_FN bool Limiter::process(const float* x, const float* sc, float* out) {
     if (disabled_) {
         for (uint32_t i = 0; i < kBlock; ++i) out[i] = x[i];
         return true;

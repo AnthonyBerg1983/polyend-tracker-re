@@ -13,15 +13,33 @@ public:
     // removal -> unmount). Call from the main loop.
     void service();
     bool mount();
+    // otAppMain(), right after it cleared `.sdram_bss`: file slots that live
+    // in the SDRAM may be used from now on (before: one file at a time).
+    void enableSdramFiles();
     void unmount();
     bool mounted() const { return mounted_; }
     // USB storage mode (spec 01 §6.1): release the card, stop all SDHC access.
     void setStorageMode(bool on);
+    // Layout of the mounted FAT volume (USB Storage diagnostics). Sectors are
+    // card blocks. freeClusters: FatFs' count (from FSINFO at mount, kept up
+    // to date by FatFs and written back to FSINFO on every f_close / f_sync),
+    // 0xFFFFFFFF when unknown. fsinfo: the volume has a valid FSINFO sector.
+    struct FatInfo {
+        uint8_t type = 0;   // 0 none, 12 / 16 / 32, 64 = exFAT
+        uint8_t fats = 0;
+        bool fsinfo = false;
+        uint32_t clusterBytes = 0, clusters = 0, fatStart = 0, fatSectors = 0, dataStart = 0;
+        uint32_t freeClusters = 0xFFFFFFFFu;
+    };
+    bool fatInfo(FatInfo* out) const;
 
     // Throughput self-measurement (selftest): writes `totalBytes` to a temp file in
     // `bufLen` chunks from `buf`, reads it back (checking chunk tags), deletes it.
     struct Bench { bool ok = false; uint32_t bytes = 0, writeUs = 0, readUs = 0, verifyErrors = 0; };
     bool benchmark(uint8_t* buf, uint32_t bufLen, uint32_t totalBytes, Bench& r);
+    // Boot: sdhc::checkSdramDirect() on the first FAT sectors of the mounted
+    // volume (real data). `scratch`: >= 65 KB of free SDRAM. True = direct reads on.
+    bool checkDirectDma(uint8_t* scratch);
 
     Handle open(const char* path, OpenMode mode) override;
     int32_t read(Handle h, void* dst, uint32_t len) override;
@@ -36,6 +54,8 @@ public:
     int32_t listDir(const char* path, DirFn fn, void* ctx) override;
 
 private:
+    // Once per boot, before the first SDRAM-sourced write (sd_storage.cpp).
+    void maybeCheckDirectWrite(const void* src, uint32_t len);
     bool mounted_ = false;
     bool storageMode_ = false;
     bool lastPresent_ = false;

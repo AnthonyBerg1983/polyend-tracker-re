@@ -58,7 +58,7 @@ TEST(song_paste_uses_grid_position) {
     a.project.playlist[3] = 0;
     a.selectPattern(1);
     a.pattern().tracks[0].steps[0].note = 60;
-    a.stored(1) = a.pattern();
+    a.storePattern(1, a.pattern());
     h.tap(btn::Song);
     SongScreen& s = song(h);
     h.tap(btn::Rec);

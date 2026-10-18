@@ -65,6 +65,16 @@ bool applyFontSet(IDisplay* d, uint8_t set);
 // True after applyFontSet bound custom fonts: kFont1..kFontIcons then name
 // bitmap handles and glyphRun draws VERTEX2II glyphs.
 bool customFontsBound();
+// ROM-font text without custom fonts (docs/OPTIMIZATION_2X.md OP-6):
+//  kRomGlyphs (default): Gfx::glyphRun and the Pattern grid cells draw the
+//    ROM font bitmaps with VERTEX2II;
+//  kRomText: the same runs as CMD_TEXT (per glyph at a fixed pitch), the
+//    pixel reference for the simulator's romcheck;
+//  kRomWholeText: as before OP-6, the Pattern grid cells as one CMD_TEXT
+//    string each (tests/ui_fakes.h Harness: host tests read whole strings).
+enum RomTextMode : uint8_t { kRomGlyphs = 0, kRomText = 1, kRomWholeText = 2 };
+void setRomTextMode(RomTextMode m);
+RomTextMode romTextMode();
 
 // Pen advance of `s` (or its first `len` chars, len < 0 = all) in pixels for a
 // font role or ROM handle. ROM fonts: the FT81x ROM advance tables (the
@@ -103,14 +113,150 @@ constexpr int kBarY = 424;           // bottom labels (spec 05 §2.2)
 constexpr int kBarLabelW = 94;
 constexpr int kBarLabelH = 55;
 
+// IDisplay sink that only hashes the commands it receives (FNV-1a 64 over
+// opcode + arguments + strings). Gfx::cached() runs a block into it to learn
+// whether the block's stored fragment is still current.
+class HashDisplay final : public IDisplay {
+public:
+    static constexpr uint64_t kSeed = 0xCBF29CE484222325ull;
+    uint64_t h = kSeed;
+    void reset() { h = kSeed; }
+
+    uint16_t width() const override { return 800; }
+    uint16_t height() const override { return 480; }
+    void dlStart() override { w(0x01000000u); }
+    void clearColorRGB(uint8_t r, uint8_t g, uint8_t b) override { w(0x02000000u | rgb(r, g, b)); }
+    void clear(bool c, bool s, bool t) override { w(0x03000000u | (c ? 4u : 0u) | (s ? 2u : 0u) | (t ? 1u : 0u)); }
+    void colorRGB(uint8_t r, uint8_t g, uint8_t b) override { w(0x04000000u | rgb(r, g, b)); }
+    void colorA(uint8_t a) override { w(0x05000000u | a); }
+    void lineWidth(uint16_t v) override { w(0x06000000u | v); }
+    void pointSize(uint16_t v) override { w(0x07000000u | v); }
+    void scissorXY(uint16_t x, uint16_t y) override { w(0x08000000u, xy(x, y)); }
+    void scissorSize(uint16_t x, uint16_t y) override { w(0x09000000u, xy(x, y)); }
+    void begin(Prim p) override { w(0x0A000000u | p); }
+    void end() override { w(0x0B000000u); }
+    void vertex2f(int32_t x, int32_t y) override { w(0x0C000000u ^ uint32_t(x), uint32_t(y)); }
+    void vertex2ii(uint16_t x, uint16_t y, uint8_t hh, uint8_t c) override {
+        w(0x0D000000u | (uint32_t(hh) << 8) | c, xy(x, y));
+    }
+    void text(int16_t x, int16_t y, uint8_t font, uint16_t o, const char* s) override {
+        w(0x0E000000u | (uint32_t(font) << 16) | o, xy(uint16_t(x), uint16_t(y)));
+        str(s);
+    }
+    void number(int16_t x, int16_t y, uint8_t font, uint16_t o, int32_t n) override {
+        w(0x0F000000u | (uint32_t(font) << 16) | o, xy(uint16_t(x), uint16_t(y)));
+        w(uint32_t(n));
+    }
+    void swap() override { w(0x10000000u); }
+    void drawImage(int16_t x, int16_t y, uint32_t a, uint16_t ww, uint16_t hh) override {
+        w(0x11000000u, xy(uint16_t(x), uint16_t(y)));
+        w(a, xy(ww, hh));
+    }
+    void drawRgb332(int16_t x, int16_t y, uint32_t a, uint16_t ww, uint16_t hh, uint8_t s) override {
+        w(0x12000000u | s, xy(uint16_t(x), uint16_t(y)));
+        w(a, xy(ww, hh));
+    }
+    void fragmentAppend(uint8_t slot) override { w(0x13000000u | slot); }
+    // 1.9.5 visual-parity primitives (must hash too: a block differing only
+    // in a gradient, translate or transform must not reuse a fragment).
+    void gradient(int16_t x0, int16_t y0, uint32_t c0, int16_t x1, int16_t y1, uint32_t c1) override {
+        w(0x14000000u, xy(uint16_t(x0), uint16_t(y0)));
+        w(c0, xy(uint16_t(x1), uint16_t(y1)));
+        w(c1);
+    }
+    void vertexTranslateX(int32_t x16) override { w(0x15000000u, uint32_t(x16)); }
+    void saveContext() override { w(0x16000000u); }
+    void restoreContext() override { w(0x17000000u); }
+    void bitmapTransform(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f) override {
+        w(0x18000000u, uint32_t(a));
+        w(uint32_t(b), uint32_t(c));
+        w(uint32_t(d), uint32_t(e));
+        w(uint32_t(f));
+    }
+    void bitmapSize(uint8_t hh, uint16_t ww, uint16_t ht) override { w(0x19000000u | hh, xy(ww, ht)); }
+
+private:
+    static uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) { return (uint32_t(r) << 16) | (uint32_t(g) << 8) | b; }
+    static uint32_t xy(uint16_t x, uint16_t y) { return (uint32_t(x) << 16) | y; }
+    void w(uint32_t v) {
+        h = (h ^ v) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    void w(uint32_t a, uint32_t b) {
+        w(a);
+        w(b);
+    }
+    void str(const char* s) {
+        uint32_t acc = 0, n = 0;
+        for (; s && *s; ++s) {
+            acc = (acc << 8) | uint8_t(*s);
+            if (++n == 4) {
+                w(acc);
+                acc = n = 0;
+            }
+        }
+        w(acc ^ (n << 24) ^ 0x80000000u);   // tail + terminator
+    }
+};
+
+// Cached display-list fragments (2.x performance workstream; the stock
+// firmware's per-control RAM_G lists, spec 05 §3.3). Owned by the Ui so it
+// survives frames. Gfx::cached() keys every slot by a 64-bit hash of the
+// command stream the block would emit, so a fragment is only reused when it
+// is bit-for-bit what would be drawn now: no manual invalidation, and the
+// output is identical to drawing inline. A block is captured only after the
+// same hash was drawn inline in kStableProbes frames in a row (static chrome
+// is cached from its third frame on; content that changes every frame never
+// pays for a capture), and a slot whose content changed kHotChanges frames in
+// a row is drawn inline without hashing for kHotSkip frames (a scrolling
+// grid row).
+struct FragmentCache {
+    static constexpr uint8_t kSlots = IDisplay::kFragmentSlots;
+    static constexpr uint8_t kMaxCapturesPerFrame = 8;   // each costs two FIFO syncs on the FT81x
+    static constexpr uint8_t kStableProbes = 3;
+    static constexpr uint8_t kHotChanges = 3;
+    static constexpr uint8_t kHotSkip = 12;
+    struct Slot {
+        uint64_t stored = 0;     // hash of the fragment held by the display (valid if `has`)
+        uint64_t seen = 0;       // hash drawn inline in the last probed frame
+        uint8_t stable = 0;      // consecutive probes that saw `seen`
+        uint64_t refused = 0;    // hash the display could not store (too large)
+        bool has = false;
+        uint8_t changes = 0;     // consecutive probes whose hash differed from the previous one
+        uint8_t skip = 0;        // frames left drawn inline without probing
+    };
+    Slot slot[kSlots];
+    bool enabled = true;         // false: always inline (A/B checks, diagnostics)
+    // Statistics (cumulative): appended, captured, probed misses, skipped.
+    uint32_t hits = 0, captures = 0, misses = 0, skips = 0;
+    void reset() {
+        for (Slot& s : slot) s = Slot{};
+    }
+};
+
+// Fragment slots (one per cached block; a slot may serve several screens,
+// the hash keeps them apart).
+enum FragSlot : uint8_t {
+    kFragTitle = 0,          // title strip background, title and subtitle
+    kFragBar = 1,            // bottom bar (spec 06 §0.3)
+    kFragPatHeaders = 2,     // Pattern grid: track header tabs
+    kFragPatSeparators = 3,  // Pattern grid: track separators
+    // The M0 per-row Pattern fragments (4..18) are gone: the 1.9.5 grid is
+    // drawn in colour passes across all rows (screen_pattern_draw.cpp), not
+    // row by row (docs/CHANGES_2X.md).
+    kFragCount = 4,
+};
+static_assert(kFragCount <= IDisplay::kFragmentSlots, "fragment slots");
+
 class Gfx {
 public:
-    explicit Gfx(IDisplay& d) : d_(d) {}
-    // Raw display access: closes an open glyph primitive and resets
+    explicit Gfx(IDisplay& d, FragmentCache* cache = nullptr) : d_(&d), base_(&d), cache_(cache) {}
+    // Raw display access (the current sink: the display, or the hasher while
+    // a cached() block is probed): closes an open glyph primitive and resets
     // VERTEX_TRANSLATE_X first (see sync()).
     IDisplay& display() {
         sync();
-        return d_;
+        return *d_;
     }
 
     void beginFrame(uint32_t bg);
@@ -139,8 +285,10 @@ public:
     // Glyph run (spec 20 §2.1): one VERTEX2II per glyph, top-left at (x, y),
     // pen advance from the font table or `advanceOverride` px when > 0 (the
     // grid's 11-px "--" rule, §2.3); VERTEX_TRANSLATE_X keeps the 9-bit
-    // VERTEX2II x in range from x >= 512 on. Fallback without custom fonts:
-    // the CMD_TEXT path (one CMD_TEXT per glyph when advanceOverride > 0).
+    // VERTEX2II x in range from x >= 512 on. Without custom fonts the same
+    // path draws the ROM font bitmaps (handles 16-31) with the romMetrics
+    // advances; only a run clipped at the top / left edge (or a non-ROM
+    // handle) falls back to CMD_TEXT (per glyph when advanceOverride > 0).
     void glyphRun(int x, int y, uint8_t font, const char* s, uint32_t colour, int advanceOverride = 0);
     int textWidth(uint8_t font, const char* s) const { return ot::textWidth(font, s); }
     // Text turned by quarterTurns x 90 degrees counter-clockwise (1 = reads
@@ -179,11 +327,40 @@ public:
     void rectsAdd(int x, int y, int w, int h);
     void rectsEnd();
 
-    // Approximate display-list words emitted this frame (FT81x RAM_DL is 2048 words).
+    // Draws the block `draw` (a callable that draws through this Gfx and has
+    // no side effects; it may run up to twice per frame) through fragment
+    // slot `slot`: CMD_APPEND of the stored copy when its hash matches, else
+    // inline (capturing it when it was stable). Without a cache or a display
+    // that supports fragments it simply calls draw().
+    // Every form starts and ends synced (no open BEGIN(BITMAPS), translate
+    // 0, no known colour).
+    template <class F>
+    void cached(uint8_t slot, F&& draw) {
+        if (!probeBegin(slot)) {    // syncs the display first
+            draw();
+            sync();
+            cur_ = kNoColor;
+            return;
+        }
+        draw();
+        sync();                        // into the hasher
+        if (probeEnd(slot)) return;    // appended
+        const bool cap = captureBegin(slot);
+        draw();
+        sync();                        // the END belongs to the fragment
+        captureEnd(slot, cap);
+    }
+
+    // Display-list words uploaded through the command FIFO this frame
+    // (approximate; an appended fragment counts 4).
     uint32_t dlWords() const { return words_; }
+    // Display-list words of the whole frame including appended fragments
+    // (approximate; FT81x RAM_DL is 2048 words).
+    uint32_t dlTotalWords() const { return words_ + appended_; }
 
     // RAM_DL guard (docs/VERIFY_1.9.5.md §6). With a limit set, a primitive
-    // that would take the frame past `limit` words (minus a small reserve
+    // that would take the frame (dlTotalWords(): appended fragments included)
+    // past `limit` words (minus a small reserve
     // for closing the open primitive, the translate reset and DISPLAY) is
     // dropped instead of sent, so an oversized frame can never fault the
     // FT81x coprocessor; dropped() counts them. 0 = no limit.
@@ -203,7 +380,9 @@ private:
     // Anything else that draws goes through these first: closePrim() ends
     // the open primitive, translate(px) sets VERTEX_TRANSLATE_X only when it
     // changes, sync() does both with translate 0 (VERTEX2F, coprocessor
-    // commands and SAVE/RESTORE_CONTEXT need the default context).
+    // commands and SAVE/RESTORE_CONTEXT need the default context). Cached
+    // blocks (cached()) start and end synced, so the inline, captured and
+    // appended forms leave the same state.
     void openBitmaps();
     void closePrim();
     void translate(int px);
@@ -219,17 +398,40 @@ private:
     uint8_t alphaStack_[kAlphaStack] = {};
     int alphaDepth_ = 0;
 
-    IDisplay& d_;
+    static constexpr uint32_t kNoColor = 0xFFFFFFFF;
+    bool probeBegin(uint8_t slot);
+    bool probeEnd(uint8_t slot);
+    bool captureBegin(uint8_t slot);
+    void captureEnd(uint8_t slot, bool captured);
+    // Gfx state a probe (drawing into the hasher) changes.
+    struct State {
+        uint32_t words = 0, dropped = 0;
+        uint8_t alpha = 255, sentAlpha = 255;
+        int alphaDepth = 0;
+        uint8_t alphaStack[kAlphaStack] = {};
+        bool rectsOpen = false;
+    };
+    State snapshot() const;
+    void restore(const State& st);
+
+    IDisplay* d_;                // current sink (the display, or the hasher while probing)
+    IDisplay* base_;             // the display
+    FragmentCache* cache_;
     uint32_t limit_ = 0;
     uint32_t dropped_ = 0;
     bool lowDetail_ = false;
     bool rectsOpen_ = false;   // rectsBegin admitted (rectsAdd / rectsEnd follow it)
     uint8_t alpha_ = 255;
     uint8_t sentAlpha_ = 255;
-    uint32_t cur_ = 0xFFFFFFFF;
+    uint32_t cur_ = kNoColor;
     uint32_t words_ = 0;
+    uint32_t appended_ = 0;
     bool bitmapsOpen_ = false;
-    int translate_ = 0;   // VERTEX_TRANSLATE_X in effect, px
+    int translate_ = 0;          // VERTEX_TRANSLATE_X in effect, px
+    // Probe state.
+    HashDisplay hasher_;
+    State saved_;
+    uint8_t capturesThisFrame_ = 0;
 };
 
 }  // namespace ot

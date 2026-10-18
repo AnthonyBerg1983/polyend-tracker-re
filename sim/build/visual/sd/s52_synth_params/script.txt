@@ -1,0 +1,9 @@
+wait 300
+press INSTR
+wait 400
+enc -70
+enc 1
+release INSTR
+wait 100
+tap INSTRPARAMS
+wait 200

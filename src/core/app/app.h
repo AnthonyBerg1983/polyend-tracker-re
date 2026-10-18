@@ -15,7 +15,9 @@
 #include "hal_api.h"
 #include "model/instrument.h"
 #include "model/pattern.h"
+#include "model/pattern_store.h"
 #include "model/project.h"
+#include "model/synth_patch.h"
 #include "sequencer/sequencer.h"
 #include "ui/notes.h"
 #include "ui/ui.h"
@@ -49,6 +51,9 @@ struct HalRefs {
     // Global config image store (spec 05 §5.4 EEPROM). Null: the image is
     // kept in kConfigPath on the card instead.
     INvStore* nvstore = nullptr;
+    // 2.x USB Storage mode (Config > USB > USB Storage). Null: not available
+    // in this build (OT_USB_MSC=0).
+    IUsbStorage* usbStorage = nullptr;
 };
 
 // Large buffers (SDRAM on the device, spec 02 §8.2 for the sample bank).
@@ -57,7 +62,19 @@ struct AppMemory {
     uint32_t sampleBankSamples = 0;
     int16_t* fxMemory = nullptr;          // delay lines + reverb rings (spec 04 §5.1, §5.2)
     uint32_t fxSamples = 0;               // >= audio::AudioEngine::kFxMemorySamples
-    Pattern* patterns = nullptr;          // kPatternCount entries; pattern n at [n-1]
+    PatternStock* patterns = nullptr;     // kPatternCount entries; pattern n at [n-1] (tracks 0..11)
+    // 2.x ext tracks 12..15 (model/pattern_store.h): extTrackBlocks track
+    // records + ExtTrackPool::metaBytes(extTrackBlocks - 1) bytes of index.
+    // The last record is the write target that storedTrack() hands out when
+    // the pool is full, so the pool holds extTrackBlocks - 1 tracks.
+    // Required (>= 2 records), like seqBuffers.
+    Track* extTracks = nullptr;
+    int extTrackBlocks = 0;               // ExtTrackPool::kDefaultBlocks + 1 on the device
+    uint8_t* extMeta = nullptr;
+    Pattern* seqBuffers = nullptr;        // 2 entries: sequencer current + preload (16 tracks)
+    // Optional third sequencer buffer: switchPatternNow() assembles the new
+    // pattern there in the main loop (no pattern copy in the audio block).
+    Pattern* seqStage = nullptr;
     Pattern* undo = nullptr;              // undoSlots entries (spec 05 §5.1: 20)
     uint8_t* undoNums = nullptr;
     int undoSlots = 0;
@@ -68,7 +85,19 @@ struct AppMemory {
     uint8_t* scratch = nullptr;           // file copy / decode buffer
     uint32_t scratchBytes = 0;
     PerfPatternMemory* perfPatterns = nullptr;   // per-track pattern overrides (spec 12 §C.1)
+    audio::StemBlock* exportStems = nullptr;     // optional: WAV export stem buffer (else allocated per export)
 };
+
+// Main-loop members of App that live in the SDRAM on the device (CPU round 3,
+// docs/OPTIMIZATION_2X.md "SRAM map"): a reference to storage in
+// `.sdram_bss` (core/sdram_bss.h), constructed in App::init() after
+// otAppMain() zeroed that section; host builds keep a plain member. Never
+// touched by the audio block, an ISR or the boot code.
+#if defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE
+#define OT_APP_SDRAM_MEMBER(T, name) T& name
+#else
+#define OT_APP_SDRAM_MEMBER(T, name) T name
+#endif
 
 constexpr const char* kWorkspace = "Workspace";
 constexpr const char* kProjectsDir = "Projects";
@@ -108,6 +137,9 @@ public:
     static constexpr uint16_t kAuditionSampleEditor = 0x63;  // sample editor preview
     static constexpr uint16_t kAuditionMidiIn = 0x100;       // + MIDI note number
     static constexpr uint16_t kAuditionNone = 0xFFFF;
+    // Tracks the audition search scans (stock 12; 2.x: all 16, so note entry
+    // on tracks 13..16 sounds like on 9..12, 2x-01 §2.6).
+    static constexpr int kAuditionTracks = kTrackCount;
     // Returns the track used, or -1 when no track was free.
     // startTrack >= 0 starts the search there instead of editorTrack (MIDI
     // input: the pattern-editor target rectangle, spec 17 §1.4 step 4).
@@ -130,7 +162,7 @@ public:
 
     // ---- model -----------------------------------------------------------
     Project project;
-    PatternNames names;
+    OT_APP_SDRAM_MEMBER(PatternNames, names);   // main loop only (UI, project files)
     Instrument instruments[kSampleInstrumentCount];
     bool instrPresent[kSampleInstrumentCount] = {};
     audio::AudioEngine engine;
@@ -147,9 +179,55 @@ public:
     const AppMemory& mem() const { return mem_; }
 
     // ---- patterns ----------------------------------------------------------
+    // pattern(): the working (current) pattern, all 16 tracks.
     Pattern& pattern() { return *seq.currentPattern(); }
     uint8_t patternNumber() const { return seq.currentPatternNumber(); }
-    Pattern& stored(int num) { return mem_.patterns[num - 1]; }
+
+    // ---- resident pattern store (2.x M1-WP1, docs/M1_PLAN.md §1) ----------
+    // Pattern num 1..255. Tracks 0..11 are always resident (storedStock, the
+    // .mtp image); tracks 12..15 live in the ext-track pool and take a block
+    // only while they hold data. An ext track without a block reads as
+    // defaultExtTrack() (empty, stock track 0's length).
+    PatternStock& storedStock(int num) { return mem_.patterns[num - 1]; }
+    const PatternStock& storedStock(int num) const { return mem_.patterns[num - 1]; }
+    // 1.9.3 name of storedStock(): tracks 0..11 only. New code that may touch
+    // tracks 12..15 uses storedTrack()/storePattern()/assemblePattern().
+    PatternStock& stored(int num) { return storedStock(num); }
+    // Write access to track t (0..15) of pattern num; t >= 12 allocates a
+    // pool block (initialised to the default ext track). Pool full: reported
+    // (notice, extPoolFullEvents()) and a scratch track is returned whose
+    // contents are discarded -- never a crash. Check storedTrackWritable()
+    // first when the caller can refuse the edit instead.
+    Track& storedTrack(int num, int t);
+    bool storedTrackWritable(int num, int t) const;
+    // Read access without allocation: nullptr for an ext track with no block.
+    const Track* findStoredTrack(int num, int t) const;
+    // Copy of track t (default ext track when it has no block).
+    void readStoredTrack(int num, int t, Track& out) const;
+    // Whole working pattern -> store: tracks 0..11 into storedStock, 12..15
+    // into existing blocks, or new blocks when not default. Blocks of tracks
+    // that became empty are kept until compactExtTracks(). False = pool full
+    // (the ext tracks that did not fit are not stored; reported).
+    bool storePattern(int num, const Pattern& p);
+    // storePattern(patternNumber(), pattern()).
+    bool commitCurrentPattern() { return storePattern(patternNumber(), pattern()); }
+    // Store -> 16-track pattern (no present check; see loadPattern).
+    void assemblePattern(int num, Pattern& dst) const;
+    // Frees the blocks of ext tracks that are default again (pattern num, or
+    // every pattern when num == 0). Main loop; the autosave calls it for the
+    // patterns it writes. Returns the number of blocks freed.
+    int compactExtTracks(int num = 0);
+    void clearExtTracks(int num);                 // drop all ext tracks of num
+    // Pattern num back to the project default (stock tracks + ext tracks).
+    void defaultStored(int num);
+    // Every pattern default, pool emptied (new project / project load).
+    void resetPatternStore();
+    const ExtTrackPool& extPool() const { return ext_; }
+    uint32_t extPoolFullEvents() const { return ext_.fullEvents(); }
+    // File undo (spec 06 §2.3 F3) of a stored pattern, all 16 tracks,
+    // without a stack copy: push the store's pattern num / pop into the store.
+    void pushFileUndo(int num);
+    bool popFileUndo(uint8_t* num);
     bool patternPresent(int num) const { return num >= 1 && num <= kPatternCount && (present_[num >> 3] >> (num & 7)) & 1; }
     bool patternHasData(int num);
     // After editing the current pattern: copy into the store and mark it dirty.
@@ -200,6 +278,23 @@ public:
     bool saveConfig();                            // INvStore, else kConfigPath
     void loadConfig();                            // boot: EEPROM, else import the file once
     void setNvStore(INvStore* nv) { hal_.nvstore = nv; }
+    void setUsbStorage(IUsbStorage* u) { hal_.usbStorage = u; }
+
+    // ---- 2.x USB Storage mode (Tracker Mini manual §13.10) ----------------
+    // Enter: refused while a project job other than the autosave runs, while
+    // the Games borrow the sample memory, or without a card / USB support;
+    // otherwise playback and recording stop, the autosave and the config are
+    // written, and the card goes to the computer. The app then leaves the
+    // card alone (loop() runs only the UI and the USB block I/O) until
+    // exitUsbStorage() takes it back and reloads the Workspace like after a
+    // card change. Never persisted: every boot starts with the mode off.
+    enum class UsbEnter : uint8_t { kOk = 0, kUnavailable, kBusy, kNoCard };
+    UsbEnter enterUsbStorage();
+    void exitUsbStorage();
+    bool usbStorageActive() const { return usbActive_; }
+    IUsbStorage::Host usbHost() const {
+        return hal_.usbStorage ? hal_.usbStorage->host() : IUsbStorage::Host::kNoUsb;
+    }
     // Recorder input routing + tuner after init (host tests; the device glue
     // passes them in HalRefs).
     void setInputRouting(bool (*fn)(void*, uint8_t, uint8_t), void* ctx, IRadio* r) {
@@ -214,6 +309,54 @@ public:
     bool neverSaved() const { return neverSaved_; }
     void autosave();                              // writes dirty items to Workspace now
     uint32_t lastAutosave() const { return lastAutosave_; }
+
+    // ---- synth slots (Tracker Mini, spec 21 §3.3, §7; docs/MINI_PLAN.md §1)
+    // Slot s = 0..2 is the project.mt record (project.synthSlot(s)) plus
+    // its patch. Open copies <project>/N.patch to Workspace/N.patch and
+    // loads it; failing that the library Patches/<ENGINE>/<record name>.patch,
+    // then the engine's Init patch. Save writes all three patches; the
+    // autosave rewrites Workspace/N.patch when the slot's patch is dirty.
+    enum class PatchSource : uint8_t { None = 0, File, Library, Init };
+    SynthSlotRecord synthSlot(int s) const { return project.synthSlot(s); }
+    SynthPatch& synthPatch(int s) { return patches_[s < 0 || s >= kSynthSlotCount ? 0 : s]; }
+    const SynthPatch& synthPatch(int s) const { return patches_[s < 0 || s >= kSynthSlotCount ? 0 : s]; }
+    PatchSource synthPatchSource(int s) const { return s >= 0 && s < kSynthSlotCount ? patchSrc_[s] : PatchSource::None; }
+    void markSynthPatchDirty(int s) {
+        if (s < 0 || s >= kSynthSlotCount) return;
+        patchDirty_[s] = true;
+        unsaved_ = true;
+        engine.synth().patchChanged(s);   // edits apply live (audio picks them up next block)
+    }
+    bool synthPatchDirty(int s) const { return s >= 0 && s < kSynthSlotCount && patchDirty_[s]; }
+    // Synth screens (WP-G, app/synth_slots.cpp). The record setter stores
+    // the project bytes and pushes them to the framework (engine sync).
+    void setSynthSlotRecord(int s, const SynthSlotRecord& r);
+    // New model for slot s: record model + "Init", the patch = library
+    // Patches/<MODEL>/Init.patch, else the built-in Init; macro page values
+    // reset to the patch defaults.
+    void setSynthModel(int s, int model);
+    // Built-in Init patch of the slot's model, record name "Init".
+    void initSynthPatch(int s);
+    // Patches/<MODEL>/<name>.patch -> slot s (record name = name). False when
+    // missing, damaged or of another engine (the slot is unchanged).
+    bool loadSynthLibraryPatch(int s, const char* name);
+    // Slot s's patch -> Patches/<MODEL>/<name>.patch (atomic; folders made),
+    // record name = name.
+    bool saveSynthLibraryPatch(int s, const char* name);
+    // Load Patch popup preview (Tracker+ 1.0; docs/SYNTH_UX_MINI_VS_OT.md
+    // row 24): Patches/<MODEL>/<name>.patch plays in slot s (its patch and
+    // the audio-side record with the patch's macro defaults) while the
+    // project record, the patch source and the dirty flag stay as they were
+    // (no autosave of a previewed patch). The first preview keeps a copy of
+    // the slot's patch; endSynthPreview() puts it back byte for byte. False
+    // (slot unchanged) when the file is missing, damaged or another engine's.
+    bool previewSynthLibraryPatch(int s, const char* name);
+    void endSynthPreview();
+    int synthPreviewSlot() const { return previewSlot_; }
+    // The load notice of a project whose slot has no engine in this build
+    // ("Synth k (WTFM) not available", the first such slot; MINI_PLAN §3).
+    // False (out untouched) when every slot is available.
+    bool synthUnavailableNotice(char* out, size_t cap) const;
 
     // ---- project operations (project_io.cpp) ------------------------------
     // The blocking calls below run the same background job as the start*()
@@ -294,12 +437,21 @@ public:
 
     // ---- ISequencerHost ---------------------------------------------------
     void loadPattern(uint8_t number, Pattern& dst, bool sync) override;
+    // Spread preload (seq_sink.h): the same copy as loadPattern, by track.
+    bool loadsPatternTracks() const override { return true; }
+    void loadPatternTracks(uint8_t number, Pattern& dst, int first, int count) override;
     void onStepChanged() override { stepChanged_ = true; }
-    void onPatternEnd() override { ++patternEnds_; }
+    void onPatternEnd() override {
+        ++patternEnds_;
+        engine.noteSeqWork(audio::kSeqPatternEnd);
+    }
     uint32_t patternEndCount() const { return patternEnds_; }
     bool noteInScale(uint8_t note) override;
     uint8_t instrumentVolume(uint8_t instrument) override;
-    void markPatternDirty() override { patternEditedFromSeq_ = true; }
+    void markPatternDirty() override {
+        patternEditedFromSeq_ = true;
+        engine.noteSeqWork(audio::kSeqLiveRecord);
+    }
     bool songScreenActive() override { return ui.active() == kModSong; }
 
     // Paths
@@ -334,6 +486,7 @@ public:
 
 private:
     void serviceMidi();
+    void loopUsbStorage(uint32_t now);   // loop() while the computer owns the card
     void midiByte(MidiPortId port, uint8_t b);
     void handleMidiMessage(uint8_t st, uint8_t d1, uint8_t d2);
     // Project job internals (project_io.cpp).
@@ -351,12 +504,43 @@ private:
     void setPresent(int num, bool on);
     void attachSequencer();
     void defaultPattern(Pattern& p) const;
+    void defaultPattern(PatternStock& p) const;
+    void reportExtPoolFull();
     static bool exportRunning(void* ctx);
+    // Mini pattern / patch file internals (project_io.cpp).
+    bool loadPatternBytes(int num, const uint8_t* file, uint32_t len, uint8_t* out, bool* upgrade);
+    bool savePatternUnit(int num);
+    void loadPatchUnit(int s, uint32_t& cost);
+    bool resolvePatch(int s, const uint8_t* buf, uint32_t len, bool haveFile);
+    uint32_t patchCrc(int s);
+    bool patchKeptOriginal(int s);
+    bool savePatch(int s, const char* dir);
+    void loadNotice();
 
     HalRefs hal_;
     AppMemory mem_;
-    Pattern bufA_, bufB_;
+    ExtTrackPool ext_;              // tracks 12..15 of the store (SDRAM blocks)
+    Track* extDiscard_ = nullptr;   // storedTrack() target when the pool is full (SDRAM)
+    uint32_t extFullReported_ = 0;  // ext_.fullEvents() at the last notice
     uint8_t present_[32] = {};
+    // Tracks 13..16 that did not fit the pool at load (bit e of entry num):
+    // the autosave keeps them from the Workspace file until the store holds
+    // the track (never lost).
+    uint8_t extKeep_[kPatternCount + 1] = {};
+    // Synth slots: patch model, where it came from, dirty bits.
+    SynthPatch patches_[kSynthSlotCount] = {};
+    PatchSource patchSrc_[kSynthSlotCount] = {};
+    bool patchDirty_[kSynthSlotCount] = {};
+    // Load Patch preview (synth_slots.cpp): slot (-1 none), its saved source
+    // and dirty flag; the saved patch lives in the SDRAM (OT_SDRAM_BSS).
+    int8_t previewSlot_ = -1;
+    PatchSource previewSrc_ = PatchSource::None;
+    bool previewDirty_ = false;
+    const SynthPatch* readSynthLibraryPatch(int s, const char* name);
+    // previewOn voice holding the synth audition track (kNoSynthAudition: none).
+    static constexpr uint16_t kNoSynthAudition = 0xFFFF;
+    uint16_t synthAudVoice_ = kNoSynthAudition;
+    char loadNotice_[64] = {};      // first problem of the last load (one notice)
     uint8_t patDirty_[32] = {};
     bool projectDirty_ = false, namesDirty_ = false, configDirty_ = false, configForce_ = false;
     uint8_t recShadow_[12] = {};                  // project bytes 0x134..0x13F last synced
@@ -378,7 +562,7 @@ private:
         uint32_t blocks = 0, tail = 0;
         int songLen = 0;
     } job_;
-    ProjectJob pj_;                 // background project operation (project_io.cpp)
+    OT_APP_SDRAM_MEMBER(ProjectJob, pj_);   // background project operation (project_io.cpp)
     bool lastJobOk_ = true;
     int lastJobErrors_ = 0;
     uint32_t jobProgressMs_ = 0;
@@ -386,6 +570,7 @@ private:
     volatile uint32_t patternEnds_ = 0;
     volatile bool patternEditedFromSeq_ = false;
     bool booted_ = false;
+    bool usbActive_ = false;   // USB Storage mode: the computer owns the card
     bool wasPlaying_ = false;
     uint32_t playStart_ = 0;
     uint32_t lastNoCardTry_ = 0;

@@ -1,10 +1,19 @@
 // Games module (spec 14): ROM browser over Games/ and the NES game screen.
 #pragma once
 
+// OT_GAMES (reimpl/Makefile, docs/OPTIMIZATION_2X.md OP-4): 1 = Games module
+// built in (default, also host tests and the simulator), 0 = compiled out:
+// no NES core, no Games screen, no File F7 "Games" entry.
+#ifndef OT_GAMES
+#define OT_GAMES 1
+#endif
+
+#include "ui/ui.h"
+
+#if OT_GAMES
 #include <cstdint>
 
 #include "games/rom_list.h"
-#include "ui/ui.h"
 
 namespace ot {
 
@@ -62,3 +71,4 @@ private:
 };
 
 }  // namespace ot
+#endif  // OT_GAMES

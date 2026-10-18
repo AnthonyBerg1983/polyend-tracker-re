@@ -28,7 +28,7 @@ struct ModuleTarget {
     // reserved in increasing order, one at a time.
     int16_t* (*reserve)(void* ctx, int slot, uint32_t frames, bool stereo) = nullptr;
     // Pattern number 1..255; the importer overwrites it completely.
-    Pattern* (*pattern)(void* ctx, int number) = nullptr;
+    PatternStock* (*pattern)(void* ctx, int number) = nullptr;
     void* ctx = nullptr;
 };
 
@@ -106,7 +106,7 @@ private:
     };
     enum Stage : uint8_t { kIdle, kPatterns, kSamples, kDone };
     bool nextPattern(int& p);
-    void convertPattern(Pattern& pat, bool first);
+    void convertPattern(PatternStock& pat, bool first);
     void finish();
 
     IStorage* fs_ = nullptr;

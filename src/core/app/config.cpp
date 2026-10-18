@@ -135,6 +135,8 @@ void Config::sanitize() {
     for (auto& g : recGain) clampField<uint8_t>(g, 100, 50);
     clampField<uint8_t>(recMonitor, 1, 1);
     if (radioFreq10 < 760 || radioFreq10 > 1080) radioFreq10 = 875;
+    clampField<uint8_t>(cpuMeter, 2, 0);
+    if (synthVoices < 1 || synthVoices > kMaxSynthVoices) synthVoices = kDefaultSynthVoices;
     validateImage(image);
 }
 
@@ -153,6 +155,32 @@ void Config::toImage() {
     image[0x36] = uint8_t(5 * k / 3);
 }
 
+void Config::toExt(uint8_t* out) const {
+    out[0] = 'O';
+    out[1] = 'T';
+    out[2] = 'X';
+    out[3] = kExtVersion;
+    out[4] = uint8_t(kExtPayload);
+    out[5] = cpuMeter;
+    out[6] = synthVoices;
+    uint8_t sum = 0;
+    for (uint32_t i = 0; i < kExtPayload; ++i) sum = uint8_t(sum + out[5 + i]);
+    out[5 + kExtPayload] = sum;
+}
+
+bool Config::fromExt(const uint8_t* in, uint32_t len) {
+    if (len < 6 || in[0] != 'O' || in[1] != 'T' || in[2] != 'X' || in[3] == 0) return false;
+    const uint32_t n = in[4];
+    if (n == 0 || len < 6 + n) return false;
+    uint8_t sum = 0;
+    for (uint32_t i = 0; i < n; ++i) sum = uint8_t(sum + in[5 + i]);
+    if (sum != in[5 + n]) return false;
+    // Newer versions only append fields: read the ones this build knows.
+    cpuMeter = in[5] <= 2 ? in[5] : 0;
+    synthVoices = (n >= 2 && in[6] >= 1 && in[6] <= kMaxSynthVoices) ? in[6] : kDefaultSynthVoices;
+    return true;
+}
+
 bool Config::fromImage(const uint8_t* img) {
     if (std::memcmp(img, kSignature, sizeof(kSignature)) != 0) return false;
     Config c;
@@ -164,6 +192,8 @@ bool Config::fromImage(const uint8_t* img) {
     c.recSource = recSource;
     c.recMonitor = recMonitor;
     c.radioFreq10 = radioFreq10;
+    c.cpuMeter = cpuMeter;   // extension record, not in the image
+    c.synthVoices = synthVoices;
     c.sanitize();
     *this = c;
     toImage();
@@ -173,18 +203,35 @@ bool Config::fromImage(const uint8_t* img) {
 bool Config::load(INvStore& nv) {
     uint8_t buf[kImageSize];
     if (nv.size() < kImageSize || !nv.read(0, buf, kImageSize)) return false;
-    return fromImage(buf);
+    if (!fromImage(buf)) return false;
+    uint8_t ext[kExtSize];
+    cpuMeter = 0;
+    synthVoices = kDefaultSynthVoices;
+    if (nv.size() >= kExtOffset + kExtSize && nv.read(kExtOffset, ext, kExtSize)) fromExt(ext, kExtSize);
+    else if (nv.size() >= kExtOffset + kExtSize - 1 && nv.read(kExtOffset, ext, kExtSize - 1)) fromExt(ext, kExtSize - 1);   // v1 record
+    return true;
 }
 
 bool Config::save(INvStore& nv) {
     toImage();
-    return nv.size() >= kImageSize && nv.write(0, image, kImageSize);
+    if (nv.size() < kImageSize || !nv.write(0, image, kImageSize)) return false;
+    // Extension record (best effort): written once the option leaves its
+    // default; a store that never had one keeps its erased bytes past 0xF4.
+    if (nv.size() < kExtOffset + kExtSize) return true;
+    uint8_t ext[kExtSize];
+    if (cpuMeter == 0 && synthVoices == kDefaultSynthVoices) {
+        Config probe;
+        if (!nv.read(kExtOffset, ext, kExtSize) || !probe.fromExt(ext, kExtSize)) return true;
+    }
+    toExt(ext);
+    nv.write(kExtOffset, ext, kExtSize);
+    return true;
 }
 
 bool Config::load(IStorage& fs) {
     IStorage::Handle h = fs.open(kConfigPath, IStorage::kRead);
     if (h < 0) return false;
-    uint8_t buf[8 + kImageSize + sizeof(Config)] = {};
+    uint8_t buf[8 + kImageSize + kExtSize + sizeof(Config)] = {};
     int32_t n = 0, r;
     while (n < int32_t(sizeof(buf)) && (r = fs.read(h, buf + n, uint32_t(sizeof(buf) - n))) > 0) n += r;
     fs.close(h);
@@ -193,7 +240,11 @@ bool Config::load(IStorage& fs) {
     const uint32_t avail = uint32_t(n) - 8;
     if (buf[4] == kFileV2) {
         if (len != kImageSize || avail < kImageSize) return false;
-        return fromImage(buf + 8);
+        if (!fromImage(buf + 8)) return false;
+        cpuMeter = 0;
+        synthVoices = kDefaultSynthVoices;
+        fromExt(buf + 8 + kImageSize, avail - kImageSize);
+        return true;
     }
     if (buf[4] != kFileV1) return false;
     // v1: a copy of the typed fields (an older OpenTracker build).
@@ -210,12 +261,13 @@ bool Config::load(IStorage& fs) {
 bool Config::save(IStorage& fs) {
     toImage();
     fs.mkdir(kConfigDir);
-    uint8_t buf[8 + kImageSize] = {};
+    uint8_t buf[8 + kImageSize + kExtSize] = {};
     std::memcpy(buf, kFileMagic, 4);
     buf[4] = kFileV2;
     buf[5] = uint8_t(kImageSize);
     buf[6] = uint8_t(kImageSize >> 8);
     std::memcpy(buf + 8, image, kImageSize);
+    toExt(buf + 8 + kImageSize);
     if (fs.exists(kConfigPath)) fs.remove(kConfigPath);
     IStorage::Handle h = fs.open(kConfigPath, IStorage::kWrite);
     if (h < 0) return false;

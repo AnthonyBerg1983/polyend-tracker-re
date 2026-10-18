@@ -143,6 +143,20 @@ TEST(name_nul_forced) {
     CHECK_EQ(g_buf2[0x90E], 0);
 }
 
+TEST(recorder_source_0x134_keeps_every_tracker_source) {
+    // Original Tracker: 0 line in, 1 radio, 2 mic LG, 3 mic HG all survive a
+    // load (the Mini rule `> 2 -> 0`, spec 21 §3.2, is not applied here).
+    for (uint8_t src = 0; src <= 4; ++src) {
+        Project p;
+        p.setU8(0x134, src);
+        encodeProject(p, g_buf);
+        CHECK_EQ(g_buf[0x134], src);
+        Project q;
+        CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+        CHECK_EQ(q.u8(0x134), src <= 3 ? src : 0);
+    }
+}
+
 TEST(sanitiser) {
     Project p;
     encodeProject(p, g_buf);
@@ -150,7 +164,7 @@ TEST(sanitiser) {
     g_buf[0x111] = 64;          // >63 -> 0
     g_buf[0x113] = 50;          // >49 -> 0
     g_buf[0x12C + 3] = 2;       // >1 -> 0
-    g_buf[0x134] = 4;           // >3 -> 0
+    g_buf[0x134] = 4;           // >3 -> 0 (1.9.2 rule; recorder source 0..3)
     wrU16(g_buf + 0x142, 0);    // not 1..255 -> 1
     wrU16(g_buf + 0x144, 256);
     wrU16(g_buf + 0x146, 255);  // valid
@@ -265,4 +279,217 @@ TEST(tracker_lib_template) {
     encodeProject(q, g_buf);
     CHECK(std::memcmp(g_buf + 0x10, tpl.data() + 0x10, 0x800) == 0);
     CHECK(std::memcmp(g_buf, tpl.data(), 0x0E) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tracker Mini additions (spec 21 §3): synth-slot records, names and mutes
+// of tracks 13..16.
+
+TEST(mini_slot_defaults_match_tracker_lib_template) {
+    // tracker-lib's LATEST_PROJECT_TEMPLATE is a Mini project: its slot area
+    // holds the three default records (-9 dB, poly 1, WTFM / ACD / VAP, "Init").
+    std::vector<uint8_t> tpl = loadFixture("tl_project_template.mt");
+    CHECK_EQ(tpl.size(), size_t(mt::kFileSize));
+    if (tpl.size() != mt::kFileSize) return;
+    uint8_t rec[mt::kSynthSlotSize];
+    for (int s = 0; s < kSynthSlotCount; ++s) {
+        SynthSlotRecord::defaults(s).encode(rec);
+        CHECK(std::memcmp(rec, tpl.data() + mt::synthSlotOff(s), mt::kSynthSlotSize) == 0);
+    }
+    Project p;   // New Project
+    encodeProject(p, g_buf);
+    // 2.0 owner decision: a New Project's Synth 1 is ACD (WTFM has no engine
+    // until 2.1); everything else in the slot area is the template's.
+    SynthSlotRecord s0 = SynthSlotRecord::defaults(0);
+    s0.model = uint32_t(SynthModel::ACD);
+    s0.encode(rec);
+    CHECK(std::memcmp(g_buf + mt::synthSlotOff(0), rec, mt::kSynthSlotSize) == 0);
+    CHECK(std::memcmp(g_buf + mt::synthSlotOff(1), tpl.data() + mt::synthSlotOff(1), 0x80C - mt::synthSlotOff(1)) == 0);
+    // Names 9..16 as the Mini init (0x603..0x642).
+    CHECK(std::memcmp(g_buf + 0x603, tpl.data() + 0x603, 0x40) == 0);
+    SynthSlotRecord r = p.synthSlot(0);
+    CHECK_NEAR(r.gainDb, -9.0, 0);
+    CHECK_EQ(r.polyphony, 1u);
+    CHECK_EQ(r.model, uint32_t(SynthModel::ACD));   // 2.1: back to WTFM
+    CHECK_STR(r.patchName, "Init");
+    CHECK_EQ(SynthSlotRecord::defaults(0).model, uint32_t(SynthModel::WTFM));   // load sanitiser: Mini
+    CHECK_EQ(p.synthSlot(1).model, uint32_t(SynthModel::ACD));
+    CHECK_EQ(p.synthSlot(2).model, uint32_t(SynthModel::VAP));
+    CHECK_EQ(synthEngineId(SynthModel::PERC), 6);
+    CHECK_STR(synthModelName(SynthModel::WTFM), "WTFM");
+}
+
+TEST(mini_slot_accessors_round_trip) {
+    Project p;
+    SynthSlotRecord r;
+    r.gainDb = -3.5f;
+    r.polyphony = 3;
+    r.model = uint32_t(SynthModel::PERC);
+    r.pan = -25.0f;
+    copyStr(r.patchName, sizeof(r.patchName), "Kit 808");
+    r.reverbSend = 12.5f;
+    r.delaySend = 100.0f;
+    const uint8_t mac[6] = {0, 10, 63, 127, 5, 0};
+    std::memcpy(r.macros, mac, 6);
+    p.setSynthSlot(1, r);
+    encodeProject(p, g_buf);
+    const uint32_t o = 0x74C + 0x40;
+    CHECK_EQ(rdF32(g_buf + o), -3.5f);
+    CHECK_EQ(rdU32(g_buf + o + 4), 3u);
+    CHECK_EQ(rdU32(g_buf + o + 8), 4u);
+    CHECK_EQ(rdF32(g_buf + o + 0xC), -25.0f);
+    CHECK_STR(reinterpret_cast<const char*>(g_buf + o + 0x10), "Kit 808");
+    CHECK_EQ(rdF32(g_buf + o + 0x30), 12.5f);
+    CHECK_EQ(rdF32(g_buf + o + 0x34), 100.0f);
+    CHECK_BYTES(g_buf + o + 0x38, 0, 10, 63, 127, 5, 0, 0, 0);
+    static Project q;
+    CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+    encodeProject(q, g_buf2);
+    CHECK(std::memcmp(g_buf, g_buf2, mt::kFileSize) == 0);
+    SynthSlotRecord b = q.synthSlot(1);
+    CHECK(b.valid());
+    CHECK_STR(b.patchName, "Kit 808");
+    CHECK_EQ(b.macros[3], 127);
+    // Out-of-range slot index: not written, reads the default.
+    q.setSynthSlot(3, r);
+    encodeProject(q, g_buf2);
+    CHECK(std::memcmp(g_buf, g_buf2, mt::kFileSize) == 0);
+}
+
+// One bad field makes the whole slot revert to its default; the other
+// slots and the neighbouring bytes stay.
+TEST(mini_slot_sanitiser) {
+    struct Bad {
+        uint32_t off;
+        uint32_t u;
+        bool isFloat;
+        float f;
+    };
+    const float nan = std::nanf("");
+    const Bad bad[] = {
+        {0x00, 0, true, 12.01f},  {0x00, 0, true, -96.5f}, {0x00, 0, true, nan},
+        {0x04, 9, false, 0},      {0x08, 5, false, 0},      {0x08, 0xFFFFFFFFu, false, 0},
+        {0x0C, 0, true, 100.5f},  {0x0C, 0, true, -101.0f}, {0x30, 0, true, -0.5f},
+        {0x30, 0, true, 101.0f},  {0x34, 0, true, nan},     {0x34, 0, true, 100.01f},
+        {0x38, 0x80, false, 0},   {0x3D, 0xFF, false, 0},
+    };
+    for (const Bad& b : bad) {
+        for (int s = 0; s < 3; ++s) {
+            Project p;
+            for (int k = 0; k < 3; ++k) {
+                SynthSlotRecord r = SynthSlotRecord::defaults(k);
+                r.gainDb = 1.0f;
+                r.polyphony = 4;
+                r.model = 1;
+                copyStr(r.patchName, sizeof(r.patchName), "Mine");
+                r.macros[0] = 9;
+                p.setSynthSlot(k, r);
+            }
+            encodeProject(p, g_buf);
+            const uint32_t o = 0x74C + 0x40 * uint32_t(s) + b.off;
+            if (b.isFloat) wrF32(g_buf + o, b.f);
+            else if (b.off >= 0x38) g_buf[o] = uint8_t(b.u);
+            else wrU32(g_buf + o, b.u);
+            g_buf[0x74C + 0x40 * s + 0x3E] = 0x5A;   // padding: not checked, reset with the slot
+            static Project q;
+            CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+            uint8_t want[0x40];
+            SynthSlotRecord::defaults(s).encode(want);
+            CHECK(std::memcmp(q.values + (0x74C + 0x40 * s - 0x110), want, 0x40) == 0);
+            for (int k = 0; k < 3; ++k) {
+                if (k == s) continue;
+                const SynthSlotRecord o2 = q.synthSlot(k);
+                CHECK_EQ(o2.polyphony, 4u);
+                CHECK_STR(o2.patchName, "Mine");
+            }
+        }
+    }
+    // Range ends are valid; the patch name and padding are not checked.
+    Project p;
+    SynthSlotRecord r;
+    r.gainDb = 12.0f;
+    r.polyphony = 8;
+    r.model = 4;
+    r.pan = -100.0f;
+    r.reverbSend = 100.0f;
+    r.delaySend = 0.0f;
+    std::memset(r.macros, 127, 6);
+    r.pad[0] = 0x77;
+    std::memset(r.patchName, 'z', 32);
+    r.patchName[32] = 0;
+    CHECK(r.valid());
+    p.setSynthSlot(0, r);
+    r.gainDb = -96.0f;
+    r.polyphony = 0;
+    r.model = 0;
+    r.pan = 100.0f;
+    CHECK(r.valid());
+    p.setSynthSlot(2, r);
+    encodeProject(p, g_buf);
+    static Project q;
+    CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+    encodeProject(q, g_buf2);
+    CHECK(std::memcmp(g_buf, g_buf2, mt::kFileSize) == 0);
+    // A 1.9.2 file (slot area zero) passes: three ACD slots, polyphony 0.
+    std::memset(g_buf + 0x74C, 0, 0xC0);
+    CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+    for (int s = 0; s < 3; ++s) {
+        const SynthSlotRecord z = q.synthSlot(s);
+        CHECK_EQ(z.polyphony, 0u);
+        CHECK_EQ(z.model, 0u);
+        CHECK_STR(z.patchName, "");
+    }
+    // Direct call: reset mask and bipolar macro defaults.
+    q.setU32(0x74C + 0x40 + 8, 7);
+    const uint8_t bip[3] = {0, 0x05, 0};
+    CHECK_EQ(sanitizeSynthSlots(q, bip), 0x02);
+    CHECK_BYTES(q.values + (0x74C + 0x40 + 0x38 - 0x110), 63, 0, 63, 0, 0, 0);
+    CHECK_EQ(sanitizeSynthSlots(q), 0);
+}
+
+TEST(mini_track_names_and_mutes_13_16) {
+    Project p;
+    char buf[16];
+    for (int t = 12; t < 16; ++t) {
+        p.trackName(t, buf, sizeof(buf));
+        char want[24];
+        std::snprintf(want, sizeof(want), "Midi %d", t + 1);
+        CHECK_STR(buf, want);
+    }
+    CHECK(p.setTrackName(12, "Bass"));
+    CHECK(p.setTrackName(15, "LongName9"));   // 7 characters kept
+    for (int t = 0; t < 16; ++t) CHECK(!p.trackMuted(t));
+    CHECK(p.setTrackMuted(12, true));
+    CHECK(p.setTrackMuted(15, true));
+    CHECK(p.setTrackMuted(8, true));
+    CHECK(p.setTrackMuted(2, true));
+    CHECK(!p.setTrackMuted(16, true));
+    encodeProject(p, g_buf);
+    CHECK_STR(reinterpret_cast<const char*>(g_buf + 0x623), "Bass");
+    CHECK_STR(reinterpret_cast<const char*>(g_buf + 0x63B), "LongNam");
+    CHECK_BYTES(g_buf + 0x742, 1, 0, 0, 0, 1, 0, 0, 1);
+    CHECK_EQ(g_buf[0x12E], 1);
+    g_buf[0x745] = 3;   // > 1 -> 0 (stock check on all 8 entries)
+    static Project q;
+    CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+    CHECK(q.trackMuted(12) && q.trackMuted(15) && q.trackMuted(8) && q.trackMuted(2));
+    CHECK(!q.trackMuted(13) && !q.trackMuted(11));
+    q.trackName(12, buf, sizeof(buf));
+    CHECK_STR(buf, "Bass");
+}
+
+TEST(mini_values_block_raw_round_trip) {
+    // Bytes nobody interprets survive decode/encode, including the slot
+    // area padding and bytes after a patch name's NUL.
+    std::vector<uint8_t> tpl = loadFixture("tl_project_template.mt");
+    if (tpl.size() != mt::kFileSize) return;
+    std::memcpy(g_buf, tpl.data(), mt::kFileSize);
+    g_buf[0x74C + 0x3E] = 0xA5;
+    g_buf[0x74C + 0x40 + 0x10 + 20] = 'q';   // after "Init\0"
+    g_buf[0x80B] = 0x11;
+    for (uint32_t o = 0x643; o < 0x742; ++o) g_buf[o] = uint8_t(o * 7);
+    static Project q;
+    CHECK(decodeProject(g_buf, sizeof(g_buf), q) == FmtStatus::Ok);
+    encodeProject(q, g_buf2);
+    CHECK(std::memcmp(g_buf + 0x10, g_buf2 + 0x10, 0x800) == 0);
 }

@@ -6,6 +6,7 @@
 #include "test.h"
 #include "ui_fakes.h"
 
+#include <algorithm>
 #include <string>
 
 #include "ui/widgets.h"
@@ -586,4 +587,101 @@ TEST(page_dots_focus_title_dot_words) {
     wg::dot(g, 10, 10, 3.0f, 0xFFFFFF);
     CHECK(g.dlWords() >= w0 + 5);
     g.endFrame();
+}
+
+// ---- 2.x CPU cell [I] (spec 2x-02 §2.2) -------------------------------------
+
+TEST(cpu_cell_levels) {
+    using wg::CpuLevel;
+    // Off / no data: hidden.
+    CHECK(!wg::cpuCell(2, true, 990, true, true).shown());
+    CHECK(!wg::cpuCell(1, false, 500, false, false).shown());
+    // Auto: hidden below 60 %, Always: dim.
+    CHECK(!wg::cpuCell(0, true, 594, false, false).shown());
+    CHECK(wg::cpuCell(1, true, 594, false, false).level == CpuLevel::kNormal);
+    CHECK_EQ(wg::cpuCell(1, true, 594, false, false).percent, 59);
+    CHECK_EQ(wg::cpuCell(1, true, 595, false, false).percent, 60);
+    CHECK(wg::cpuCell(0, true, 600, false, false).level == CpuLevel::kWarn);
+    CHECK(wg::cpuCell(0, true, 700, false, false).level == CpuLevel::kAlarm);
+    CHECK(wg::cpuCell(0, true, 300, false, true).level == CpuLevel::kAlarm);    // governor cut
+    CHECK(wg::cpuCell(0, true, 850, false, false).level == CpuLevel::kCritical);
+    wg::CpuCell o = wg::cpuCell(0, true, 200, true, false);                    // overrun
+    CHECK(o.level == CpuLevel::kCritical && o.overrun);
+    CHECK_EQ(wg::cpuCell(0, true, 1400, true, false).percent, 99);
+    // Colours: stock slots (dim, yellow, orange, red).
+    CHECK_EQ(wg::cpuCellColour(O(), CpuLevel::kNormal), O().dim);
+    CHECK_EQ(wg::cpuCellColour(O(), CpuLevel::kWarn), O().slot(slot::kYellow));
+    CHECK_EQ(wg::cpuCellColour(O(), CpuLevel::kAlarm), O().slot(slot::kOrange));
+    CHECK_EQ(wg::cpuCellColour(O(), CpuLevel::kCritical), O().slot(slot::kSolidRect));
+}
+
+TEST(cpu_cell_title_geometry_and_words) {
+    static RecordingDisplay d;
+    d.customFonts = true;
+    CHECK(applyFontSet(&d, 0));
+    wg::TitleStatus st;
+    // Hidden: the stock frame, byte for byte.
+    auto ref = frame([&](Gfx& g) { wg::titleBar(g, O(), "Pattern 10", "5. Bass02", &st); });
+    wg::TitleStatus hid;
+    hid.cpu = wg::cpuCell(2, true, 900, false, false);
+    hid.cpu.right = int16_t(wg::cpuCellRight(0));
+    CHECK(frame([&](Gfx& g) { wg::titleBar(g, O(), "Pattern 10", "5. Bass02", &hid); }) == ref);
+    CHECK(hasLine(ref, "SCISSOR_SIZE 270 27"));
+    // Shown: 60 x 24 cell right-aligned at the time ink (300) - 4; the title
+    // clip ends 10 px before it (217 px from x 9).
+    st.cpu = wg::cpuCell(1, true, 452, false, false);
+    st.cpu.right = int16_t(wg::cpuCellRight(st.seconds));
+    CHECK_EQ(st.cpu.right, 296);
+    CHECK_EQ(wg::titleClipWidth(&st.cpu), 217);
+    auto dl = frame([&](Gfx& g) { wg::titleBar(g, O(), "Pattern 10", "5. Bass02", &st); });
+    CHECK(hasLine(dl, "SCISSOR_SIZE 217 27"));
+    // Glyphs: "CPU" then "45%", all inside x 236..296.
+    int glyphs = 0, minX = 9999, maxX = 0;
+    const int lo = 296 - wg::kCpuCellW;
+    for (const std::string& l : dl) {
+        unsigned x, y, h, c;
+        if (std::sscanf(l.c_str(), "VERTEX2II %u %u %u %u", &x, &y, &h, &c) == 4 && int(x) >= lo && int(x) < 296) {
+            ++glyphs;
+            minX = std::min(minX, int(x));
+            maxX = std::max(maxX, int(x) + textWidth(kFont4, std::string(1, char(c)).c_str()));
+        }
+    }
+    CHECK_EQ(glyphs, 6);
+    CHECK(minX >= lo);
+    CHECK_EQ(maxX, 296);
+    // Display-list words of the dynamic part (status group): <= 6 more.
+    auto statusWords = [&](const wg::TitleStatus& s) {
+        static RecordingDisplay d2;
+        Gfx g(d2);
+        g.beginFrame(0);
+        const uint32_t w0 = g.dlWords();
+        wg::titleBarStatus(g, O(), s);
+        g.endFrame();
+        return g.dlWords() - w0;
+    };
+    wg::TitleStatus none;
+    const uint32_t base = statusWords(none);
+    CHECK(statusWords(st) <= base + 6);
+    wg::TitleStatus ov = st;
+    ov.cpu = wg::cpuCell(0, true, 1000, true, false);
+    ov.cpu.right = st.cpu.right;
+    CHECK(statusWords(ov) <= base + 6);
+    // Overrun: "CPU!" in red.
+    auto dlo = frame([&](Gfx& g) { wg::titleBar(g, O(), "Pattern 10", nullptr, &ov); });
+    bool bang = false;
+    for (const std::string& l : dlo) bang |= l.find(" 33") != std::string::npos && l.rfind("VERTEX2II", 0) == 0;
+    CHECK(bang);
+    CHECK(hasLine(dlo, "COLOR " + [&] {
+        char b[8];
+        std::snprintf(b, sizeof b, "%06X", unsigned(O().slot(slot::kSolidRect)));
+        return std::string(b);
+    }()));
+    // The cached-chrome split draws the same pixels as titleBar().
+    auto split = frame([&](Gfx& g) {
+        wg::titleBarChrome(g, O(), "Pattern 10", "5. Bass02", true, &st.cpu);
+        wg::titleBarStatus(g, O(), st);
+    });
+    CHECK(hasLine(split, "SCISSOR_SIZE 217 27"));
+    d.customFonts = false;
+    applyFontSet(nullptr, 0);
 }

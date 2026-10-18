@@ -19,6 +19,7 @@ struct ProjectLoadInfo {
     bool upgraded = false;       // structure <= 16 (upgrade hook invoked if set)
     uint32_t storedCrc = 0;      // informational only; never checked (spec 02 §2)
     uint32_t computedCrc = 0;
+    uint8_t synthSlotsReset = 0; // bit s: slot record s failed the check and took the default
 };
 
 // Serialise exactly as fw 1.9.2 does (spec 02 §3.1 "Save").
@@ -33,8 +34,17 @@ void encodeProject(const Project& p, uint8_t out[mt::kFileSize]);
 FmtStatus decodeProject(const uint8_t* file, size_t len, Project& p, ProjectLoadInfo* info = nullptr,
                         uint8_t trackIndexLimit = 0);
 
-// Value sanitiser applied after load (spec 02 §3.3 "Validation on load").
-void sanitizeProject(Project& p, uint8_t trackIndexLimit = 0);
+// Value sanitiser applied after load (spec 02 §3.3 "Validation on load"),
+// followed by sanitizeSynthSlots (spec 21 §3.2: the Mini validates the slot
+// records on every load). Returns sanitizeSynthSlots' mask of reset slots.
+uint8_t sanitizeProject(Project& p, uint8_t trackIndexLimit = 0);
+
+// Tracker Mini synth-slot check (spec 21 §3.3): a slot record with any field
+// out of range is replaced as a whole by the slot default. bipolarMask[s]
+// (optional) gives the bipolar macros of slot s's loaded patch (bit m =
+// macro m+1), which default to 63 instead of 0. Returns a bit mask of the
+// slots that were reset (bit s = slot s).
+uint8_t sanitizeSynthSlots(Project& p, const uint8_t* bipolarMask = nullptr);
 
 // Override for the built-in spec 10 §1.2 upgrade chain (tests). Called
 // with the 0x800-byte block at file offset 0x010. nullptr = built-in chain.

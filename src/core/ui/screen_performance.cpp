@@ -81,10 +81,14 @@ void PerformanceScreen::start(int opt) {
     const uint8_t curPat = a.patternNumber();
     for (int t = 0; t < 8; ++t) {
         perf::setTrackPattern(a.project, t, curPat);
-        fxOn[t] = true;   // step 3
         keyHeld_[t] = keyUsed_[t] = false;
-        pending_[t] = 0;
         trackCcPending_[t] = false;
+    }
+    // Step 3: FX enabled on every track. 2.x tracks 9-16 take the FX too
+    // but have no pattern override (the Tracker Mini stores 1-8 only).
+    for (int t = 0; t < kTrackCount; ++t) {
+        fxOn[t] = true;
+        pending_[t] = 0;
     }
     lastPattern_ = curPat;
     edit = false;
@@ -177,7 +181,10 @@ void PerformanceScreen::edited() {
 // FX apply / revert (spec 12 §E)
 
 // Rebuild every track's performance state from the slots' current values and
-// push it to the engine and the sequencer. A slot with cur = 0 is reverted;
+// push it to the engine and the sequencer. 2.x: all 16 tracks; the voice FX
+// (audio::PerfOffsets) exist on the sample tracks 1-8 only, tracks 9-16 take
+// the sequencer side (Volume as velocity offset, Tune as transpose, step
+// repeater, play mode; 2x-01 §5). A slot with cur = 0 is reverted;
 // disabled tracks are reverted; a global FX (Pattern length) is applied once
 // (spec 12 §E.1). FX types are exclusive, so at most one slot per type is
 // normally active; if two are, the higher slot wins.
@@ -185,7 +192,7 @@ void PerformanceScreen::applyAll(bool revertEverything) {
     App& a = app_;
     Sequencer& q = a.seq;
     int globalLen = -1;
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < kTrackCount; ++t) {
         audio::PerfOffsets p;
         int8_t repeat = -1, velOff = 0, transpose = 0;
         bool transposeOn = false;
@@ -231,7 +238,7 @@ void PerformanceScreen::applyAll(bool revertEverything) {
                 default: break;
             }
         }
-        a.engine.setPerf(t, p);
+        if (t < kMidiTrackStart) a.engine.setPerf(t, p);
         q.setPerfRepeat(t, repeat);
         q.setPerfPlayMode(t, playMode);
         q.setPerfVelocityOffset(t, velOff);
@@ -291,15 +298,31 @@ void PerformanceScreen::padLeds(uint8_t* lv) {
 }
 
 uint8_t PerformanceScreen::shownPattern(int t) const {
-    return pending_[t] ? pending_[t] : perf::trackPattern(app_.project, t);
+    if (t < 0 || t >= kTrackCount) return 1;
+    return pending_[t] ? pending_[t] : trackPatternOf(t);
+}
+
+// Pattern the track plays: stock 0x142 for tracks 1-8; tracks 9-16 always
+// play the current pattern (no override on the Tracker Mini).
+uint8_t PerformanceScreen::trackPatternOf(int t) const {
+    App& a = app_;
+    if (t < kMidiTrackStart) return perf::trackPattern(a.project, t);
+    return a.patternNumber();
+}
+
+void PerformanceScreen::storeTrackPattern(int t, uint8_t num) {
+    App& a = app_;
+    if (t >= kMidiTrackStart) return;
+    perf::setTrackPattern(a.project, t, num);
+    a.markProjectDirty();
 }
 
 void PerformanceScreen::trackPatternNow(int t, int num) {
     // Track key + encoder / Up / Down: immediate switch (spec 12 §C.2).
     App& a = app_;
+    if (t >= kMidiTrackStart) return;
     num = clampi(num, 1, 255);
-    perf::setTrackPattern(a.project, t, uint8_t(num));
-    a.markProjectDirty();
+    storeTrackPattern(t, uint8_t(num));
     a.seq.setTrackPattern(t, uint8_t(num), true);
     pending_[t] = 0;
 }
@@ -308,9 +331,9 @@ void PerformanceScreen::trackPatternQueued(int t, int num) {
     // Track key release after Left/Right, CC 41-48: switch at that track's
     // loop end (spec 12 §C.2).
     App& a = app_;
+    if (t >= kMidiTrackStart) return;
     num = clampi(num, 1, 255);
-    perf::setTrackPattern(a.project, t, uint8_t(num));
-    a.markProjectDirty();
+    storeTrackPattern(t, uint8_t(num));
     a.seq.setTrackPattern(t, uint8_t(num), false);
 }
 
@@ -322,10 +345,11 @@ bool PerformanceScreen::anyTrackKey() const {
 
 void PerformanceScreen::onEncoder(int d) {
     if (anyTrackKey()) {
-        for (int t = 0; t < 8; ++t)
-            if (keyHeld_[t]) {
-                keyUsed_[t] = true;
-                trackPatternNow(t, perf::trackPattern(app_.project, t) + d);
+        for (int i = 0; i < 8; ++i)
+            if (keyHeld_[i]) {
+                const int t = bank * 8 + i;
+                keyUsed_[i] = true;
+                trackPatternNow(t, trackPatternOf(t) + d);
             }
         refreshBar();
         return;
@@ -389,20 +413,31 @@ void PerformanceScreen::swapColumn(int nc) {
 
 void PerformanceScreen::onButton(uint8_t id, uint8_t state) {
     App& a = app_;
+    if (id == btn::Performance) {
+        // 2.x: the Performance key toggles the track bank (2x-01 §5); held
+        // track keys are dropped (their queued patterns with them).
+        if (state != kPress) return;
+        bank ^= 1;
+        for (int i = 0; i < 8; ++i) keyHeld_[i] = keyUsed_[i] = false;
+        for (auto& p : pending_) p = 0;
+        refreshBar();
+        ui_.dirty();
+        return;
+    }
     if (btn::isFKey(id)) {
-        const int t = id;
+        const int k = id, t = bank * 8 + k;
         if (state == kPress) {
-            if (ui_.shift()) a.setTrackMute(t, !a.trackMuted(t));
+            if (ui_.shift()) trk::setMuted(a, t, !trk::muted(a, t));
             else {
-                keyHeld_[t] = true;
-                keyUsed_[t] = false;
+                keyHeld_[k] = true;
+                keyUsed_[k] = false;
             }
-        } else if (state == kRelease && keyHeld_[t]) {
-            keyHeld_[t] = false;
+        } else if (state == kRelease && keyHeld_[k]) {
+            keyHeld_[k] = false;
             if (pending_[t]) {
                 trackPatternQueued(t, pending_[t]);
                 pending_[t] = 0;
-            } else if (!keyUsed_[t]) {
+            } else if (!keyUsed_[k]) {
                 fxOn[t] = !fxOn[t];
                 applyAll(false);   // enable = apply the active slots, disable = revert
             }
@@ -425,10 +460,11 @@ void PerformanceScreen::onButton(uint8_t id, uint8_t state) {
                 if (ui_.shift() && nc != column) swapColumn(nc);
                 column = nc;
             } else {
-                for (int t = 0; t < 8; ++t)
-                    if (keyHeld_[t]) {
-                        keyUsed_[t] = true;
-                        pending_[t] = uint8_t(clampi(shownPattern(t) + d, 1, 255));
+                for (int i = 0; i < 8; ++i)
+                    if (keyHeld_[i]) {
+                        const int t = bank * 8 + i;
+                        keyUsed_[i] = true;
+                        if (t < kMidiTrackStart) pending_[t] = uint8_t(clampi(shownPattern(t) + d, 1, 255));
                     }
             }
             break;
@@ -437,10 +473,11 @@ void PerformanceScreen::onButton(uint8_t id, uint8_t state) {
         case btn::Down: {
             const int d = id == btn::Up ? 1 : -1;
             if (anyTrackKey()) {
-                for (int t = 0; t < 8; ++t)
-                    if (keyHeld_[t]) {
-                        keyUsed_[t] = true;
-                        trackPatternNow(t, perf::trackPattern(a.project, t) + d);
+                for (int i = 0; i < 8; ++i)
+                    if (keyHeld_[i]) {
+                        const int t = bank * 8 + i;
+                        keyUsed_[i] = true;
+                        trackPatternNow(t, trackPatternOf(t) + d);
                     }
             } else if (edit) {
                 changeType(d);
@@ -477,13 +514,13 @@ void PerformanceScreen::play() {
             // SPEC GAP: "continue in song/pattern mode at the next sync
             // point" -- every track is queued back to the current pattern, so
             // each switches at its own loop end.
-            for (int t = 0; t < 8; ++t) trackPatternQueued(t, curPat);
+            for (int t = 0; t < kTrackCount; ++t) trackPatternQueued(t, curPat);
         }
         return;
     }
     if (ui_.shift()) {
-        for (int t = 0; t < 8; ++t) {
-            perf::setTrackPattern(a.project, t, curPat);
+        for (int t = 0; t < kTrackCount; ++t) {
+            if (t < kMidiTrackStart) perf::setTrackPattern(a.project, t, curPat);
             pending_[t] = 0;
         }
         a.seq.clearTrackPatterns();
@@ -562,25 +599,29 @@ void PerformanceScreen::refreshBar() {
     BottomBar& b = ui_.bar;
     App& a = app_;
     b.clear();
-    for (int t = 0; t < 8; ++t) {
+    for (int i = 0; i < 8; ++i) {
+        const int t = bank * 8 + i;
+        const bool m = trk::muted(a, t);
         char nm[24], v[24];
-        a.project.trackName(t, nm, sizeof(nm));
-        if (ui_.shift()) std::snprintf(v, sizeof(v), "%s", a.trackMuted(t) ? "Unmute" : "Mute");
+        trk::name(a, t, nm, sizeof(nm));
+        if (ui_.shift()) std::snprintf(v, sizeof(v), "%s", m ? "Unmute" : "Mute");
         else std::snprintf(v, sizeof(v), a.cfg.numbering == 2 ? "Patt: %02X" : "Patt: %d", shownPattern(t));
         // 1.9.2 manual: a highlighted label = FX applied to the track; the
         // text colour shows the mute state (spec 06 §3.3).
-        b.set(t, nm, v, !a.trackMuted(t));
-        b.highlight(t, fxOn[t]);
+        b.set(i, nm, v, !m);
+        b.highlight(i, fxOn[t]);
         // Drawn by draw(): the stock bar shows no focus frames here
         // [S snap 021], so "FX on" is the plain stock look and "FX off"
         // greys the title only [I].
-        b.label[t].hidden = true;
+        b.label[i].hidden = true;
     }
 }
 
 void PerformanceScreen::draw(Gfx& g) {
     const Theme& th = ui_.th();
-    ui_.drawTitle(g, "Performance FX", edit ? "EDIT" : nullptr);
+    // 2.x bank B: right-hand text "Tracks 9-16" (M1 plan spec gap 5).
+    const char* right = bank ? (edit ? "EDIT  Tracks 9-16" : "Tracks 9-16") : (edit ? "EDIT" : nullptr);
+    ui_.drawTitle(g, "Performance FX", right);
     if (!src.valid()) return;
     // spec 20 §4.10 / VISUAL_DIFF §8.10: 12 FX panels (class 0x0b) 63 px
     // wide at x 11 + 65 i: a title band y 34..69 with the current (or live

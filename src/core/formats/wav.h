@@ -72,7 +72,8 @@ bool wavParseHeader(const uint8_t* file, size_t len, WavInfo& info);
 
 // Accepted formats (spec 02 §8.1): WAVE, 1-2 channels, PCM 8/16/24/32 or float 32; any rate.
 bool wavIsSupported(const WavInfo& info);
-// Fast path: PCM 16-bit mono 44.1 kHz (copied verbatim).
+// Fast path: PCM 16-bit mono 44.1 kHz (copied verbatim). The importer also
+// skips the resampler for every other 44.1 kHz format (see WavImporter).
 bool wavIsFastPath(const WavInfo& info);
 uint32_t wavBytesPerFrame(const WavInfo& info);
 uint32_t wavSourceFrames(const WavInfo& info);
@@ -83,28 +84,36 @@ int16_t wavDecodeSample(const uint8_t* p, uint16_t format, uint16_t bits);
 
 // Streaming 4-point cubic resampler to 44.1 kHz (spec 02 §8.1). Source
 // samples outside [0, srcFrames) read as zero. Writes outputFrames() samples
-// to dst over the life of one conversion.
+// to dst over the life of one conversion. The position arithmetic is single
+// precision exactly as spec 07 Q8 states (t = i * ratio, n = floor(t),
+// mu = t - n); the ratio is computed once per conversion and the next output's
+// source position is cached, so a pushed sample costs one integer compare
+// unless an output becomes ready.
 class CubicResampler {
 public:
     void begin(uint32_t srcRate, uint32_t srcFrames, int16_t* dst);
-    void push(int16_t s);
+    void push(int16_t s) { pushBlock(&s, 1); }
+    void pushBlock(const int16_t* s, uint32_t n);
     // Treat all remaining source samples as zero and emit the rest.
     void finish();
     uint32_t outputFrames() const { return uint32_t(outTotal_); }
     uint32_t produced() const { return uint32_t(outNext_); }
 
 private:
-    bool ready(uint64_t i) const;
-    void emit();
+    void locate();      // n / mu / readiness threshold of output outNext_
+    void emitOne();
     int32_t src(int64_t j) const;
 
     int16_t hist_[4] = {};
     uint32_t srcRate_ = 44100;
+    float ratio_ = 1.0f;
     uint64_t srcFrames_ = 0;
     uint64_t received_ = 0;
     uint64_t outNext_ = 0;
     uint64_t outTotal_ = 0;
-    bool ended_ = false;
+    int64_t curN_ = 0;          // floor(t) of output outNext_
+    float curMu_ = 0.0f;        // t - floor(t)
+    uint64_t curNeed_ = 0;      // source samples needed (received_ > curNeed_)
     int16_t* dst_ = nullptr;
 };
 
@@ -124,25 +133,39 @@ WavImportPlan wavPlanImport(const WavInfo& info, const WavImportOptions& opt);
 
 // Streaming importer: feed the data-chunk bytes in order (any chunking).
 // Output is planar int16: outFrames left samples, then (stereo) outFrames
-// right samples.
+// right samples. A 44.1 kHz source is decoded straight into the output (the
+// resampler at ratio 1 returns each source sample unchanged: t = i exactly
+// for i < 2^24, mu = 0), other rates go through CubicResampler in blocks.
 class WavImporter {
 public:
     FmtStatus begin(const WavInfo& info, const WavImportOptions& opt, int16_t* out, size_t outCapSamples);
     void feed(const uint8_t* bytes, size_t n);
+    // Direct-read fast path (16-bit PCM mono 44.1 kHz on a little-endian
+    // CPU): the next data bytes may be read straight into the returned output
+    // position (up to maxBytes), then reported with directCommit(). Null when
+    // the bytes must go through feed().
+    uint8_t* directBuffer(uint32_t& maxBytes);
+    void directCommit(uint32_t bytes);
+    // Every source frame of the plan has been received.
+    bool complete() const { return frameIdx_ >= uint64_t(plan_.srcStart) + plan_.srcFrames; }
     // Returns frames per channel written.
     uint32_t finish();
     const WavImportPlan& plan() const { return plan_; }
 
 private:
-    void frame(const uint8_t* f);
+    void frames(const uint8_t* f, uint64_t count);
 
     WavInfo info_;
     WavImportPlan plan_;
     CubicResampler rs_[2];
+    int16_t* out_[2] = {};
     uint8_t carry_[8] = {};
     uint32_t carryLen_ = 0;
     uint32_t bpf_ = 0;
     uint64_t frameIdx_ = 0;
+    uint32_t written_ = 0;     // direct path: output frames filled so far
+    bool direct_ = false;      // 44.1 kHz: decode without the resampler
+    bool directRead_ = false;  // ... and the raw bytes are the output samples
 };
 
 struct WavImportResult {

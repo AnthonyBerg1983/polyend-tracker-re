@@ -325,9 +325,10 @@ TEST(open_legacy_project_converts_instruments) {
     CHECK(a.instruments[0].lengthFrames == 1000);
     CHECK(std::strcmp(a.instruments[0].name, "kick") == 0);   // ".wav" stripped
     CHECK(a.bank.left(0)[0] == 100 && a.bank.left(0)[999] == 1099);
-    // Pattern upgraded on load, file kept raw (8 tracks).
+    // Pattern upgraded on load; the Workspace copy is a Tracker Mini 16-track
+    // file (2.x, docs/MINI_PLAN.md §1).
     CHECK(a.pattern().tracks[0].steps[0].note == 48);
-    CHECK(h.fs.files["Workspace/patterns/pattern_01.mtp"].size() == mtp::kLegacyFileSize);
+    CHECK(h.fs.files["Workspace/patterns/pattern_01.mtp"].size() == mtp::kMiniFileSize);
     CHECK(h.fs.files.count("Workspace/patterns/patternsMetadata"));
     // Save in place: 1.9.2 layout; legacy .mti removed, samples/ kept (README deviation).
     CHECK(canDirectSave(a));
@@ -336,7 +337,7 @@ TEST(open_legacy_project_converts_instruments) {
     CHECK(!h.fs.files.count("Projects/old/instruments/instrument_01.mti"));
     CHECK(h.fs.files.count("Projects/old/samples/instr01.wav"));
     CHECK(h.fs.files["Projects/old/project.mt"].size() == mt::kFileSize);
-    CHECK(h.fs.files["Projects/old/patterns/pattern_01.mtp"].size() == mtp::kLegacyFileSize);
+    CHECK(h.fs.files["Projects/old/patterns/pattern_01.mtp"].size() == mtp::kMiniFileSize);
     // Reopen: now through the .pti path.
     a.newProject();
     CHECK(a.openProject(kProjectsDir, "old"));

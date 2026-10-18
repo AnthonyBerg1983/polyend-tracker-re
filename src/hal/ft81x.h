@@ -41,10 +41,22 @@ public:
     void text(int16_t x, int16_t y, uint8_t font, uint16_t options, const char* s) override;
     void number(int16_t x, int16_t y, uint8_t font, uint16_t options, int32_t n) override;
     void swap() override;
-    // Non-blocking swap: FIFO consumed and REG_DLSWAP == 0. A display
-    // that stays busy for kBusyGiveUpMs reports ready so dlStart()'s bounded
-    // wait runs the spec 01 §4.3 fault recovery.
+    // Non-blocking swap (2.x M0 / 1.9.5): FIFO consumed and REG_DLSWAP == 0.
+    // A display that stays busy for kBusyGiveUpMs reports ready so
+    // dlStart()'s bounded wait runs the spec 01 §4.3 fault recovery.
     bool frameReady() override;
+    // Cached fragments (spec 05 §3.3 scheme, see hal_api.h): captured with
+    // REG_CMD_DL before/after + CMD_MEMCPY(RAM_DL -> RAM_G), drawn with
+    // CMD_APPEND. A fragment holds at most kFragSlotBytes.
+    bool fragmentsSupported() const override { return ok_; }
+    void fragmentBegin(uint8_t slot) override;
+    bool fragmentEnd(uint8_t slot) override;
+    void fragmentAppend(uint8_t slot) override;
+    uint32_t fragmentWords(uint8_t slot) const override;
+    // SPI2 TX DMA for the command FIFO uploads (build flag OT_FT81X_DMA,
+    // default on; turned off for good after a DMA timeout). Diagnostics.
+    static bool dmaActive();
+    static uint32_t dmaFaults();
     // Visual-parity primitives: CMD_GRADIENT, VERTEX_TRANSLATE_X (0x2B),
     // SAVE_CONTEXT (0x22) / RESTORE_CONTEXT (0x23), BITMAP_TRANSFORM_A..F
     // (0x15..0x1A), BITMAP_HANDLE + BITMAP_SIZE.
@@ -78,14 +90,15 @@ public:
     bool writeRamG(uint32_t ramgAddr, const void* src, uint32_t len) override;
     void drawRgb332(int16_t x, int16_t y, uint32_t ramgAddr, uint16_t w, uint16_t h, uint8_t scale) override;
 
-    // RAM_G map (1 MiB, 0x000000..0x0FFFFF). The UI keeps no cached display
-    // lists, so these are the only users:
+    // RAM_G map (1 MiB, 0x000000..0x0FFFFF):
     //   0x000000 .. 0x05DBFF  snapshot band (readPixels), 800 x 240 RGB565 = 384,000 B
     //   0x05DC00 .. 0x06CBFF  Games frame (IDisplay::kRamGGameFrame = 384,000):
     //                         256 x 240 RGB332 = 61,440 B (spec 14 §3.1)
-    //   0x06CC00 .. +kBlobSize custom UI fonts, both sets + icon sheet
-    //                         (fontdata::kRamGBase, uploaded once by init())
-    //   .. 0x0A392F           free
+    //   0x06CC00 .. 0x08C4DF  custom UI fonts, both sets + icon sheet
+    //                         (fontdata::kRamGBase + kBlobSize, uploaded once by init())
+    //   0x08C800 .. 0x09C7FF  cached display-list fragments: 16 slots x 4 KB
+    //                         (kFragRamG, IDisplay::kFragmentSlots, spec 05 §3.3)
+    //   0x09C800 .. 0x0A392F  free
     //   0x0A3930 .. 0x0F1A2F  image (IDisplay::kRamGCover = 670,000): RGB565,
     //                         <= 400 x 400 x 2 = 320,000 B for the cover
     //   0x0F1A30 .. 0x0FFFFF  free (images may extend up to kRamGSize)
@@ -114,13 +127,24 @@ public:
     static_assert(IDisplay::kFontHandleBase + IDisplay::kFontHandleCount <= IDisplay::kIconHandle &&
                       IDisplay::kFontHandleBase > kGameHandle && IDisplay::kIconHandle < 15,
                   "font handles collide with the image / Games / scratch handles");
+    // Fragments after the font image (1 KB aligned), before the cover image.
+    static constexpr uint32_t kFragRamG = (fontdata::kRamGEnd + 0x3FFu) & ~0x3FFu;
+    static constexpr uint32_t kFragSlotBytes = 4096;
+    static constexpr uint32_t kFragRamGEnd = kFragRamG + kFragSlotBytes * IDisplay::kFragmentSlots;
+    static_assert(kFragRamG == 0x08C800 && kFragRamGEnd == 0x09C800, "RAM_G map comment");
+    static_assert(kFragRamG >= fontdata::kRamGEnd, "fragment slots overlap the font image");
+    static_assert(kFragRamG >= IDisplay::kRamGGameFrame + IDisplay::kGameFrameBytes && kFragRamG >= kImageRamGMin,
+                  "fragment slots overlap the Games frame / snapshot band");
+    static_assert(kFragRamG % 4 == 0 && kFragRamGEnd <= IDisplay::kRamGCover,
+                  "fragment slots must end before the cover image");
 
     // Last frame's upload statistics (telemetry, docs/HARDWARE_TESTING.md):
     // bytes on the SPI wire for the command FIFO (data + the REG_CMD_READ /
     // REG_CMD_WRITE traffic per chunk), time spent in flush() in us (SPI
-    // transfer plus any wait for FIFO space), chunks that had to wait for
-    // FIFO space, REG_CMD_READ polls of the dlStart() wait (1 = the frame
-    // started without waiting), and the cumulative coprocessor resets.
+    // transfer, or starting the DMA, plus any wait for FIFO space), chunks
+    // that had to wait for FIFO space, REG_CMD_READ polls of the dlStart()
+    // wait (1 = the frame started without waiting), and the cumulative
+    // coprocessor resets.
     uint32_t lastFrameBytes() const { return lastFrameBytes_; }
     uint32_t lastUploadUs() const { return lastUploadUs_; }
     uint32_t lastFifoWaits() const { return lastFifoWaits_; }
@@ -159,9 +183,18 @@ private:
     bool uploadFonts();
     void fontSetup();
 
-    static constexpr uint32_t kStage = 1024;          // spec 01 §4.3: uploads chunked <= 1000 B
-    uint8_t stage_[kStage] = {};
+    bool waitCoproc();                 // REG_CMD_READ == wp_ (bounded), no DLSWAP condition
+    void invalidateFragments();
+
+    // Staging: two halves of a DMA buffer in the .dma section (ft81x.cpp):
+    // one is sent by the SPI2 TX DMA while the next commands fill the other.
+    static constexpr uint32_t kStage = 512;           // spec 01 §4.3: uploads chunked <= 1000 B
+    uint8_t* stage_ = nullptr;
+    uint8_t stageHalf_ = 0;
     uint32_t staged_ = 0;
+    int8_t capSlot_ = -1;              // fragment being captured
+    uint16_t capStart_ = 0;            // REG_CMD_DL at fragmentBegin
+    uint16_t fragBytes_[IDisplay::kFragmentSlots] = {};
     uint32_t busySince_ = 0;           // frameReady() false since (ms), 0 = ready
     uint32_t frameBytes_ = 0, uploadUs_ = 0, fifoWaits_ = 0, waitPolls_ = 0;   // current frame
     uint32_t lastFrameBytes_ = 0, lastUploadUs_ = 0, lastFifoWaits_ = 0, lastWaitPolls_ = 0;

@@ -22,6 +22,14 @@ class FakeStorage : public ot::IStorage {
 public:
     std::map<std::string, std::vector<uint8_t>> files;
     std::set<std::string> dirs;
+    // USB Storage mode (FakeUsbStorage): the computer owns the card; every
+    // access is refused and counted (the app must not make any).
+    bool locked = false;
+    int lockedAccess = 0;
+    bool refuse() {
+        if (locked) ++lockedAccess;
+        return locked;
+    }
 
     static std::string parent(const std::string& p) {
         size_t s = p.rfind('/');
@@ -32,6 +40,7 @@ public:
         return par.empty() || dirs.count(par);
     }
     Handle open(const char* path, OpenMode mode) override {
+        if (refuse()) return -1;
         std::string p(path);
         auto it = files.find(p);
         if (mode == kRead && it == files.end()) return -1;
@@ -42,7 +51,13 @@ public:
         open_[h] = {p, 0};
         return h;
     }
+    // Simulated SD latency (opt-in): every read advances this millisecond
+    // clock by readLatencyMs, so background jobs span many main-loop passes.
+    uint32_t* readLatencyClockMs = nullptr;
+    uint32_t readLatencyMs = 1;
     int32_t read(Handle h, void* dst, uint32_t len) override {
+        if (refuse()) return -1;
+        if (readLatencyClockMs) *readLatencyClockMs += readLatencyMs;
         auto o = open_.find(h);
         if (o == open_.end()) return -1;
         auto& f = files[o->second.path];
@@ -53,6 +68,7 @@ public:
         return int32_t(n);
     }
     int32_t write(Handle h, const void* src, uint32_t len) override {
+        if (refuse()) return -1;
         auto o = open_.find(h);
         if (o == open_.end()) return -1;
         auto& f = files[o->second.path];
@@ -62,24 +78,31 @@ public:
         return int32_t(len);
     }
     bool seek(Handle h, uint32_t pos) override {
+        if (refuse()) return false;
         auto o = open_.find(h);
         if (o == open_.end()) return false;
         o->second.pos = pos;
         return true;
     }
     int32_t size(Handle h) override {
+        if (refuse()) return -1;
         auto o = open_.find(h);
         return o == open_.end() ? -1 : int32_t(files[o->second.path].size());
     }
-    void close(Handle h) override { open_.erase(h); }
-    bool exists(const char* path) override { return files.count(path) || dirs.count(path); }
+    void close(Handle h) override {
+        refuse();
+        open_.erase(h);
+    }
+    bool exists(const char* path) override { return !refuse() && (files.count(path) || dirs.count(path)); }
     bool mkdir(const char* path) override {
+        if (refuse()) return false;
         if (files.count(path)) return false;
         if (!parentOk(path)) return false;
         dirs.insert(path);
         return true;
     }
     bool remove(const char* path) override {
+        if (refuse()) return false;
         if (files.erase(path)) return true;
         std::string p(path);
         if (!dirs.count(p)) return false;
@@ -92,6 +115,7 @@ public:
         return true;
     }
     bool rename(const char* from, const char* to) override {
+        if (refuse()) return false;
         auto it = files.find(from);
         if (it == files.end()) return false;
         files[to] = it->second;
@@ -99,6 +123,7 @@ public:
         return true;
     }
     int32_t listDir(const char* path, DirFn fn, void* ctx) override {
+        if (refuse()) return -1;
         std::string p(path);
         if (!p.empty() && !dirs.count(p)) return -1;
         std::string pre = p.empty() ? "" : p + "/";
@@ -127,6 +152,33 @@ private:
     Handle next_ = 1;
 };
 
+// USB Storage mode stand-in (IUsbStorage): begin() locks the fake card the
+// way the device unmounts it, end() unlocks it; the host state is set by tests.
+class FakeUsbStorage : public ot::IUsbStorage {
+public:
+    explicit FakeUsbStorage(FakeStorage* fs) : fs_(fs) {}
+    bool failBegin = false;
+    int begins = 0, ends = 0, services = 0;
+    Host hostState = Host::kWaiting;
+    bool begin() override {
+        if (failBegin) return false;
+        ++begins;
+        fs_->locked = true;
+        return true;
+    }
+    bool end() override {
+        ++ends;
+        fs_->locked = false;
+        return true;
+    }
+    Host host() const override { return hostState; }
+    void service() override { ++services; }
+    bool active() const { return fs_->locked; }
+
+private:
+    FakeStorage* fs_;
+};
+
 // Records every display-list call of the last completed frame as text.
 class RecordingDisplay : public ot::IDisplay {
 public:
@@ -134,7 +186,15 @@ public:
     int swaps = 0;
     uint16_t width() const override { return 800; }
     uint16_t height() const override { return 480; }
-    void dlStart() override { cur.clear(); }
+    void dlStart() override {
+        if (busy.on) {
+            // Ft81xDisplay::dlStart flushes (an SPI access: commits a lazy
+            // tail) and blocks until the previous swap took effect.
+            busyAccess();
+            if (busy.pending) presentPending();
+        }
+        cur.clear();
+    }
     void clearColorRGB(uint8_t r, uint8_t g, uint8_t b) override { add("CLEAR_COLOR %02X%02X%02X", r, g, b); }
     void clear(bool, bool, bool) override { add("CLEAR"); }
     void colorRGB(uint8_t r, uint8_t g, uint8_t b) override { add("COLOR %02X%02X%02X", r, g, b); }
@@ -156,6 +216,61 @@ public:
     void swap() override {
         last = cur;
         ++swaps;
+        if (busy.on) {
+            busy.frame = cur;
+            busy.pending = true;
+            busy.committed = !busy.lazyCommit;
+            busy.commitUs = nowUs() + uploadUs(cur);
+        }
+    }
+    // Realistic busy panel (opt-in, busy.on; time from busy.clockMs): a
+    // swapped frame is uploaded over SPI2 (DMA, ~16 B per recorded command
+    // at 30 MHz), then shown at the next 54 Hz vsync (REG_DLSWAP clears);
+    // frameReady() is false until then. `shown` is what the panel shows.
+    // lazyCommit models the 2.0.0 driver: the frame's last DMA segment and
+    // its REG_CMD_WRITE are only committed by the next display access, so
+    // a frame nobody follows up on is never shown.
+    struct Busy {
+        bool on = false, lazyCommit = false;
+        const uint32_t* clockMs = nullptr;
+        bool pending = false, committed = false;
+        uint64_t commitUs = 0;
+        std::vector<std::string> frame;
+        uint32_t polls = 0, shownFrames = 0;
+    } busy;
+    static constexpr uint64_t kVsyncUs = 18480;   // ft81xFrameMilliHz: 54.112 Hz
+    std::vector<std::string> shown;
+    bool frameReady() override {
+        if (!busy.on) return true;
+        ++busy.polls;
+        busyAccess();
+        busyTick();
+        return !busy.pending;
+    }
+    const std::vector<std::string>& visible() {
+        busyTick();
+        return shown;
+    }
+    bool visibleHasText(const char* s) {
+        for (auto& l : visible())
+            if (l.compare(0, 5, "TEXT ") == 0 && l.find(s) != std::string::npos) return true;
+        return false;
+    }
+    uint64_t nowUs() const { return busy.clockMs ? uint64_t(*busy.clockMs) * 1000u : 0; }
+    static uint64_t uploadUs(const std::vector<std::string>& f) { return uint64_t(f.size()) * 16u * 8u / 30u; }
+    void busyAccess() {
+        if (busy.pending && !busy.committed) {
+            busy.committed = true;
+            busy.commitUs = nowUs() + uploadUs(busy.frame);
+        }
+    }
+    void busyTick() {
+        if (busy.pending && busy.committed && nowUs() >= (busy.commitUs / kVsyncUs + 1) * kVsyncUs) presentPending();
+    }
+    void presentPending() {
+        shown = busy.frame;
+        busy.pending = false;
+        ++busy.shownFrames;
     }
     // Last IDisplay::setBacklight() level (-1 = never set) and the call count.
     int backlight = -1;
@@ -327,6 +442,7 @@ public:
 // Whole-app harness.
 struct Harness {
     FakeStorage fs;
+    FakeUsbStorage usb{&fs};
     RecordingDisplay disp;
     ScriptInput input;
     FakeLeds leds;
@@ -334,7 +450,10 @@ struct Harness {
     FakeMidi midi;
     FakeAudio audio;
     std::vector<int16_t> bank, fx;
-    std::vector<ot::Pattern> pats, undo, fundo;
+    std::vector<ot::PatternStock> pats;
+    std::vector<ot::Pattern> undo, fundo, seqBufs;
+    std::vector<ot::Track> extTracks;
+    std::vector<uint8_t> extMeta;
     ot::Pattern clip;
     std::vector<uint8_t> nums, scratch;
     std::unique_ptr<ot::App> app;
@@ -346,9 +465,15 @@ struct Harness {
     uint64_t lineBlocks = 0;
 
     explicit Harness(bool bootNow = true, uint32_t bankSamples = 4 * 1024 * 1024) {
+        // ROM-font runs as whole CMD_TEXT strings (the checks read them);
+        // display_budget_test / gfx_api_test turn the VERTEX2II path on.
+        ot::setRomTextMode(ot::kRomWholeText);
         bank.resize(bankSamples);
         fx.resize(ot::audio::AudioEngine::kFxMemorySamples);
         pats.resize(ot::kPatternCount);
+        seqBufs.resize(3);   // current, preload, switch stage
+        extTracks.resize(ot::ExtTrackPool::kDefaultBlocks + 1);
+        extMeta.resize(ot::ExtTrackPool::metaBytes(ot::ExtTrackPool::kDefaultBlocks));
         undo.resize(20);
         fundo.resize(10);
         nums.resize(64);
@@ -362,6 +487,7 @@ struct Harness {
         h.input = &input;
         h.leds = &leds;
         h.clock = &clock;
+        h.usbStorage = &usb;
         h.isUpdateImageName = [](const char* n) { return std::strlen(n) >= 15 && std::strstr(n, ".ptf") != nullptr; };
         h.requestFirmwareUpdate = [](ot::IStorage&, const char* n) {
             fwRequested = n;
@@ -380,6 +506,11 @@ struct Harness {
         m.fxMemory = fx.data();
         m.fxSamples = uint32_t(fx.size());
         m.patterns = pats.data();
+        m.seqBuffers = seqBufs.data();
+        m.seqStage = seqBufs.data() + 2;
+        m.extTracks = extTracks.data();
+        m.extTrackBlocks = int(extTracks.size());
+        m.extMeta = extMeta.data();
         m.undo = undo.data();
         m.undoNums = nums.data();
         m.undoSlots = 20;

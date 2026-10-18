@@ -102,6 +102,8 @@ void setLength(Pattern& p, int len) {
 }
 
 uint8_t mapInstrument(int track, int instr) {
+    // 2.x synth slots 64..66 play on any of the 16 tracks (Tracker Mini).
+    if (instr >= 0 && isSynthInstrument(uint8_t(instr))) return uint8_t(instr);
     if (isMidiTrack(track)) return (instr >= kFirstMidiInstrument && instr < kInstrumentCount) ? uint8_t(instr) : 48;
     return (instr >= 0 && instr < kInstrumentCount) ? uint8_t(instr) : 0;
 }
@@ -147,7 +149,7 @@ void paste(Pattern& dst, const Pattern& clip, const SelRect& src, int dstStep, i
     }
     for (int ti = 0; ti <= src.t1 - src.t0; ++ti) {
         const int dt = dstTrack + ti;
-        if (dt >= kTrackCount) break;
+        if (dt >= kTrackCount) break;   // 2.x: 16 tracks (2x-01 §2.5)
         const int dlen = dst.tracks[dt].length();
         for (int si = 0; si <= src.s1 - src.s0; ++si) {
             const int ds = dstStep + si;
@@ -228,8 +230,9 @@ void writeInstrument(Pattern& p, const SelRect& r, uint8_t instr) {
             Step& st = p.tracks[t].steps[s];
             const uint8_t v = mapInstrument(t, instr);
             if (r.single()) {
-                if (st.note == kNoteEmpty && isSampleInstrument(v)) st.note = 60;
-                if (st.note < kNoteEmpty && isSampleInstrument(v)) continue;   // specials keep theirs
+                const bool plays = isSampleInstrument(v) || isSynthInstrument(v);
+                if (st.note == kNoteEmpty && plays) st.note = 60;
+                if (st.note < kNoteEmpty && plays) continue;   // specials keep theirs
                 st.instrument = v;
             } else if (st.note >= 0) {
                 st.instrument = v;
@@ -288,7 +291,7 @@ void stepInstrument(Pattern& p, const SelRect& r, int delta) {
             if (!r.single() && st.note < 0) continue;
             const int lo = isMidiTrack(t) ? kFirstMidiInstrument : 0;
             int v = mapInstrument(t, st.instrument) + delta;
-            st.instrument = uint8_t(clampi(v, lo, kInstrumentCount - 1));
+            st.instrument = uint8_t(clampi(v, lo, kFirstSynthInstrument + kSynthSlotCount - 1));   // + S1..S3
             if (r.single() && st.note == kNoteEmpty) st.note = 60;
         }
 }

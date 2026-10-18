@@ -17,7 +17,37 @@ void SwDisplay::warnOnce(int key, const char* msg, int v) {
     std::fprintf(stderr, "sim display: %s (%d) -- ignored (logged once)\n", msg, v);
 }
 
+uint64_t SwDisplay::busyNowUs() const {
+    const uint32_t us = busyClock_->micros();
+    lastUs_ += uint32_t(us - uint32_t(lastUs_));
+    return lastUs_;
+}
+
+void SwDisplay::busyTickLocked() const {
+    constexpr uint64_t kVsyncUs = 18480;   // ft81xFrameMilliHz: 54.112 Hz
+    if (!pending_ || busyNowUs() < (pendingAtUs_ / kVsyncUs + 1) * kVsyncUs) return;
+    front_.swap(pendingFrame_);
+    pending_ = false;
+}
+
+bool SwDisplay::frameReady() {
+    if (!busyClock_) return true;
+    std::lock_guard<std::mutex> lk(frontMu_);
+    busyTickLocked();
+    return !pending_;
+}
+
 void SwDisplay::dlStart() {
+    if (busyClock_) {
+        // Ft81xDisplay::dlStart blocks until the previous swap took effect.
+        std::lock_guard<std::mutex> lk(frontMu_);
+        if (pending_) {
+            front_.swap(pendingFrame_);
+            pending_ = false;
+        }
+    }
+    dl_ = appends_ = 0;
+    recSlot_ = -1;
     // Fresh display list: default graphics context (FT81x reset values).
     clearRgb_ = 0;
     rgb_ = 0xFFFFFF;
@@ -35,7 +65,12 @@ void SwDisplay::dlStart() {
     back_.resetClip();
     back_.clearRect(0);
     applyColor();
-    if (fontsBound_) setupFontHandles();   // as the FT81x driver after CMD_DLSTART
+    if (fontsBound_) {
+        setupFontHandles();   // as the FT81x driver after CMD_DLSTART
+        // Its RAM_DL words: BITMAP_HANDLE/SOURCE/LAYOUT_H/LAYOUT/SIZE_H/SIZE
+        // per font handle and for the icon handle (CMD_SETFONT adds none).
+        dl_ += kFontSetupDlWords;
+    }
 }
 
 namespace {
@@ -47,7 +82,7 @@ uint32_t rd32(const std::vector<uint8_t>& m, uint32_t a) {
 bool SwDisplay::bindFontSet(int set) {
     if (!fontsUploaded_) fontsUploaded_ = writeRamG(ot::fontdata::kRamGBase, ot::fontdata::kBlob, ot::fontdata::kBlobSize);
     fontSet_ = set == 1 ? 1 : 0;
-    fontsBound_ = fontsUploaded_;
+    fontsBound_ = fontsUploaded_ && !romOnly_;
     return fontsBound_;
 }
 
@@ -77,11 +112,13 @@ void SwDisplay::setupFontHandles() {
 }
 
 void SwDisplay::bitmapTransform(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f) {
+    rec(21, a, b, c, d, e, f);
     xform_[0] = a; xform_[1] = b; xform_[2] = c;
     xform_[3] = d; xform_[4] = e; xform_[5] = f;
 }
 
 void SwDisplay::bitmapSize(uint8_t handle, uint16_t w, uint16_t h) {
+    rec(22, handle, w, h);
     if (handle >= 16 || !handles_[handle].valid) {
         warnOnce(9, "bitmapSize on a handle without a bitmap", handle);
         return;
@@ -103,45 +140,53 @@ void SwDisplay::applyClip() {
 }
 void SwDisplay::applyColor() { back_.setColor(rgb_, a_); }
 
-void SwDisplay::clearColorRGB(uint8_t r, uint8_t g, uint8_t b) { clearRgb_ = (uint32_t(r) << 16) | (g << 8) | b; }
+void SwDisplay::clearColorRGB(uint8_t r, uint8_t g, uint8_t b) { rec(1, r, g, b); clearRgb_ = (uint32_t(r) << 16) | (g << 8) | b; }
 
-void SwDisplay::clear(bool color, bool, bool) {
+void SwDisplay::clear(bool color, bool s, bool t) {
+    rec(2, color, s, t);
     if (!color) return;
     applyClip();
     back_.clearRect(clearRgb_);
 }
 
 void SwDisplay::colorRGB(uint8_t r, uint8_t g, uint8_t b) {
+    rec(3, r, g, b);
     rgb_ = (uint32_t(r) << 16) | (g << 8) | b;
     applyColor();
 }
 void SwDisplay::colorA(uint8_t a) {
+    rec(4, a);
     a_ = a;
     applyColor();
 }
-void SwDisplay::lineWidth(uint16_t w) { lineW_ = w; }
-void SwDisplay::pointSize(uint16_t s) { pointS_ = s; }
-void SwDisplay::scissorXY(uint16_t x, uint16_t y) { scX_ = x; scY_ = y; }
-void SwDisplay::scissorSize(uint16_t w, uint16_t h) { scW_ = w; scH_ = h; }
+void SwDisplay::lineWidth(uint16_t w) { rec(5, w); lineW_ = w; }
+void SwDisplay::pointSize(uint16_t s) { rec(6, s); pointS_ = s; }
+void SwDisplay::scissorXY(uint16_t x, uint16_t y) { rec(7, x, y); scX_ = x; scY_ = y; }
+void SwDisplay::scissorSize(uint16_t w, uint16_t h) { rec(8, w, h); scW_ = w; scH_ = h; }
 
 void SwDisplay::begin(Prim prim) {
+    rec(9, prim);
     if (prim < kBitmaps || prim > kRects) warnOnce(1, "unsupported BEGIN primitive", prim);
     prim_ = prim;
     nvert_ = 0;
 }
 void SwDisplay::end() {
+    rec(10);
     prim_ = 0;
     nvert_ = 0;
 }
 
 void SwDisplay::vertex2f(int32_t x16, int32_t y16) {
+    rec(11, x16, y16);
     vertex(float(x16 + translateX_) / 16.0f, float(y16) / 16.0f, 0, 0, false);
 }
 void SwDisplay::vertex2ii(uint16_t x, uint16_t y, uint8_t handle, uint8_t cell) {
+    rec(12, x, y, handle, cell);
     vertex(float(x) + float(translateX_) / 16.0f, float(y), handle, cell, true);
 }
 
 void SwDisplay::saveContext() {
+    rec(18);
     if (ctxDepth_ >= 4) {
         warnOnce(6, "SAVE_CONTEXT stack overflow", ctxDepth_);
         return;
@@ -152,6 +197,7 @@ void SwDisplay::saveContext() {
 }
 
 void SwDisplay::restoreContext() {
+    rec(19);
     if (ctxDepth_ <= 0) {
         warnOnce(7, "RESTORE_CONTEXT without SAVE_CONTEXT", 0);
         return;
@@ -172,6 +218,7 @@ void SwDisplay::restoreContext() {
 }
 
 void SwDisplay::gradient(int16_t x0, int16_t y0, uint32_t rgb0, int16_t x1, int16_t y1, uint32_t rgb1) {
+    rec(20, x0, y0, int32_t(rgb0), x1, y1, int32_t(rgb1));
     // Colour = rgb0 + t * (rgb1 - rgb0), t = projection of the pixel centre
     // on (x0, y0) -> (x1, y1), clamped to 0..1; fills scissor ∩ screen.
     const int cx0 = std::max<int>(scX_, 0), cy0 = std::max<int>(scY_, 0);
@@ -261,6 +308,7 @@ void SwDisplay::vertex(float x, float y, uint8_t handle, uint8_t cell, bool ii) 
 }
 
 void SwDisplay::text(int16_t x, int16_t y, uint8_t font, uint16_t options, const char* s) {
+    rec(13, x, y, font, options, 0, 0, s ? s : "");
     if (font < 16 && handles_[font].valid && handles_[font].metric) {
         // CMD_TEXT on a custom font: widths from the RAM_G metric block.
         if (!s) return;
@@ -296,6 +344,7 @@ void SwDisplay::text(int16_t x, int16_t y, uint8_t font, uint16_t options, const
 }
 
 void SwDisplay::number(int16_t x, int16_t y, uint8_t font, uint16_t options, int32_t n) {
+    rec(14, x, y, font, options, n);
     char buf[24];
     const int digits = options & 0xFF;
     bool neg = false;
@@ -312,18 +361,33 @@ void SwDisplay::number(int16_t x, int16_t y, uint8_t font, uint16_t options, int
     if (neg) buf[p++] = '-';
     for (int i = len; i < digits && p < 20; ++i) buf[p++] = '0';
     std::memcpy(buf + p, tmp, size_t(len) + 1);
+    const bool r = replaying_;
+    replaying_ = true;   // the expansion is not a recorded command
     text(x, y, font, uint16_t(options & ~0xFF), buf);
+    replaying_ = r;
 }
 
 void SwDisplay::swap() {
+    lastDl_ = dl_ + 1;   // + DISPLAY
+    lastAppends_ = appends_;
+    if (recSlot_ >= 0) warnOnce(20, "swap inside a fragment capture", recSlot_);
+    recSlot_ = -1;
     std::lock_guard<std::mutex> lk(frontMu_);
-    std::memcpy(front_.data(), back_.pixels(), front_.size() * 4);
+    if (busyClock_) {
+        pendingFrame_.resize(front_.size());
+        std::memcpy(pendingFrame_.data(), back_.pixels(), front_.size() * 4);
+        pending_ = true;
+        pendingAtUs_ = busyNowUs() + uint64_t(lastDl_) * 4u * 8u / 30u;
+    } else {
+        std::memcpy(front_.data(), back_.pixels(), front_.size() * 4);
+    }
     ++frames_;
 }
 
 bool SwDisplay::readPixels(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint32_t* rgb) {
     if (uint32_t(x) + w > uint32_t(kW) || uint32_t(y) + h > uint32_t(kH)) return false;
     std::lock_guard<std::mutex> lk(frontMu_);
+    if (busyClock_) busyTickLocked();
     for (uint16_t r = 0; r < h; ++r)
         for (uint16_t c = 0; c < w; ++c) rgb[size_t(r) * w + c] = front_[size_t(y + r) * kW + x + c] & 0xFFFFFFu;
     return true;
@@ -366,6 +430,7 @@ bool SwDisplay::writeRamG(uint32_t addr, const void* src, uint32_t len) {
 }
 
 void SwDisplay::drawRgb332(int16_t x, int16_t y, uint32_t addr, uint16_t w, uint16_t h, uint8_t scale) {
+    rec(15, x, y, int32_t(addr), w, h, scale);
     if (!w || !h || !scale || addr + uint32_t(w) * h > kRamGSize) {
         warnOnce(5, "drawRgb332 outside RAM_G", int(addr));
         return;
@@ -401,12 +466,117 @@ void SwDisplay::drawRgb332(int16_t x, int16_t y, uint32_t addr, uint16_t w, uint
 }
 
 void SwDisplay::drawImage(int16_t x, int16_t y, uint32_t addr, uint16_t w, uint16_t h) {
+    rec(16, x, y, int32_t(addr), w, h);
     if (!w || !h || (addr & 1u) || addr + uint32_t(w) * h * 2u > kRamGSize) {
         warnOnce(4, "drawImage outside RAM_G", int(addr));
         return;
     }
     applyClip();
     back_.blitRgb565(x, y, ramg_.data() + addr, w, h);
+}
+
+// ---------------------------------------------------------------------------
+// Fragments: record while drawing, replay on append (CMD_APPEND semantics: the
+// appended commands run in the graphics state of the append point).
+
+void SwDisplay::rec(uint8_t k, int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5,
+                    const char* s) {
+    if (replaying_) return;
+    // DL words this command produces (CMD_TEXT: one per glyph plus BEGIN/END).
+    // 1.9.5 ops as Gfx counts them: translate / save / restore 1, CMD_GRADIENT
+    // 5, BITMAP_TRANSFORM_A..F 6, BITMAP_HANDLE + BITMAP_SIZE 2.
+    uint32_t w = 1;
+    switch (k) {
+        case 13: w = uint32_t(std::strlen(s)) + 2; break;
+        case 14: case 15: case 16: w = 8; break;
+        case 20: w = 5; break;
+        case 21: w = 6; break;
+        case 22: w = 2; break;
+        default: break;
+    }
+    dl_ += w;
+    if (recSlot_ < 0) return;
+    recWords_ += w;
+    Op o;
+    o.k = k;
+    o.a[0] = a0; o.a[1] = a1; o.a[2] = a2; o.a[3] = a3; o.a[4] = a4; o.a[5] = a5;
+    if (s) o.s = s;
+    frag_[recSlot_].push_back(std::move(o));
+}
+
+void SwDisplay::replay(const Op& o) {
+    const int32_t* a = o.a;
+    switch (o.k) {
+        case 1: clearColorRGB(uint8_t(a[0]), uint8_t(a[1]), uint8_t(a[2])); break;
+        case 2: clear(a[0] != 0, a[1] != 0, a[2] != 0); break;
+        case 3: colorRGB(uint8_t(a[0]), uint8_t(a[1]), uint8_t(a[2])); break;
+        case 4: colorA(uint8_t(a[0])); break;
+        case 5: lineWidth(uint16_t(a[0])); break;
+        case 6: pointSize(uint16_t(a[0])); break;
+        case 7: scissorXY(uint16_t(a[0]), uint16_t(a[1])); break;
+        case 8: scissorSize(uint16_t(a[0]), uint16_t(a[1])); break;
+        case 9: begin(Prim(a[0])); break;
+        case 10: end(); break;
+        case 11: vertex2f(a[0], a[1]); break;
+        case 12: vertex2ii(uint16_t(a[0]), uint16_t(a[1]), uint8_t(a[2]), uint8_t(a[3])); break;
+        case 13: text(int16_t(a[0]), int16_t(a[1]), uint8_t(a[2]), uint16_t(a[3]), o.s.c_str()); break;
+        case 14: number(int16_t(a[0]), int16_t(a[1]), uint8_t(a[2]), uint16_t(a[3]), a[4]); break;
+        case 15: drawRgb332(int16_t(a[0]), int16_t(a[1]), uint32_t(a[2]), uint16_t(a[3]), uint16_t(a[4]), uint8_t(a[5])); break;
+        case 16: drawImage(int16_t(a[0]), int16_t(a[1]), uint32_t(a[2]), uint16_t(a[3]), uint16_t(a[4])); break;
+        case 17: vertexTranslateX(a[0]); break;
+        case 18: saveContext(); break;
+        case 19: restoreContext(); break;
+        case 20: gradient(int16_t(a[0]), int16_t(a[1]), uint32_t(a[2]), int16_t(a[3]), int16_t(a[4]), uint32_t(a[5])); break;
+        case 21: bitmapTransform(a[0], a[1], a[2], a[3], a[4], a[5]); break;
+        case 22: bitmapSize(uint8_t(a[0]), uint16_t(a[1]), uint16_t(a[2])); break;
+        default: break;
+    }
+}
+
+void SwDisplay::fragmentBegin(uint8_t slot) {
+    if (!fragOn_ || slot >= kFragmentSlots || recSlot_ >= 0) {
+        warnOnce(21, "fragmentBegin rejected", slot);
+        return;
+    }
+    frag_[slot].clear();
+    fragWords_[slot] = 0;
+    recSlot_ = slot;
+    recWords_ = 0;
+}
+
+bool SwDisplay::fragmentEnd(uint8_t slot) {
+    if (recSlot_ != int(slot)) return false;
+    recSlot_ = -1;
+    if (recWords_ == 0 || recWords_ > kFragSlotWords) {   // device: slot holds 4 KB
+        frag_[slot].clear();
+        return false;
+    }
+    fragWords_[slot] = recWords_;
+    return true;
+}
+
+void SwDisplay::fragmentAppend(uint8_t slot) {
+    if (slot >= kFragmentSlots || !fragWords_[slot]) {
+        warnOnce(22, "append of an empty fragment slot", slot);
+        return;
+    }
+    if (recSlot_ >= 0) warnOnce(23, "append inside a fragment capture", slot);
+    ++appends_;
+    dl_ += fragWords_[slot];
+    replaying_ = true;
+    for (const Op& o : frag_[slot]) replay(o);
+    replaying_ = false;
+}
+
+uint32_t SwDisplay::fragmentWords(uint8_t slot) const { return slot < kFragmentSlots ? fragWords_[slot] : 0; }
+
+void SwDisplay::setFragments(bool on) {
+    fragOn_ = on;
+    if (!on)
+        for (int i = 0; i < kFragmentSlots; ++i) {
+            frag_[i].clear();
+            fragWords_[i] = 0;
+        }
 }
 
 void SwDisplay::dimFrame(uint32_t* px, size_t n, uint8_t duty) {
@@ -421,6 +591,7 @@ void SwDisplay::dimFrame(uint32_t* px, size_t n, uint8_t duty) {
 
 uint32_t SwDisplay::frontCopy(uint32_t* dst) const {
     std::lock_guard<std::mutex> lk(frontMu_);
+    if (busyClock_) busyTickLocked();
     std::memcpy(dst, front_.data(), front_.size() * 4);
     return frames_;
 }

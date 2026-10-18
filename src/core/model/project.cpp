@@ -2,6 +2,7 @@
 #include "model/project.h"
 
 #include <cstdio>
+#include <cstring>
 
 #include "formats/bytes.h"
 
@@ -36,6 +37,17 @@ void Project::setDefault() {
     setU8(0x4FB, 0);             // side-chain off
     setU8(0x4FC, 1);             // Sends mode = post-fader
     setU16(mt::kU16_5FE, 20000); // delay filter, Hz
+    // Tracker Mini (spec 21 §3.2, §3.3): three default synth slots. The
+    // "Midi 9".."Midi 16" names come from the load pre-fill.
+    for (int s = 0; s < kSynthSlotCount; ++s) resetSynthSlot(s);
+    // Owner decision for 2.0: WTFM has no engine yet, so a New Project starts
+    // Synth 1 on ACD instead of the Mini's WTFM (a dead slot otherwise).
+    // Synth 2 / 3 keep the Mini defaults (ACD / VAP), and the load sanitiser
+    // keeps SynthSlotRecord::defaults (WTFM / ACD / VAP, spec 21 §3.3).
+    // 2.1: back to WTFM
+    SynthSlotRecord s0 = synthSlot(0);
+    s0.model = uint32_t(SynthModel::ACD);
+    setSynthSlot(0, s0);
 }
 
 void Project::setLoadPrefill() {
@@ -114,6 +126,90 @@ bool Project::setTrackName(int track, const char* s) {
         wrStr(&values[mt::kTrackNames9to16 + (track - 8) * mt::kTrackNameLen9to16 - mt::kValuesOff],
               mt::kTrackNameLen9to16, s);
     return true;
+}
+
+bool Project::trackMuted(int track) const {
+    if (track < 0 || track >= kTrackCount) return false;
+    return track < 8 ? u8(mt::kTrackMutes1to8 + uint32_t(track)) != 0
+                     : u8(mt::kTrackMutes9to16 + uint32_t(track - 8)) != 0;
+}
+
+bool Project::setTrackMuted(int track, bool muted) {
+    if (track < 0 || track >= kTrackCount) return false;
+    if (track < 8) setU8(mt::kTrackMutes1to8 + uint32_t(track), muted ? 1 : 0);
+    else setU8(mt::kTrackMutes9to16 + uint32_t(track - 8), muted ? 1 : 0);
+    return true;
+}
+
+const char* synthModelName(SynthModel m) {
+    static const char* const kNames[kSynthModelCount] = {"ACD", "FAT", "VAP", "WTFM", "PERC"};
+    return uint8_t(m) < kSynthModelCount ? kNames[uint8_t(m)] : "";
+}
+
+bool SynthSlotRecord::valid() const {
+    // spec 21 §3.3 "Valid range (load check)"; written so NaN fails.
+    if (!(gainDb >= -96.0f && gainDb <= 12.0f)) return false;
+    if (polyphony > 8) return false;
+    if (model >= uint32_t(kSynthModelCount)) return false;
+    if (!(pan >= -100.0f && pan <= 100.0f)) return false;
+    if (!(reverbSend >= 0.0f && reverbSend <= 100.0f)) return false;
+    if (!(delaySend >= 0.0f && delaySend <= 100.0f)) return false;
+    for (uint8_t m : macros)
+        if (m & 0x80) return false;
+    return true;
+}
+
+SynthSlotRecord SynthSlotRecord::defaults(int slot, uint8_t bipolarMask) {
+    static const SynthModel kModels[kSynthSlotCount] = {SynthModel::WTFM, SynthModel::ACD, SynthModel::VAP};
+    SynthSlotRecord r;
+    r.gainDb = -9.0f;
+    r.polyphony = 1;
+    r.model = uint32_t(kModels[(slot >= 0 && slot < kSynthSlotCount) ? slot : 0]);
+    r.pan = 0.0f;
+    copyStr(r.patchName, sizeof(r.patchName), "Init");
+    r.reverbSend = 0.0f;
+    r.delaySend = 0.0f;
+    for (uint32_t m = 0; m < mt::kSynthMacroCount; ++m) r.macros[m] = (bipolarMask >> m) & 1 ? 63 : 0;
+    return r;
+}
+
+void SynthSlotRecord::decode(const uint8_t* rec) {
+    gainDb = rdF32(rec + mt::kSynthGain);
+    polyphony = rdU32(rec + mt::kSynthPolyphony);
+    model = rdU32(rec + mt::kSynthModel);
+    pan = rdF32(rec + mt::kSynthPan);
+    rdStr(rec + mt::kSynthPatchName, mt::kSynthPatchNameSize, patchName, sizeof(patchName));
+    reverbSend = rdF32(rec + mt::kSynthReverbSend);
+    delaySend = rdF32(rec + mt::kSynthDelaySend);
+    std::memcpy(macros, rec + mt::kSynthMacros, mt::kSynthMacroCount);
+    std::memcpy(pad, rec + mt::kSynthPad, 2);
+}
+
+void SynthSlotRecord::encode(uint8_t* rec) const {
+    wrF32(rec + mt::kSynthGain, gainDb);
+    wrU32(rec + mt::kSynthPolyphony, polyphony);
+    wrU32(rec + mt::kSynthModel, model);
+    wrF32(rec + mt::kSynthPan, pan);
+    // The name field holds up to 32 bytes with no NUL (the Mini keeps 32
+    // non-NUL bytes; wrStr would cut the 32nd).
+    std::memset(rec + mt::kSynthPatchName, 0, mt::kSynthPatchNameSize);
+    std::memcpy(rec + mt::kSynthPatchName, patchName, strnlen(patchName, mt::kSynthPatchNameSize));
+    wrF32(rec + mt::kSynthReverbSend, reverbSend);
+    wrF32(rec + mt::kSynthDelaySend, delaySend);
+    std::memcpy(rec + mt::kSynthMacros, macros, mt::kSynthMacroCount);
+    std::memcpy(rec + mt::kSynthPad, pad, 2);
+}
+
+SynthSlotRecord Project::synthSlot(int slot) const {
+    if (slot < 0 || slot >= kSynthSlotCount) return SynthSlotRecord::defaults(0);
+    SynthSlotRecord r;
+    r.decode(&values[mt::synthSlotOff(slot) - mt::kValuesOff]);
+    return r;
+}
+
+void Project::setSynthSlot(int slot, const SynthSlotRecord& r) {
+    if (slot < 0 || slot >= kSynthSlotCount) return;
+    r.encode(&values[mt::synthSlotOff(slot) - mt::kValuesOff]);
 }
 
 MidiInstrument Project::midiInstrument(int idx) const {

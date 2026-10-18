@@ -136,6 +136,10 @@ bool ManualAudio::recordWav(const char* path) {
 void ManualAudio::pull() {
     int16_t buf[kBlockFrames * kChannels] = {};
     if (running_ && fn_) fn_(buf, kBlockFrames, ctx_);
+    for (int16_t v : buf) {
+        const int a = v < 0 ? -int(v) : int(v);
+        if (a > peak) peak = a;
+    }
     if (wav_) {
         std::fwrite(buf, 1, sizeof(buf), wav_);   // host is little-endian
         wavBytes_ += sizeof(buf);

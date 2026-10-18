@@ -11,6 +11,7 @@
 #include <DMAChannel.h>
 #include <string.h>
 #include "board.h"
+#include "dma_mem.h"
 #include "hw_math.h"
 #include "i2c_bus.h"
 #include "k66.h"
@@ -28,10 +29,10 @@ static_assert(hw::i2sBclkHz(hw::i2sMclkHz(board::kCoreHz, board::kI2sMdr), board
                   hw::i2sMclkHz(board::kCoreHz, board::kI2sMdr) / 4,
               "BCLK must be 64 Fs = MCLK / 4");
 // TX ring: 2 halves x 128 stereo frames of int16 (spec 01 §5.3: 1 KB).
-int16_t txBuf[2 * kFrames * 2] __attribute__((aligned(32)));
+OT_DMA_MEM int16_t txBuf[2 * kFrames * 2];   // .dma: uncached SRAM_U (dma_mem.h)
 DMAChannel txDma(false);
 // RX ring: same shape (spec 01 §5.3 RX column), RDR0+2 -> buffer.
-int16_t rxBuf[2 * kFrames * 2] __attribute__((aligned(32)));
+OT_DMA_MEM int16_t rxBuf[2 * kFrames * 2];
 int16_t rxCopy[kFrames * 2];
 DMAChannel rxDma(false);
 volatile int8_t gRxHalf = -1;            // last completed RX half, -1 = none yet

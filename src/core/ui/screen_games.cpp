@@ -2,6 +2,8 @@
 // in-game key mapping, display and audio routing.
 #include "ui/screen_games.h"
 
+#if OT_GAMES
+
 #include <cstdio>
 
 #include "app/app.h"
@@ -374,3 +376,4 @@ void GamesScreen::draw(Gfx& g) {
 }
 
 }  // namespace ot
+#endif  // OT_GAMES

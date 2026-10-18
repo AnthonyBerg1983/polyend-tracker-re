@@ -29,6 +29,7 @@
 #include "audio/audio_tables.h"
 #include "formats/bytes.h"
 #include "model/fx.h"
+#include "sdram_bss.h"
 
 namespace ot {
 
@@ -55,12 +56,12 @@ const StepFx* findFx(const Step& s, FxId id) {
 }
 }  // namespace
 
-uint32_t encodePattern(const Pattern& p, const Instrument* ins, uint8_t speed, uint8_t restoreTempo, uint8_t* out) {
+uint32_t encodePattern(const PatternStock& p, const Instrument* ins, uint8_t speed, uint8_t restoreTempo, uint8_t* out) {
     uint8_t* o = out;
     bool row0Tempo = false;
     const int rows = p.tracks[0].length();   // spec 11 §2.6: track 0's length
     for (int r = 0; r < rows; ++r) {
-        for (int t = 0; t < kTrackCount; ++t) {
+        for (int t = 0; t < kStockTrackCount; ++t) {
             const Step& s = p.tracks[t].steps[r];
             if (s.note != kNoteEmpty && !isSampleInstrument(s.instrument)) continue;   // MIDI steps
             uint8_t mask = 0, note = 0, vol = 0, cmd = 0, par = 0;
@@ -303,8 +304,13 @@ void buildSampleHeader(uint8_t* b, int index, const Instrument& in, uint32_t fra
 // ---------------------------------------------------------------------------
 
 namespace {
-const Instrument kEmptyInstrument;
+// Built on first use (an export job, main loop); SDRAM on the device (2.0.1:
+// SRAM for the USB Storage ring).
+const Instrument& emptyInstrument() {
+    OT_SDRAM_BSS static const Instrument def;
+    return def;
 }
+}  // namespace
 
 bool ItExport::fail(const char* msg) {
     std::snprintf(err_, sizeof(err_), "%s", msg);
@@ -350,14 +356,14 @@ bool ItExport::begin(IStorage& fs, const char* path, const ItExportSource& src, 
     // Any Tempo FX: every pattern restates the project tempo on row 0.
     restoreT_ = 0;
     for (int k = 1; k <= patNum_ && !restoreT_; ++k) {
-        const Pattern* p = src_.pattern(src_.ctx, k);
-        for (int t = 0; p && t < kTrackCount && !restoreT_; ++t)
+        const PatternStock* p = src_.pattern(src_.ctx, k);
+        for (int t = 0; p && t < kStockTrackCount && !restoreT_; ++t)
             for (int r = 0; r < p->tracks[t].length() && !restoreT_; ++r)
                 for (const StepFx& f : p->tracks[t].steps[r].fx)
                     if (f.type == uint8_t(FxId::Tempo) && f.value > 4) restoreT_ = tempo_;
     }
     for (int k = 1; k <= patNum_; ++k) {
-        const Pattern* p = src_.pattern(src_.ctx, k);
+        const PatternStock* p = src_.pattern(src_.ctx, k);
         patSize_[k - 1] = p ? uint16_t(itfmt::encodePattern(*p, src_.instruments, speed_, restoreT_, buf_)) : 0;
     }
     if (fs.exists(path)) fs.remove(path);   // spec 11 §2.1: an existing file is deleted first
@@ -423,7 +429,7 @@ ImportStep ItExport::step(uint32_t& cost) {
             return ImportStep::More;
         }
         case kInstr: {
-            const Instrument& in = src_.present[idx_] ? src_.instruments[idx_] : kEmptyInstrument;
+            const Instrument& in = src_.present[idx_] ? src_.instruments[idx_] : emptyInstrument();
             itfmt::buildInstrument(buf_, idx_, in, speed_, tempo_);
             if (!put(buf_, itfmt::kImpiSize)) {
                 fail("Cannot write file");
@@ -441,7 +447,7 @@ ImportStep ItExport::step(uint32_t& cost) {
             uint32_t frames = 0;
             bool st = false;
             const bool has = src_.present[idx_] && src_.samples(src_.ctx, idx_, &frames, &st);
-            const Instrument& in = src_.present[idx_] ? src_.instruments[idx_] : kEmptyInstrument;
+            const Instrument& in = src_.present[idx_] ? src_.instruments[idx_] : emptyInstrument();
             itfmt::buildSampleHeader(buf_, idx_, in, has ? frames : 0, has && st, dataOff_[idx_]);
             if (!put(buf_, itfmt::kImpsSize)) {
                 fail("Cannot write file");
@@ -494,7 +500,7 @@ ImportStep ItExport::step(uint32_t& cost) {
                 units_ = total_;
                 return ImportStep::Done;
             }
-            const Pattern* p = src_.pattern(src_.ctx, idx_ + 1);
+            const PatternStock* p = src_.pattern(src_.ctx, idx_ + 1);
             uint8_t* b = buf_;
             const uint32_t n = p ? itfmt::encodePattern(*p, src_.instruments, speed_, restoreT_, b + 8) : 0;
             if (n != patSize_[idx_]) {

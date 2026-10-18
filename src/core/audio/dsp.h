@@ -31,11 +31,19 @@
 #include <cstdint>
 
 #include "audio/audio_tables.h"
+#include "fastrun.h"
 
 namespace ot {
 namespace audio {
 
 inline float clampUnit(float x) { return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x); }
+// clampUnit() (same result, NaN passes through) with one compare on the
+// in-range path: cheaper where the compiler keeps the rare branch out of
+// line (reverb output, SVF outputs).
+inline float clampUnitFast(float x) {
+    if (__builtin_expect(__builtin_fabsf(x) > 1.0f, 0)) return x < 0.0f ? -1.0f : 1.0f;
+    return x;
+}
 // float (+-1 full scale) -> int16: truncation toward zero, saturating, NaN -> 0.
 inline int16_t toS16(float x) {
 #if defined(__arm__) && defined(__ARM_FP) && defined(__ARM_FEATURE_SAT)
@@ -89,6 +97,17 @@ inline float s16ToF(int32_t v) {
     return f;
 #else
     return float(v) * (1.0f / 32768.0f);
+#endif
+}
+// s16ToF(toS16(x)): x rounded to the int16 grid (truncation, saturation,
+// NaN -> 0), staying in a float register on the M4 (two in-place VCVTs).
+inline float s16Round(float x) {
+#if defined(__arm__) && defined(__ARM_FP) && defined(__ARM_FEATURE_SAT)
+    float v = x;
+    __asm__("vcvt.s16.f32 %0, %0, #15\n\tvcvt.f32.s16 %0, %0, #15" : "+t"(v));
+    return v;
+#else
+    return s16ToF(toS16(x));
 #endif
 }
 // Saturate an int32 to the int16 range (SSAT on the M4).
@@ -184,7 +203,7 @@ public:
     float level() const { return level_ * scale_; }
 
     // One 8-sample group: writes the per-sample gains into g[0..7].
-    int group(float* g) {
+    OT_FASTRUN_INLINE(envGroup) int group(float* g) {
         int ev = 0;
         while (count_ == 0) {
             if (state_ == kAttack) {
@@ -322,7 +341,7 @@ private:
             h = in - l - d * b;
             b += f * h;
             const float y = kType == 0 ? (l + l1) : (kType == 1 ? (h + h1) : (b + b1));
-            x[i] = clampUnit(y * 0.5f);
+            x[i] = clampUnitFast(y * 0.5f);
         }
         // Keep the state bounded like the fixed-point original (saturating ints).
         lp = l > 16.0f ? 16.0f : (l < -16.0f ? -16.0f : l);

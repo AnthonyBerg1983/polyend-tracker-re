@@ -66,13 +66,29 @@ void songWideLabel(Gfx& g, const Theme& th, int i, const BarLabel& l) {
                   th.slot(l.underline == wg::kUnderlineGreen ? slot::kGreen : slot::kSolidRect));
 }
 
-bool trackUsed(const Pattern& p, int t) {
-    const Track& tr = p.tracks[t];
+bool trackUsed(const Track& tr) {
     for (int s = 0; s < tr.length(); ++s)
         if (tr.steps[s].note >= 0) return true;
     return false;
 }
+
+// Track srcT of pattern src -> track dstT of pattern dst (whole record, as
+// stock). Ext tracks (12..15) go through the pool; an empty source copied
+// onto an ext track that has no block leaves it without one.
+void copyStoredTrack(App& a, int src, int srcT, int dst, int dstT) {
+    Track tmp;
+    a.readStoredTrack(src, srcT, tmp);
+    if (dstT >= kStockTrackCount && !a.findStoredTrack(dst, dstT) &&
+        extTrackIsDefault(tmp, a.storedStock(dst).tracks[0].lastStep))
+        return;
+    a.storedTrack(dst, dstT) = tmp;
+}
 }  // namespace
+
+void SongScreen::followGridCursor(int edge) {
+    if (edge >= firstTrack + kGridCols) firstTrack = kTrackCount - kGridCols;
+    if (edge < firstTrack) firstTrack = 0;
+}
 
 int SongScreen::length() const {
     Project& p = app_.project;
@@ -125,7 +141,7 @@ void SongScreen::reloadPlayingSlot() {
     if (!s.isPlaying() || !(s.isSongMode() || loopInSong_) || s.songPosition() != cursor) return;
     const int num = a.project.playlist[cursor];
     if (num == a.patternNumber()) return;
-    a.stored(a.patternNumber()) = a.pattern();
+    a.commitCurrentPattern();
     a.loadPattern(uint8_t(num), a.pattern(), true);
     a.project.setCurrentPattern(uint8_t(num));
     s.attach(&a.engine, &a, &a.project, s.currentPattern(), s.preloadPattern());
@@ -228,20 +244,20 @@ void SongScreen::copyJob(bool paste) {
     const int n = length();
     const int row0 = focus == 0 ? selRow0 : cursor;
     const int dstT0 = focus == 0 ? selTrack0 : clipTrack0_;
-    a.stored(a.patternNumber()) = a.pattern();
+    a.commitCurrentPattern();
     for (int i = 0; i < clipRows_; ++i) {
         const int dstSlot = row0 + i;
         if (dstSlot >= n || clipRow0_ + i >= n) break;
         const int src = a.project.playlist[clipRow0_ + i], dst = a.project.playlist[dstSlot];
         if (src == dst && dstT0 == clipTrack0_) continue;
-        a.fileUndo.push(uint8_t(dst), a.stored(dst));
+        a.pushFileUndo(dst);
         const int cnt = clipTracks_ < kTrackCount - dstT0 ? clipTracks_ : kTrackCount - dstT0;
         // Same pattern, overlapping tracks: copy away from the overlap.
         const bool back = src == dst && dstT0 > clipTrack0_;
         for (int k = 0; k < cnt; ++k) {
             const int j = back ? cnt - 1 - k : k;
             if (clipTrack0_ + j >= kTrackCount) continue;
-            a.stored(dst).tracks[dstT0 + j] = a.stored(src).tracks[clipTrack0_ + j];
+            copyStoredTrack(a, src, clipTrack0_ + j, dst, dstT0 + j);
         }
         a.markPatternDirty(dst);
         ui_.progress("Copying", (i + 1) * 100 / clipRows_);
@@ -252,14 +268,17 @@ void SongScreen::copyJob(bool paste) {
 
 void SongScreen::deleteJob() {
     App& a = app_;
-    a.stored(a.patternNumber()) = a.pattern();
+    a.commitCurrentPattern();
     for (int i = 0; i < selRows; ++i) {
         const int slot = selRow0 + i;
         if (slot >= length()) break;
         const int num = a.project.playlist[slot];
-        a.fileUndo.push(uint8_t(num), a.stored(num));
-        for (int t = selTrack0; t < selTrack0 + selTracks && t < kTrackCount; ++t)
-            for (auto& s : a.stored(num).tracks[t].steps) s = Step{};
+        a.pushFileUndo(num);
+        for (int t = selTrack0; t < selTrack0 + selTracks && t < kTrackCount; ++t) {
+            // An ext track without a pool block is empty already.
+            if (!a.findStoredTrack(num, t)) continue;
+            for (auto& s : a.storedTrack(num, t).steps) s = Step{};
+        }
         a.markPatternDirty(num);
         // spec 06 §2.3 Delete: background "Deleting" job with a percentage
         // popup, like "Copying" (stock title 0xa9d28).
@@ -341,7 +360,7 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
             {
                 const int top = a.fileUndo.topNumber();
                 uint8_t num = 0;
-                if (top < 1 || !a.fileUndo.pop(&num, &a.stored(top))) {
+                if (top < 1 || !a.popFileUndo(&num)) {
                     ui_.notify("Nothing to undo");
                     break;
                 }
@@ -433,16 +452,23 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
             const int d = id == btn::Right ? 1 : -1;
             if (focus == 0) {
                 const int nt = selTrack0 + d;
-                if (ui_.shift()) selTracks = clampi(selTracks + d, 1, kTrackCount - selTrack0);
-                else if (nt >= kTrackCount) focus = 1;
-                else selTrack0 = clampi(nt, 0, kTrackCount - 1);
+                if (ui_.shift()) {
+                    selTracks = clampi(selTracks + d, 1, kTrackCount - selTrack0);
+                    followGridCursor(selTrack0 + selTracks - 1);
+                } else if (nt >= kTrackCount) {
+                    focus = 1;
+                } else {
+                    selTrack0 = clampi(nt, 0, kTrackCount - 1);
+                    followGridCursor(selTrack0);
+                }
             } else {
                 int nf = focus + d;
                 if (nf < (edit ? 0 : 1)) nf = edit ? 0 : 1;
                 if (nf > 2) nf = 2;
                 if (nf == 0) {
+                    // Enters on the rightmost shown column (stock: track 12).
                     selRow0 = cursor;
-                    selTrack0 = kTrackCount - 1;
+                    selTrack0 = firstTrack + kGridCols - 1;
                 }
                 focus = nf;
             }
@@ -520,13 +546,15 @@ void SongScreen::draw(Gfx& g) {
     // [8] empty tile 121212, [9] selection 30cb3f.
     // Rotated column headers (style bit7, font 1).
     const uint32_t white = th.slot(slot::kSongList);
-    for (int t = 0; t < kTrackCount; ++t) {
+    const int ft = firstTrack;   // first shown track: 0 or 4 (12-column window)
+    for (int c = 0; c < kGridCols; ++c) {
         // Word and number as two runs: the stock vertical text advances
         // only 5 px for the space (font 1 is 8) [S snap 010].
+        const int t = ft + c;
         const char* word = t < 8 ? "Track" : "Midi";
         char num[12];
         std::snprintf(num, sizeof(num), "%d", t + 1);
-        const int x = kHeaderX - 4 + kPitchX * t;
+        const int x = kHeaderX - 4 + kPitchX * c;
         const int ww = g.textWidth(kFont1, word);
         g.textRotated(x, kHeaderBottom - ww, kFont1, white, word, 1);
         g.textRotated(x, kHeaderBottom - ww - kHeaderSpace - g.textWidth(kFont1, num), kFont1, white, num, 1);
@@ -534,35 +562,38 @@ void SongScreen::draw(Gfx& g) {
 
     // Slot grid: dark tile (121212, soft edge) per empty track, white
     // rounded cell where the track of that slot's pattern has notes.
-    bool used[kRows][kTrackCount] = {};
+    bool used[kRows][kGridCols] = {};
     const int rows = n - first < kRows ? n - first : kRows;
     for (int r = 0; r < rows; ++r) {
         const int num = a.project.playlist[first + r];
         const bool cur = num == a.patternNumber();
         if (!cur && !a.patternPresent(num)) continue;
-        const Pattern& p = cur ? a.pattern() : a.stored(num);
-        for (int t = 0; t < kTrackCount; ++t) used[r][t] = trackUsed(p, t);
+        for (int c = 0; c < kGridCols; ++c) {
+            const Track* tr = cur ? &a.pattern().tracks[ft + c] : a.findStoredTrack(num, ft + c);
+            used[r][c] = tr && trackUsed(*tr);   // ext track without a block: empty
+        }
     }
     g.lineWidth(32);   // RECTS corners r 2: boxes 1 px beyond the vertices
     g.rectsBegin(th.slot(slot::kSongList + 8));
     for (int r = 0; r < rows; ++r)
-        for (int t = 0; t < kTrackCount; ++t)
-            if (!used[r][t]) g.rectsAdd(kGridX + 1 + kPitchX * t, kGridY + 1 + kPitchY * r, 37, 24);
+        for (int c = 0; c < kGridCols; ++c)
+            if (!used[r][c]) g.rectsAdd(kGridX + 1 + kPitchX * c, kGridY + 1 + kPitchY * r, 37, 24);
     g.rectsEnd();
     g.rectsBegin(white);
     for (int r = 0; r < rows; ++r)
-        for (int t = 0; t < kTrackCount; ++t)
-            if (used[r][t]) g.rectsAdd(kGridX + 41 - kPitchX + kPitchX * t, kGridY + 2 + kPitchY * r, 36, 22);
+        for (int c = 0; c < kGridCols; ++c)
+            if (used[r][c]) g.rectsAdd(kGridX + 41 - kPitchX + kPitchX * c, kGridY + 2 + kPitchY * r, 36, 22);
     g.rectsEnd();
     g.lineWidth(16);
     if (focus == 0) {
-        // Grid selection (edit mode): white 1.5-px outline on the gaps.
+        // Grid selection (edit mode): white 1.5-px outline on the gaps,
+        // clipped to the shown columns.
         const int r0 = selRow0 - first, r1 = selRow0 + selRows - first;
-        if (r1 > 0 && r0 < kRows) {
+        const int c0 = clampi(selTrack0 - ft, 0, kGridCols), c1 = clampi(selTrack0 + selTracks - ft, 0, kGridCols);
+        if (r1 > 0 && r0 < kRows && c0 < c1) {
             const int y0 = kGridY - 1 + kPitchY * clampi(r0, 0, kRows);
             const int y1 = kGridY - 1 + kPitchY * clampi(r1, 0, kRows);
-            wg::stroke(g, kGridX - 1 + kPitchX * selTrack0, y0, kGridX - 1 + kPitchX * (selTrack0 + selTracks), y1,
-                       white);
+            wg::stroke(g, kGridX - 1 + kPitchX * c0, y0, kGridX - 1 + kPitchX * c1, y1, white);
         }
     }
 

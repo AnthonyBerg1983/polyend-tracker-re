@@ -4,17 +4,22 @@
 //
 // Transfers: ADMA2 (descriptor table, CMD17/18/24/25, auto CMD12), like the stock
 // SDK host (spec 01 §6). Buffers ADMA2 cannot reach safely (unaligned, crossing
-// the SRAM_L/SRAM_U boundary, SDRAM unless board::kSdDmaToSdram) bounce through
-// an SRAM buffer. Clock: CMD6 high speed -> 45 MHz (180/4; stock asks the SDK for
-// 50 MHz), else default speed 22.5 MHz. Errors: reset CMD/DAT lines, CMD12,
-// retry once, then step down the clock (last resort: PIO). The polled PIO path
-// (DATPORT) stays as runtime fallback when ADMA2 fails its init self-check.
+// the SRAM_L/SRAM_U boundary, SDRAM until checkSdramDirect() passed) bounce
+// through an SRAM buffer. The descriptors and the bounce buffer live in the
+// uncached `.dma` section (dma_mem.h); SDRAM buffers get the system-cache
+// maintenance of sdram_cache.h around each direct transfer. Clock: CMD6 high
+// speed -> 45 MHz (180/4; stock asks the SDK for 50 MHz), else default speed
+// 22.5 MHz. Errors: reset CMD/DAT lines, CMD12, retry once, then step down the
+// clock (last resort: PIO). The polled PIO path (DATPORT) stays as runtime
+// fallback when ADMA2 fails its init self-check.
 #include "sdhc.h"
 
 #include <Arduino.h>
 #include <string.h>
 #include "board.h"
 #include "diag.h"
+#include "dma_mem.h"
+#include "sdram_cache.h"
 #include "hw_math.h"
 #include "k66.h"
 
@@ -70,8 +75,8 @@ constexpr uint32_t kBounceBlocks = board::kSdBounceBytes / 512;
 constexpr uint32_t kMaxDirectBlocks = board::kSdAdmaDescs * board::kSdAdmaDescBytes / 512;
 
 struct Adma2Desc { uint32_t attr; uint32_t addr; };
-alignas(32) Adma2Desc gDesc[board::kSdAdmaDescs];
-alignas(32) uint8_t gBounce[board::kSdBounceBytes];
+OT_DMA_MEM Adma2Desc gDesc[board::kSdAdmaDescs];
+OT_DMA_MEM uint8_t gBounce[board::kSdBounceBytes];
 
 bool gReady = false;
 bool gHighCapacity = false;
@@ -82,6 +87,11 @@ uint32_t gClockIdx = 1;
 uint32_t gProctl = PROCTL_LE;
 Info gInfo;
 const char* gNote = "";
+Counters gCount;
+// ADMA2 straight into / out of SDRAM: a property of the crossbar path, so it
+// survives card re-inits (set only by checkSdramDirect()).
+bool gSdramRd = false, gSdramWr = false;
+DirectCheck gDirect = DirectCheck::NotRun, gDirectWr = DirectCheck::NotRun;
 
 bool waitPrs(uint32_t mask, uint32_t timeoutMs) {
     uint32_t t = millis();
@@ -124,6 +134,7 @@ bool command(uint32_t idx, uint32_t arg, uint32_t flags) {
     SDHC_IRQSTAT = 0xFFFFFFFFu;
     SDHC_CMDARG = arg;
     SDHC_XFERTYP = CMD(idx) | flags;
+    gCount.cmds++;
     uint32_t s = waitIrq(I_CC, I_CMD_ERR, 500);
     if (!(s & I_CC) || (s & I_CMD_ERR)) {
         gLastErr = s ? s : 0x40000000u;
@@ -203,6 +214,7 @@ bool startData(bool write, uint32_t lba, uint32_t count, uint32_t extra) {
     if (count > 1) flags |= X_MSBSEL | X_BCEN | X_AC12EN;
     SDHC_CMDARG = gHighCapacity ? lba : lba * 512;
     SDHC_XFERTYP = CMD(write ? (count > 1 ? 25 : 24) : (count > 1 ? 18 : 17)) | flags;
+    gCount.cmds++;
     uint32_t s = waitIrq(I_CC, I_CMD_ERR, 500);
     if (!(s & I_CC) || (s & I_CMD_ERR)) { gLastErr = s ? s : 0x40000000u; return false; }
     SDHC_IRQSTAT = I_CC;
@@ -254,6 +266,8 @@ bool admaXfer(bool write, uint32_t lba, uint8_t* buf, uint32_t count) {
     const bool maint = detail::inCodeBusRam(reinterpret_cast<uint32_t>(buf)) ||
                        detail::inCodeBusRam(reinterpret_cast<uint32_t>(gDesc));
     if (maint) cacheClearAll();
+    if (write) cache::cleanForDma(buf, count * 512);   // SDRAM source (no-op elsewhere)
+    __asm__ volatile("dsb" ::: "memory");              // descriptors stored before the SDHC fetches them
     SDHC_ADSADDR = reinterpret_cast<uint32_t>(gDesc);
     if (!startData(write, lba, count, X_DMAEN)) return false;
     uint32_t s = waitIrq(I_TC, I_DATA_ERR, timeoutMsFor(count));
@@ -264,6 +278,7 @@ bool admaXfer(bool write, uint32_t lba, uint8_t* buf, uint32_t count) {
     }
     SDHC_IRQSTAT = I_TC | I_DINT;
     if (maint && !write) cacheClearAll();
+    if (!write) cache::invalidate(buf, count * 512);   // SDRAM destination (no-op elsewhere)
     return write ? waitTransferState() : true;
 }
 
@@ -311,18 +326,21 @@ bool xfer(bool write, uint32_t lba, uint8_t* buf, uint32_t count) {
         if (!gInfo.adma) {
             n = count < 0xFFFFu ? count : 0xFFFFu;
             ok = xferRobust(write, lba, buf, n);
-        } else if (n = count < kMaxDirectBlocks ? count : kMaxDirectBlocks,
-                   detail::dmaDirectOk(addr, n * 512, board::kSdDmaToSdram, board::kSdramBase,
-                                       board::kSdramSize)) {
+        } else if (const detail::Chunk c = detail::planChunk(addr, count, kMaxDirectBlocks, kBounceBlocks,
+                                                               write ? gSdramWr : gSdramRd, board::kSdramBase,
+                                                               board::kSdramSize);
+                   n = c.blocks, c.direct) {
+            gCount.direct++;
             ok = xferRobust(write, lba, buf, n);
         } else {
-            n = count < kBounceBlocks ? count : kBounceBlocks;
             gInfo.bounced++;
+            gCount.bounced++;
             if (write) memcpy(gBounce, buf, n * 512);
             ok = xferRobust(write, lba, gBounce, n);
             if (ok && !write) memcpy(buf, gBounce, n * 512);
         }
         if (!ok) return false;
+        if (write) gCount.writeBytes += n * 512; else gCount.readBytes += n * 512;
         lba += n;
         buf += n * 512;
         count -= n;
@@ -339,6 +357,7 @@ bool switchFunc(uint32_t arg, uint8_t* st) {
     SDHC_BLKATTR = (1u << 16) | 64;
     SDHC_CMDARG = arg;
     SDHC_XFERTYP = CMD(6) | R1 | X_DPSEL | X_DTDSEL;
+    gCount.cmds++;
     bool ok = false;
     uint32_t s = waitIrq(I_CC, I_CMD_ERR, 500);
     if ((s & I_CC) && !(s & I_CMD_ERR)) {
@@ -381,6 +400,71 @@ uint32_t sectorCount() { return gSectors; }
 uint32_t lastError() { return gLastErr; }
 const Info& info() { return gInfo; }
 const char* initNote() { return gNote; }
+const Counters& counters() { return gCount; }
+bool sdramDirectRead() { return gSdramRd; }
+bool sdramDirectWrite() { return gSdramWr; }
+DirectCheck directCheck() { return gDirect; }
+DirectCheck directWriteCheck() { return gDirectWr; }
+const char* directCheckName(DirectCheck c) {
+    switch (c) {
+    case DirectCheck::NotRun: return "not run";
+    case DirectCheck::Ok: return "ok";
+    case DirectCheck::Mismatch: return "MISMATCH";
+    case DirectCheck::XferError: return "transfer error";
+    case DirectCheck::Skipped: return "skipped";
+    }
+    return "?";
+}
+
+// ADMA2 straight into SDRAM, compared with the bounce path (docs/PLAN_2X.md
+// "Direct ADMA2 into SDRAM, behind an init self-check"). Reads: 64 sectors at
+// `lba` through the bounce buffer (reference) and directly into a pre-cached,
+// pre-filled SDRAM buffer (exercises the invalidate), plus 8 sectors to a
+// word- but not line-aligned address. Only reads touch the card here; direct
+// writes are verified lazily through FatFs (SdStorage, begin/endDirectWriteTrial).
+// UNVERIFIED: K66 crossbar lets the SDHC master (M5) reach the SDRAM controller.
+bool checkSdramDirect(uint8_t* scratch, uint32_t lba) {
+    constexpr uint32_t kN = 64, kBytes = kN * 512;
+    static_assert(kN <= kMaxDirectBlocks, "one ADMA2 table");
+    gSdramRd = gSdramWr = false;
+    gDirect = DirectCheck::Skipped;
+    gDirectWr = DirectCheck::NotRun;
+    if (!gReady || !gInfo.adma || !board::kSdDmaToSdram) return false;
+    uint8_t* ref = scratch;
+    uint8_t* chk = scratch + kBytes;
+    if (!xfer(false, lba, ref, kN)) { gDirect = DirectCheck::XferError; return false; }   // bounced
+    memset(chk, 0xA5, kBytes + 64);
+    volatile uint32_t sink = 0;
+    for (uint32_t i = 0; i < kBytes; i += 16) sink = sink + chk[i];   // pull into the cache
+    (void)sink;
+    gSdramRd = true;   // xfer() may now go direct
+    const uint32_t before = gCount.direct;
+    bool ok = xfer(false, lba, chk, kN) && gCount.direct != before;
+    if (!ok) gDirect = DirectCheck::XferError;
+    else if (memcmp(ref, chk, kBytes) != 0) { ok = false; gDirect = DirectCheck::Mismatch; }
+    if (ok) {
+        uint8_t* odd = chk + 4;
+        ok = xfer(false, lba, odd, 8);
+        if (!ok) gDirect = DirectCheck::XferError;
+        else if (memcmp(ref, odd, 8 * 512) != 0) { ok = false; gDirect = DirectCheck::Mismatch; }
+    }
+    if (!ok) {
+        gSdramRd = false;
+        recoverAfterError();
+        return false;
+    }
+    gDirect = DirectCheck::Ok;
+    return true;
+}
+
+// Direct-write trial (sd_storage.cpp, through FatFs on a temp file): writes from
+// SDRAM go direct only between begin and end; end(true) keeps them direct.
+void beginDirectWriteTrial() { gSdramWr = gSdramRd; }
+void endDirectWriteTrial(bool ok) {
+    gSdramWr = ok && gSdramRd;
+    gDirectWr = gSdramWr ? DirectCheck::Ok : (gSdramRd ? DirectCheck::Mismatch : DirectCheck::Skipped);
+}
+void skipDirectWriteCheck() { gSdramWr = false; gDirectWr = DirectCheck::Skipped; }
 
 void release() {
     gReady = false;
@@ -473,11 +557,54 @@ bool init() {
     return true;
 }
 
-bool readBlocks(uint32_t lba, uint8_t* dst, uint32_t count) { return xfer(false, lba, dst, count); }
+namespace {
+volatile Owner gOwner = Owner::kApp;
+uint32_t gViolations = 0;
+bool ownedBy(Owner o, const char* what) {
+    if (gOwner == o) return true;
+    if (gViolations++ < 8)
+        diagLogf("ASSERT sd: %s refused, the card belongs to the %s (USB storage mode)", what,
+                 gOwner == Owner::kHost ? "computer" : "app");
+    return false;
+}
+}  // namespace
+
+void setOwner(Owner o) { gOwner = o; }
+Owner owner() { return gOwner; }
+uint32_t ownershipViolations() { return gViolations; }
+
+bool readBlocks(uint32_t lba, uint8_t* dst, uint32_t count) {
+    return ownedBy(Owner::kApp, "app read") && xfer(false, lba, dst, count);
+}
 
 bool writeBlocks(uint32_t lba, const uint8_t* src, uint32_t count) {
     // xfer() only reads from `buf` on the write path (DMA source / memcpy source).
-    return xfer(true, lba, const_cast<uint8_t*>(src), count);
+    return ownedBy(Owner::kApp, "app write") && xfer(true, lba, const_cast<uint8_t*>(src), count);
+}
+
+bool hostReadBlocks(uint32_t lba, uint8_t* dst, uint32_t count) {
+    return ownedBy(Owner::kHost, "USB read") && xfer(false, lba, dst, count);
+}
+
+bool hostWriteBlocks(uint32_t lba, const uint8_t* src, uint32_t count) {
+    return ownedBy(Owner::kHost, "USB write") && xfer(true, lba, const_cast<uint8_t*>(src), count);
+}
+
+uint8_t* hostBuffer(uint32_t* bytes) {
+    if (gOwner != Owner::kHost) return nullptr;
+    *bytes = uint32_t(sizeof gBounce);
+    return gBounce;
+}
+
+uint8_t* takeBounceForFault(uint32_t* bytes) {
+    // Software reset of the DAT line: aborts a running ADMA transfer. Only
+    // with the SDHC clock gate on (a register access without it bus-faults).
+    if (SIM_SCGC3 & SIM_SCGC3_SDHC) {
+        SDHC_SYSCTL |= SDHC_SYSCTL_RSTD;
+        for (int i = 0; i < 100000 && (SDHC_SYSCTL & SDHC_SYSCTL_RSTD); ++i) {}
+    }
+    *bytes = uint32_t(sizeof gBounce);
+    return gBounce;
 }
 
 }  // namespace sdhc

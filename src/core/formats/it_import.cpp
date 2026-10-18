@@ -394,7 +394,7 @@ bool ItImport::nextPattern(int& k, bool& inSong) {
     return false;
 }
 
-void ItImport::storeCell(Pattern& pat, int row, int ch, int note, int ins, int vol, int cmd, int par,
+void ItImport::storeCell(PatternStock& pat, int row, int ch, int note, int ins, int vol, int cmd, int par,
                          bool& row0Tempo) {
     if (ins > 0) chanInstr_[ch] = uint8_t(ins);
     // Speed / tempo state follows every channel, stored or not.
@@ -463,7 +463,7 @@ void ItImport::storeCell(Pattern& pat, int row, int ch, int note, int ins, int v
     }
 }
 
-bool ItImport::convertPattern(int k, bool inSong, Pattern& pat, uint32_t& cost) {
+bool ItImport::convertPattern(int k, bool inSong, PatternStock& pat, uint32_t& cost) {
     pat.setDefault();
     const uint32_t ptr = k < nPat_ ? patPtr_[k] : 0;
     const float entryBpm = ts_.bpm();
@@ -518,7 +518,7 @@ bool ItImport::convertPattern(int k, bool inSong, Pattern& pat, uint32_t& cost) 
     // The Tempo FX override ends at every song-pattern switch (spec 03
     // §3.6): restate the tempo on row 0 when it differs from the project's.
     if (inSong && !row0Tempo && std::fabs(entryBpm - projBpm_) > 0.01f) {
-        for (int t = 0; t < kTrackCount; ++t) {
+        for (int t = 0; t < kStockTrackCount; ++t) {
             Step& s0 = pat.tracks[t].steps[0];
             StepFx* fx = s0.fx[0].type == 0 ? &s0.fx[0] : (s0.fx[1].type == 0 ? &s0.fx[1] : nullptr);
             if (!fx) continue;
@@ -555,7 +555,7 @@ ImportStep ItImport::step(uint32_t& cost) {
                 return ImportStep::Done;
             }
             done_[k >> 3] |= uint8_t(1 << (k & 7));
-            Pattern* pat = t_.pattern(t_.ctx, k + 1);
+            PatternStock* pat = t_.pattern(t_.ctx, k + 1);
             if (pat && !convertPattern(k, inSong, *pat, cost)) {
                 fail("Cannot read file");
                 return ImportStep::Failed;

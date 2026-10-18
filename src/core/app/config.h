@@ -62,6 +62,14 @@ struct Config {
     uint8_t recGain[4] = {50, 50, 50, 50};   // per source 0..100 (line, radio, mic LG, mic HG)
     uint8_t recMonitor = 1;        // 0 off, 1 on
     uint16_t radioFreq10 = 875;    // MHz x 10, default 87.5 (appendix C §2.8)
+    // 2.x (spec 2x-02 §2.2): Config > General "CPU meter". Not in the stock
+    // image: kept in the extension record after it (kExtOffset).
+    uint8_t cpuMeter = 0;          // 0 Auto, 1 Always, 2 Off
+    // 2.x synth voice budget B (OPTIMIZATION_2X item 10 / OP-8): voices the
+    // governor starts from, 1..8. Extension record byte 2.
+    uint8_t synthVoices = kDefaultSynthVoices;
+    static constexpr uint8_t kDefaultSynthVoices = 4;
+    static constexpr uint8_t kMaxSynthVoices = 8;
 
     // --- the stock config image --------------------------------------------
     static constexpr uint32_t kImageSize = 0xF4;   // spec 05 §5.4 version word 0xf4
@@ -74,6 +82,18 @@ struct Config {
     static constexpr uint32_t kOffPerfRows = 0xB4;       // u8[12]
     static constexpr uint32_t kOffPerfReserved = 0xC0;   // u8[8]
     uint8_t image[kImageSize];
+
+    // --- 2.x extension record (M1 plan, spec gap 7) -------------------------
+    // Stored right after the stock image (store offset kImageSize, file: after
+    // the image), so the stock bytes stay byte-exact and a stock firmware
+    // ignores it: "OTX" magic, version, payload length, payload, 8-bit sum of
+    // the payload. A missing or bad record leaves the defaults.
+    static constexpr uint32_t kExtOffset = kImageSize;
+    static constexpr uint8_t kExtVersion = 1;
+    static constexpr uint32_t kExtPayload = 2;               // cpuMeter, synthVoices
+    static constexpr uint32_t kExtSize = 5 + kExtPayload + 1;
+    void toExt(uint8_t* out) const;                          // kExtSize bytes
+    bool fromExt(const uint8_t* in, uint32_t len);           // false: none / bad (fields unchanged)
 
     Config();
     void setDefaults();

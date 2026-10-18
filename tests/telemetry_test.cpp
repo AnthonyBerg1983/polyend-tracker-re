@@ -73,3 +73,79 @@ TEST(telemetry_format) {
     formatTelemetry(small, sizeof small, s);
     CHECK(std::strlen(small) == 15);
 }
+
+// ---- 2.x "cpu" line (spec 2x-02 §4, tools/telemetry_check.py) -------------
+
+#include "audio/cpu_meter.h"
+#include "audio/governor.h"
+
+TEST(telemetry_cpu_line) {
+    CpuSample s;
+    s.avg = 372;
+    s.peak = 480;
+    s.overruns = 2;
+    s.cap = 3;
+    s.budget = 4;
+    s.synthVoices = 1;
+    s.cycPerVoice = 12000;
+    char line[160];
+    const size_t n = formatCpu(line, sizeof line, s);
+    CHECK_EQ(n, std::strlen(line));
+    CHECK_STR(line, "telemetry: cpu avg=37.2% peak=48.0% overruns=2 cap=3/4 synth_voices=1 cyc_per_voice=12000");
+    // With the peak block of the last window (audio/block_profile.h).
+    s.hasPeak = true;
+    s.pk.total = 491109;
+    s.pk.seq = 5400;
+    s.pk.smpOn = 8040;
+    s.pk.synOn = 8520;
+    s.pk.ctrl = 5360;
+    s.pk.smp = 160240;
+    s.pk.synFw = 14880;
+    s.pk.slot[0] = 124920;
+    s.pk.slot[1] = 27440;
+    s.pk.slot[2] = 40560;
+    s.pk.slotEngine[0] = ot::kSynthEngineVap;
+    s.pk.slotEngine[1] = ot::kSynthEngineAcd;
+    s.pk.slotEngine[2] = ot::kSynthEnginePerc;
+    s.pk.dly = 7720;
+    s.pk.rev = 39680;
+    s.pk.out = 36200;
+    s.pk.nSmpOn = 8;
+    s.pk.nSynOn[0] = 4;
+    s.pk.nSynOn[1] = 1;
+    s.pk.nSynOn[2] = 2;
+    s.pk.nSteal = 6;
+    s.pk.nPendStart = 2;
+    s.pk.nDeferred = 3;
+    s.pk.nSynVoices = 10;
+    s.pk.nSmpVoices = 8;
+    s.pk.seqWhy = ot::audio::kSeqPreloadPart | ot::audio::kSeqPatternEnd;
+    s.pk.nPatTracks = 2;
+    s.pk.nMidiOut = 3;
+    char big[400];
+    const size_t nb = formatCpu(big, sizeof big, s);
+    CHECK_EQ(nb, std::strlen(big));
+    CHECK_STR(big, "telemetry: cpu avg=37.2% peak=48.0% overruns=2 cap=3/4 synth_voices=1 cyc_per_voice=12000"
+                   " | pk 491k: seq 5k on 8k/9k ctl 5k smp 160k syn 15k VAP 125k ACD 27k PERC 41k dly 8k rev 40k out 36k"
+                   " | ev on 8 VAP 4 ACD 1 PERC 2 rl 0 fc 0 mc 0 st 6 pd 2 df 3 vx 10/8 sq PN pt 2 mo 3");
+    s.pk.seqWhy = 0;
+    CHECK(formatCpu(big, sizeof big, s) > 0 && std::strstr(big, " vx 10/8 sq - pt 2 mo 3") != nullptr);
+    s.hasPeak = false;
+    // From the meter / governor.
+    ot::audio::CpuMeter m;
+    ot::audio::Governor g;
+    for (int i = 0; i < 10; ++i) m.addBlock(ot::audio::CpuMeter::kBudgetCycles / 2);
+    const CpuSample t = cpuSample(m, g);
+    CHECK_EQ(t.peak, 500u);
+    CHECK_EQ(t.cap, 4);
+    CHECK_EQ(t.budget, 4);
+    CHECK_EQ(t.synthVoices, 0);
+    // 1 Hz period.
+    CpuTelemetry c;
+    CHECK_EQ(c.tick(100, m, g, line, sizeof line), 0u);   // starts the period
+    CHECK_EQ(c.tick(1099, m, g, line, sizeof line), 0u);
+    CHECK(c.tick(1100, m, g, line, sizeof line) > 0);
+    CHECK(std::strstr(line, "peak=50.0%") != nullptr);
+    CHECK_EQ(c.tick(1500, m, g, line, sizeof line), 0u);
+    CHECK(c.tick(2100, m, g, line, sizeof line) > 0);
+}

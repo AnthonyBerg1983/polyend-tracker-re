@@ -174,7 +174,7 @@ TEST(list_loading_progress_titles) {
     h.fs.dirs.insert("Firmware");
     h.fs.files["Firmware/PolyendTrackerOTv194.ptf"] = {1};
     h.tap(btn::Config);
-    for (int i = 0; i < 4; ++i) h.tap(btn::Down);   // Firmware
+    for (int i = 0; i < 5; ++i) h.tap(btn::Down);   // Firmware
     h.tap(btn::Right);
     h.tap(btn::F8);   // Firmware update
     CHECK_STR(a.ui.progressTitle(), kLoadingFirmwares);
@@ -213,7 +213,7 @@ TEST(usb_storage_mode_page) {
     CHECK_EQ(a.ui.active(), int(kModPattern));
     h.tap(btn::F1);
     CHECK(a.ui.usbStorageMode());
-    // Exit (F8) closes it; the SD card was never released.
+    // Exit (F8) closes it (2.x: the card comes back, usb_storage_test.cpp).
     h.tap(btn::F8);
     CHECK(!a.ui.usbStorageMode());
     h.run(40);

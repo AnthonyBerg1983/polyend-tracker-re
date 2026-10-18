@@ -1,0 +1,45 @@
+# bench-m4 baseline (make -C tests bench-m4: QEMU mps2-an386 -icount, device compiler flags).
+# Executed Cortex-M4 instructions per 128-frame audio block. make perf-gate fails when a
+# scenario exceeds its baseline by more than 5 %. Update this file in the same commit as a
+# deliberate change, with the reason. "-" = placeholder: the scenario is not in the bench
+# yet (reported, never fails); give it a number once audio_bench prints it.
+# Recorded 2026-10-16 on branch 2.x at 2.0.0 (M0), before any 2.x audio change.
+# stereo8 added with the M2 stereo voice path (WP-D): play8 with stereo instruments,
+# limit play8 + 24 % (docs/MINI_PLAN.md §2); 187917 = play8 + 21.4 %.
+# synth4 added with the M3 synth framework (WP-E): 4 voices of the internal test
+# engine in Synth 1 with a reverb send (includes reverb + limiter); framework
+# overhead 2935 insn/block (<= 3k). WP-F re-baselines it with the real engines.
+# vapinit / vapworst added with the VAP engine (WP-F): one VAP voice per block incl.
+# prepare (OPTIMIZATION_2X item 10 limits: Init <= 12k, worst <= 18k).
+# mix added with WP-H: stereo8 + 4 worst-case ACD voices + the costly PERC kit (six
+# drums hit every 32 blocks), real engines through renderLive; est. 68.7 % of the
+# block budget (peak hit block 71.5 %). The per-engine limit lines (acd.* / vap* /
+# perc*, "limit N") are gated in absolute terms by tools/telemetry_check.py.
+# OP-1..OP-3 (optimization pass part 2, 2.x): reverb in block passes (29.4k ->
+# 19.2k), fused voice chains + send-clamp skip, LDM/STM span copies, word-wise
+# mem*; every number below improved (render / mono hashes unchanged). mix now
+# runs at the default synth voice budget 4 (was budget 5: 286064); mix5 / mix6
+# are budgets 5 and 6. pswitch = the block with an immediate pattern switch
+# (stage buffer, pointer swap; the switch delta is gated as pswitch.d <= 40k
+# est. cycles).
+# 2.0.0 hardware round (CPU spikes, docs/OPTIMIZATION_2X.md "2.0.0 hardware round"):
+# peakavg / peak = song 5 replayed from its trace (tests/peak_trace.cpp) through
+# fillCallback, positions 0-2 (8100 blocks): average and worst block. Before the
+# note-on spreading / same-block steal change: peak 257600 (bar start of "Sixteen-track
+# chords"), avg 143535. play8 / worst / stereo8 / mix* / pswitch re-recorded (-0.1..-1.0 %,
+# the governor / profile code moved the layout); idle / idle2 / synth4 kept (+0.3..0.7 %:
+# the block-profile checks and the start counter, within the 5 % rule).
+idle     10731
+idle2    10863
+play8    138113
+worst    241144
+stereo8  167310
+synth4   66420
+vapinit  9025
+vapworst 17148
+mix      249396
+mix5     265354
+mix6     265357
+pswitch  137875
+peakavg  143387
+peak     224440

@@ -549,6 +549,23 @@ let me know?  http://forum.pjrc.com/forums/4-Suggestions-amp-Bug-Reports
   #define ENDPOINT3_CONFIG	ENDPOINT_TRANSMIT_ONLY
   #define ENDPOINT4_CONFIG	ENDPOINT_TRANSMIT_ONLY
   #define ENDPOINT5_CONFIG	ENDPOINT_RECEIVE_ONLY
+  // OPENTRACKER PATCH (see PATCHES.txt): OT_USB_MSC=1 adds a USB mass-storage
+  // interface (Bulk-Only Transport, SCSI transparent command set) as interface 3
+  // with bulk IN endpoint 6 and bulk OUT endpoint 7 (driver: usb_msc_impl.h). OT_USB_MSC=0 or
+  // undefined: exactly the upstream MIDI + Serial descriptors above.
+  #if defined(OT_USB_MSC) && OT_USB_MSC
+  #undef  NUM_ENDPOINTS
+  #define NUM_ENDPOINTS         7
+  #undef  NUM_INTERFACE
+  #define NUM_INTERFACE		4
+  #define MSC_INTERFACE		3	// Mass Storage (BOT)
+  #define MSC_TX_ENDPOINT	6
+  #define MSC_TX_SIZE		64
+  #define MSC_RX_ENDPOINT	7
+  #define MSC_RX_SIZE		64
+  #define ENDPOINT6_CONFIG	ENDPOINT_TRANSMIT_ONLY
+  #define ENDPOINT7_CONFIG	ENDPOINT_RECEIVE_ONLY
+  #endif
 
 #elif defined(USB_MIDI4_SERIAL)
   #define VENDOR_ID		0x16C0

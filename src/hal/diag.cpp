@@ -7,6 +7,7 @@
 #include "board.h"
 #include "diag_log.h"
 #include "k66.h"
+#include "sdhc.h"
 #include "usb_dev.h"
 #include "usb_mem.h"
 
@@ -15,6 +16,7 @@ namespace hal {
 
 namespace {
 diag::LogBuf gLog;
+static_assert(sizeof(diag::LogBuf) <= 8192, "gLog SRAM budget (docs/OPTIMIZATION_2X.md OP-5)");
 volatile uint32_t gStage = 0;
 const char* volatile gStageName = "reset";
 volatile uint32_t gBeat = 0;
@@ -23,7 +25,10 @@ volatile uint32_t gLastDrainMs = 0;
 void (*gOrigSystick)() = nullptr;
 bool gInit = false;
 volatile bool gWatchOn = true;
-char gFaultText[4096];   // registers + last 40 log lines (SRAM budget)
+// Fault report text (registers + last 40 log lines): written into the SD
+// bounce buffer, which nothing uses after a fault (CPU round 3: 4 KB of SRAM).
+char* gFaultText = nullptr;
+uint32_t gFaultCap = 0;
 
 constexpr uint32_t kSramLo = 0x1FFF0000u, kSramHi = 0x20030000u;   // MK66 SRAM_L + SRAM_U
 constexpr uint32_t kTxQueueMax = 4;       // of our CDC packets in flight (Teensy limit 8)
@@ -165,12 +170,14 @@ extern "C" __attribute__((used, noreturn)) void diagFaultC(uint32_t* frame, uint
     lf.str("FAULT ").str(diag::exceptionName(f.ipsr)).str(" PC ").hex(f.pc).str(" CFSR ").hex(f.cfsr)
         .str(" BFAR ").hex(f.bfar).str(" at stage ").dec(f.stage);
     diag::line(gLog, f.ms, l);
-    size_t n = diag::formatFault(gFaultText, sizeof gFaultText, f);
-    diag::Fmt t(gFaultText + n, sizeof gFaultText - n);
+    gFaultText = reinterpret_cast<char*>(sdhc::takeBounceForFault(&gFaultCap));
+    if (gFaultCap > 4096) gFaultCap = 4096;
+    size_t n = diag::formatFault(gFaultText, gFaultCap, f);
+    diag::Fmt t(gFaultText + n, gFaultCap - n);
     t.str("--- last 40 log lines:\r\n");
     n += t.len;
-    n += diag::copyFrom(gLog, diag::tailStart(gLog, 40), gFaultText + n, sizeof gFaultText - n - 96);
-    diag::Fmt e(gFaultText + n, sizeof gFaultText - n);
+    n += diag::copyFrom(gLog, diag::tailStart(gLog, 40), gFaultText + n, gFaultCap - n - 96);
+    diag::Fmt e(gFaultText + n, gFaultCap - n);
     e.str("--- end of fault report (repeats every 1 s; send any byte for the boot log)\r\n\r\n");
     n += e.len;
 

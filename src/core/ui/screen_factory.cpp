@@ -8,6 +8,7 @@
 #include "app/input_gain.h"
 #include "ui/gfx.h"
 #include "ui/ui.h"
+#include "sdram_bss.h"
 
 namespace ot {
 
@@ -164,7 +165,7 @@ void FactoryTest::runRadio() {
 // has no check in OpenTracker.
 void FactoryTest::runSd() {
     IStorage& fs = app_.fs();
-    static uint8_t buf[4096];
+    OT_SDRAM_BSS static uint8_t buf[4096];   // SDRAM on the device (OP-5)
     bool ok = true;
     IStorage::Handle h = fs.open(kSdTestPath, IStorage::kWrite);
     if (h < 0) ok = false;

@@ -10,7 +10,11 @@ namespace {
 struct ScreenSet {
     ScreenSet(Ui& u, App& a)
         : file(u, a), loader(u, a), pattern(u, a), playback(u, a), song(u, a), instrument(u, a), editor(u, a),
-          config(u, a), recorder(u, a), performance(u, a), mixer(u, a), games(u, a) {}
+          config(u, a), recorder(u, a), performance(u, a), mixer(u, a),
+#if OT_GAMES
+          games(u, a),
+#endif
+          synth(u, a) {}
     FileScreen file;
     LoaderScreen loader;
     PatternScreen pattern;
@@ -22,7 +26,10 @@ struct ScreenSet {
     RecorderScreen recorder;
     PerformanceScreen performance;
     MixerScreen mixer;
+#if OT_GAMES
     GamesScreen games;
+#endif
+    SynthScreen synth;
 };
 }  // namespace
 
@@ -39,7 +46,10 @@ void* createScreens(Ui& ui, App& app, Screen** out) {
     out[kModRecorder] = &s->recorder;
     out[kModPerformance] = &s->performance;
     out[kModMaster] = &s->mixer;
+#if OT_GAMES
     out[kModGames] = &s->games;
+#endif
+    out[kModSynth] = &s->synth;
     return s;
 }
 

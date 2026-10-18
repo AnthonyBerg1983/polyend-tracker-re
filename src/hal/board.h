@@ -139,10 +139,33 @@ constexpr uint8_t kSdDtocv = 0xE;            // spec 01 §6 (SDCLK x 2^27 data t
 // ADMA2 (spec 01 §6: stock SDK host uses ADMA2). OpenTracker sizes:
 constexpr uint32_t kSdAdmaDescs = 8;         // descriptors per command
 constexpr uint32_t kSdAdmaDescBytes = 32768; // bytes per descriptor (16-bit length field)
-constexpr uint32_t kSdBounceBytes = 8192;   // SRAM bounce buffer (16 sectors; SRAM budget)
+// SRAM bounce buffer. 2.x USB Storage (OT_USB_MSC=1): 16 KB (32 sectors),
+// which is also the computer's 4-chunk transfer ring while it owns the card
+// (usb_storage.cpp, msc::Bot::kChunk); the 8 KB it adds come from the FatFs
+// file objects moved to the SDRAM (sd_storage.cpp). Fallback image: 8 KB.
+#if defined(OT_USB_MSC) && OT_USB_MSC
+constexpr uint32_t kSdBounceBytes = 16384;
+#else
+constexpr uint32_t kSdBounceBytes = 8192;
+#endif
 // UNVERIFIED: whether the SDHC crossbar master (M5) reaches the SDRAM controller
-// slave. Until confirmed on hardware, buffers in SDRAM bounce through SRAM.
-constexpr bool kSdDmaToSdram = false;
+// slave. 2.x: true = try it; sdhc::checkSdramDirect() compares it with the bounce
+// path at boot and only then lets SDRAM buffers skip the bounce (else they bounce).
+constexpr bool kSdDmaToSdram = true;
+// Direct SDRAM->SD writes: verified lazily (first SDRAM-sourced write of the
+// boot) through FatFs on a temp file (sd_storage.cpp); never raw sectors.
+// false = SDRAM writes always bounce.
+constexpr bool kSdDirectWriteCheck = true;
+// SDRAM scratch for the boot-time cache + direct-DMA checks: inside the 1 MB the
+// quick test just destroyed, before the application owns the SDRAM.
+constexpr uint32_t kSdramCheckScratch = kSdramBase + 0x00040000;   // cache test (80 KB)
+constexpr uint32_t kSdramSdScratch    = kSdramBase + 0x00060000;   // SD direct check (65 KB)
+// `.sdram_bss` (core/sdram_bss.h, docs/OPTIMIZATION_2X.md OP-5): the linker
+// region SDRAM_BSS of src/hal/opentracker.ld, below the selftest's buffer in
+// the top 64 KB (selftest.cpp). The app's SDRAM layout (app_main.cpp) ends
+// below it. 2.0.1: 80 KB (was 64 KB) for the FatFs file objects.
+constexpr uint32_t kSdramBssBase      = kSdramBase + 0x00FDC000;
+constexpr uint32_t kSdramBssSize      = 0x00014000;
 
 // ---- input (spec 01 §7) ---------------------------------------------------------
 constexpr uint8_t kTeensyButtonsInt = 14;    // spec 01 §7.1: PTD1

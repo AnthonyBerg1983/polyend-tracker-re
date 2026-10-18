@@ -361,3 +361,164 @@ TEST(fx_values_use_engine_ranges) {
     CHECK_EQ(s.fx[0].value, 29);   // pad 47 = max (0..29)
     CHECK_EQ(seq::fxMax(uint8_t(FxId::BitDepth)), 16);
 }
+
+// ---------------------------------------------------------------------------
+// 2.x M1 (docs/M1_PLAN.md §4, 2x-01 §2): tracks 13..16 in the pattern editor.
+
+// The 4-track window scrolls to tracks 13..16 like it reaches 9..12 (first
+// shown track 0..12; 0..8 with a column mask); Right at track 16 stops.
+TEST(tracks_13_16_window_and_tabs) {
+    Harness h;
+    App& a = *h.app;
+    PatternScreen& p = pe(h);
+    for (int i = 0; i < 20; ++i) h.tap(btn::Right);
+    CHECK_EQ(p.track, kTrackCount - 1);
+    CHECK_EQ(p.firstTrack, kTrackCount - 4);
+    a.ui.dirty();
+    h.run(40);
+    for (const char* nm : {"\"Midi 13\"", "\"Midi 14\"", "\"Midi 15\"", "\"Midi 16\""}) CHECK(h.disp.lastHasText(nm));
+    CHECK(!h.disp.lastHasText("\"Midi 12\""));
+    // Back left: the window follows one track at a time, as on 1..12.
+    for (int i = 0; i < 4; ++i) h.tap(btn::Left);
+    CHECK_EQ(p.track, 11);
+    CHECK_EQ(p.firstTrack, 11);
+    // Column mask: 8 tracks, first shown track at most 8.
+    for (int i = 0; i < 4; ++i) h.tap(btn::Right);
+    h.down(btn::Pattern);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    CHECK(p.colMask != 0);
+    h.tap(btn::Left);
+    h.tap(btn::Right);
+    CHECK_EQ(p.firstTrack, kTrackCount - 8);
+    a.ui.dirty();
+    h.run(40);
+    CHECK(h.disp.lastHasText("\"Midi 9\""));
+    CHECK(h.disp.lastHasText("\"Midi 16\""));
+    // Horizontal arrangement keeps its window (rows = the same tracks).
+    h.down(btn::Pattern);
+    h.tap(btn::Fx1);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    CHECK_EQ(p.colMask, 0);
+    a.cfg.arrangement = 2;
+    h.tap(btn::Down);   // track + 1 (already the last)
+    CHECK_EQ(p.track, kTrackCount - 1);
+    CHECK_EQ(p.firstTrack, kTrackCount - 4);
+}
+
+// Mute (Shift) and Live-REC arm (Shift + Rec) pages: bank B (cursor on 9..16)
+// puts tracks 9..16 on F1..F8, so F5..F8 reach 13..16.
+TEST(tracks_13_16_mute_and_arm_pages) {
+    Harness h;
+    App& a = *h.app;
+    PatternScreen& p = pe(h);
+    for (int i = 0; i < 13; ++i) h.tap(btn::Right);
+    CHECK_EQ(p.track, 13);
+    h.down(btn::Shift);
+    h.run(20);
+    CHECK_STR(a.ui.bar.label[0].top, "Midi 9");
+    CHECK_STR(a.ui.bar.label[4].top, "Midi 13");
+    CHECK_STR(a.ui.bar.label[7].top, "Midi 16");
+    CHECK(!a.ui.bar.label[7].hidden);
+    CHECK_STR(a.ui.bar.label[7].bottom, a.trackMuted(15) ? "Unmute" : "Mute");
+    h.tap(btn::Rec);   // arm page
+    CHECK(p.recArmPage);
+    CHECK(p.armed[12] && p.armed[15]);
+    h.tap(btn::F5);
+    h.tap(btn::F8);
+    CHECK(!p.armed[12]);
+    CHECK(!p.armed[15]);
+    CHECK(p.armed[13] && p.armed[11]);
+    CHECK_STR(a.ui.bar.label[4].bottom, "Unarmed");
+    h.up(btn::Shift);
+    // Bank A on tracks 1..8.
+    for (int i = 0; i < 13; ++i) h.tap(btn::Left);
+    h.down(btn::Shift);
+    h.run(20);
+    CHECK_STR(a.ui.bar.label[0].top, "Track 1");
+    h.up(btn::Shift);
+}
+
+// Selections, copy / paste, note entry and Fill across 16 tracks; tracks
+// 13..16 are stored in the ext-track pool.
+TEST(tracks_13_16_selection_copy_paste_entry) {
+    Harness h;
+    App& a = *h.app;
+    PatternScreen& p = pe(h);
+    // Shift+Up at step 0 twice: all 16 tracks.
+    h.down(btn::Shift);
+    h.tap(btn::Up);
+    h.tap(btn::Up);
+    h.up(btn::Shift);
+    SelRect r = p.target();
+    CHECK_EQ(r.t0, 0);
+    CHECK_EQ(r.t1, kTrackCount - 1);
+    // Whole column at track 16, Shift+Right extends to all tracks.
+    for (int i = 0; i < 16; ++i) h.tap(btn::Right);
+    h.down(btn::Shift);
+    h.tap(btn::Up);
+    CHECK(p.wholeCol);
+    h.tap(btn::Right);
+    h.up(btn::Shift);
+    CHECK(p.allTracks);
+    // Note entry on track 13 (edit mode).
+    h.tap(btn::Left);   // collapses, cursor to track 15
+    for (int i = 0; i < 2; ++i) h.tap(btn::Left);
+    CHECK_EQ(p.track, 12);
+    h.tap(btn::Rec);
+    CHECK(p.edit());
+    a.setCurrentInstrument(kFirstMidiInstrument + 12);   // MIDI 13 = "M13"
+    a.cfg.midiOut = 3;   // USB + jack
+    const int n0 = h.midi.sent.size();
+    h.pad(10);
+    CHECK(int(h.midi.sent.size()) > n0);   // audition on track 13 (MIDI out)
+    const Step& e = a.pattern().tracks[12].steps[0];
+    CHECK(e.note >= 0);
+    CHECK_EQ(int(e.instrument), kFirstMidiInstrument + 12);
+    const int num = a.patternNumber();
+    const Track* st = a.findStoredTrack(num, 12);
+    CHECK(st != nullptr);
+    if (st) CHECK_EQ(int(st->steps[0].note), int(e.note));
+    a.ui.dirty();
+    h.run(40);
+    CHECK(h.disp.lastHasText("\"M13\""));
+    // Copy tracks 13..14, step 0 and paste at track 15: the paste clamps at
+    // track 16.
+    p.step = 0;
+    h.down(btn::Shift);
+    h.tap(btn::Right);
+    h.up(btn::Shift);
+    r = p.target();
+    CHECK_EQ(r.t0, 12);
+    CHECK_EQ(r.t1, 13);
+    h.tap(btn::Copy);
+    CHECK(a.clipboardValid());
+    h.tap(btn::Right);   // collapse, cursor to track 15
+    CHECK_EQ(p.track, 14);
+    p.step = 0;
+    h.down(btn::Shift);
+    h.tap(btn::Copy);    // paste
+    h.up(btn::Shift);
+    CHECK_EQ(int(a.pattern().tracks[14].steps[0].note), int(e.note));
+    CHECK(a.pattern().tracks[15].steps[0].note == kNoteEmpty);
+    CHECK(a.findStoredTrack(num, 14) != nullptr);
+    // Fill over all 16 tracks (constant note).
+    pops::FillParams f;
+    f.where = 1;   // empty steps
+    f.from = f.to = 62;
+    SelRect all;
+    all.s0 = 0;
+    all.s1 = 3;
+    all.t0 = 0;
+    all.t1 = kTrackCount - 1;
+    pops::fill(a.pattern(), all, 0, f, 0, uint8_t(kFirstMidiInstrument), nullptr, nullptr);
+    for (int t = 0; t < kTrackCount; ++t) CHECK_EQ(int(a.pattern().tracks[t].steps[3].note), 62);
+    // Pattern copy / paste carries all 16 tracks.
+    a.patternEdited();
+    p.page = 1;
+    h.tap(btn::F6);     // Copy pattern
+    a.pattern().tracks[15].steps[3].note = kNoteEmpty;
+    h.tap(btn::F7);     // Paste pattern
+    CHECK_EQ(int(a.pattern().tracks[15].steps[3].note), 62);
+}

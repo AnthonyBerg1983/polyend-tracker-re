@@ -12,6 +12,7 @@
 #include "formats/mod_import.h"
 #include "ui/screen_games.h"
 #include "ui/screens.h"
+#include "sdram_bss.h"
 
 namespace ot {
 
@@ -20,11 +21,12 @@ int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 // Browser of the Open (state 1) and Save (state 3) pages; its names live in
 // FileScreen::entries (spec 05 appendix E1.2).
-ProjectBrowser g_browser;
+OT_SDRAM_BSS SdramLazy<ProjectBrowser> g_browserMem;   // SDRAM on the device (CPU round 3)
+ProjectBrowser& projBrowser() { return g_browserMem.get(); }
 
 // Target remembered for a deferred open (spec 05 appendix E1.2: heap copies
 // of the path/name; pending 2 = SD list, 3 = Recent list).
-char g_openFolder[ProjectBrowser::kPathMax + 1];
+OT_SDRAM_BSS char g_openFolder[ProjectBrowser::kPathMax + 1];
 char g_openName[ProjectBrowser::kNameCap];
 int g_openRecent = 0;
 int g_openKind = 2;
@@ -59,10 +61,10 @@ constexpr int kModEntries = 64;
 constexpr int kModNameCap = 56;
 enum : uint8_t { kMbUp = 0, kMbFolder = 1, kMbFile = 2 };
 char g_modPath[ProjectBrowser::kPathMax + 1] = "Mod";
-char g_modNames[kModEntries][kModNameCap];
+OT_SDRAM_BSS char g_modNames[kModEntries][kModNameCap];   // SDRAM on the device (OP-5)
 uint8_t g_modKinds[kModEntries];
 int g_modCount = 0;
-char g_importPath[ProjectBrowser::kPathMax + kModNameCap + 2];
+OT_SDRAM_BSS char g_importPath[ProjectBrowser::kPathMax + kModNameCap + 2];
 char g_importName[kModNameCap];
 
 bool modListFn(const IStorage::DirEntry& e, void*) {
@@ -107,35 +109,40 @@ bool modIsFile(int i) { return i >= 0 && i < g_modCount && g_modKinds[i] == kMbF
 bool modIsDir(int i) { return i >= 0 && i < g_modCount && g_modKinds[i] != kMbFile; }
 
 // ---- background import / export (spec 11 §0.1 sub-ops 0x13 / 0x14) -------
-ModImport g_modImport;
-ItImport g_itImport;
-ItExport g_itExport;
+// SDRAM on the device (CPU round 3): main-loop jobs.
+OT_SDRAM_BSS SdramLazy<ModImport> g_modImportMem;
+OT_SDRAM_BSS SdramLazy<ItImport> g_itImportMem;
+OT_SDRAM_BSS SdramLazy<ItExport> g_itExportMem;
+ModImport& modImport() { return g_modImportMem.get(); }
+ItImport& itImport() { return g_itImportMem.get(); }
+ItExport& itExport() { return g_itExportMem.get(); }
 ModuleKind g_importKind = ModuleKind::None;
 char g_exportPath[mt::kNameMax + 16];
 
 int16_t* reserveSample(void* ctx, int slot, uint32_t frames, bool stereo) {
     return static_cast<App*>(ctx)->bank.reserve(slot, frames, stereo);
 }
-Pattern* importPattern(void* ctx, int number) {
+PatternStock* importPattern(void* ctx, int number) {
     App& a = *static_cast<App*>(ctx);
     a.markPatternDirty(number);
-    return &a.stored(number);
+    a.clearExtTracks(number);   // the import overwrites the whole pattern (12 channels)
+    return &a.storedStock(number);
 }
 int importUnit(void*, uint32_t& cost) {
-    const ImportStep r = g_importKind == ModuleKind::Mod ? g_modImport.step(cost) : g_itImport.step(cost);
+    const ImportStep r = g_importKind == ModuleKind::Mod ? modImport().step(cost) : itImport().step(cost);
     return int(r);
 }
-int importPercent(void*) { return g_importKind == ModuleKind::Mod ? g_modImport.percent() : g_itImport.percent(); }
-const char* importError() { return g_importKind == ModuleKind::Mod ? g_modImport.error() : g_itImport.error(); }
-const char* importWarning() { return g_importKind == ModuleKind::Mod ? g_modImport.warning() : g_itImport.warning(); }
+int importPercent(void*) { return g_importKind == ModuleKind::Mod ? modImport().percent() : itImport().percent(); }
+const char* importError() { return g_importKind == ModuleKind::Mod ? modImport().error() : itImport().error(); }
+const char* importWarning() { return g_importKind == ModuleKind::Mod ? modImport().warning() : itImport().warning(); }
 
 // spec 11 §1.1 Result: pattern 1 is current, the project is changed (the
 // Workspace files are written by the autosave), the Pattern editor shows.
 void importDone(void* ctx, bool ok) {
     auto* s = static_cast<FileScreen*>(ctx);
     App& a = *g_app;
-    if (g_importKind == ModuleKind::Mod) g_modImport.abort();
-    else g_itImport.abort();
+    if (g_importKind == ModuleKind::Mod) modImport().abort();
+    else itImport().abort();
     for (int i = 0; i < kSampleInstrumentCount; ++i)
         if (a.instrPresent[i]) a.markInstrumentDirty(i, true);
     a.project.setCurrentPattern(1);
@@ -158,18 +165,18 @@ const int16_t* exportSamples(void* ctx, int slot, uint32_t* frames, bool* stereo
     *stereo = a.bank.stereo(slot);
     return *frames ? a.bank.left(slot) : nullptr;
 }
-const Pattern* exportPattern(void* ctx, int number) {
+const PatternStock* exportPattern(void* ctx, int number) {
     App& a = *static_cast<App*>(ctx);
-    return a.patternPresent(number) ? &a.stored(number) : nullptr;
+    return a.patternPresent(number) ? &a.storedStock(number) : nullptr;
 }
-int exportUnit(void*, uint32_t& cost) { return int(g_itExport.step(cost)); }
-int exportPercent(void*) { return g_itExport.percent(); }
+int exportUnit(void*, uint32_t& cost) { return int(itExport().step(cost)); }
+int exportPercent(void*) { return itExport().percent(); }
 void exportDone(void*, bool ok) {
     App& a = *g_app;
-    g_itExport.abort();
+    itExport().abort();
     char msg[64];
     if (ok) std::snprintf(msg, sizeof(msg), "Exported %s", g_exportPath);
-    else std::snprintf(msg, sizeof(msg), "%s", g_itExport.error()[0] ? g_itExport.error() : "Export failed");
+    else std::snprintf(msg, sizeof(msg), "%s", itExport().error()[0] ? itExport().error() : "Export failed");
     a.ui.notify(msg);
 }
 }  // namespace
@@ -180,8 +187,8 @@ static void importModule(FileScreen& s, App& a) {
     g_importKind = moduleKind(g_importName);
     const AppMemory& m = a.mem();
     bool ok = false;
-    if (g_importKind == ModuleKind::Mod) ok = g_modImport.begin(a.fs(), g_importPath, m.scratch, m.scratchBytes);
-    else if (g_importKind == ModuleKind::It) ok = g_itImport.begin(a.fs(), g_importPath, m.scratch, m.scratchBytes);
+    if (g_importKind == ModuleKind::Mod) ok = modImport().begin(a.fs(), g_importPath, m.scratch, m.scratchBytes);
+    else if (g_importKind == ModuleKind::It) ok = itImport().begin(a.fs(), g_importPath, m.scratch, m.scratchBytes);
     if (!ok) {
         // Refused before anything changed: the current project stays.
         a.ui.notify(g_importKind == ModuleKind::None ? "Unknown file type" : importError());
@@ -199,8 +206,8 @@ static void importModule(FileScreen& s, App& a) {
     t.reserve = reserveSample;
     t.pattern = importPattern;
     t.ctx = &a;
-    if (g_importKind == ModuleKind::Mod) g_modImport.apply(t);
-    else g_itImport.apply(t);
+    if (g_importKind == ModuleKind::Mod) modImport().apply(t);
+    else itImport().apply(t);
     if (!a.startExternalJob("Importing mod file", importUnit, importPercent, nullptr, importDone, &s)) {
         a.ui.notify("Import failed");
         return;
@@ -212,7 +219,7 @@ static void importModule(FileScreen& s, App& a) {
 static void exportIt(App& a) {
     a.finishJob();
     a.seq.stop();
-    a.stored(a.patternNumber()) = a.pattern();
+    a.commitCurrentPattern();
     a.fs().mkdir(kModDir);
     std::snprintf(g_exportPath, sizeof(g_exportPath), "%s/%s.it", kModDir,
                   a.project.name[0] ? a.project.name : "New Project");
@@ -224,12 +231,12 @@ static void exportIt(App& a) {
     src.pattern = exportPattern;
     src.ctx = &a;
     const AppMemory& m = a.mem();
-    if (!g_itExport.begin(a.fs(), g_exportPath, src, m.scratch, m.scratchBytes)) {
-        a.ui.notify(g_itExport.error());
+    if (!itExport().begin(a.fs(), g_exportPath, src, m.scratch, m.scratchBytes)) {
+        a.ui.notify(itExport().error());
         return;
     }
     if (!a.startExternalJob("Exporting to .it file", exportUnit, exportPercent, nullptr, exportDone, nullptr)) {
-        g_itExport.abort();
+        itExport().abort();
         a.ui.notify("Export failed");
     }
 }
@@ -237,7 +244,7 @@ static void exportIt(App& a) {
 void FileScreen::start(int opt) {
     (void)opt;
     g_app = &app_;
-    g_browser.bind(entries, int(sizeof(entries) / sizeof(entries[0])));
+    projBrowser().bind(entries, int(sizeof(entries) / sizeof(entries[0])));
     state = 0;
     refreshBar();
 }
@@ -251,7 +258,7 @@ void FileScreen::start(int opt) {
 void FileScreen::update(uint32_t now) {
     char key[sizeof(coverKey_)] = {};
     const bool browser = (state == 1 || state == 3) && focus == 0 && !ui_.kb.isOpen() && !ui_.askOpen();
-    if (browser && g_browser.isProject(cursor)) g_browser.entryPath(cursor, key, int(sizeof(key)));
+    if (browser && projBrowser().isProject(cursor)) projBrowser().entryPath(cursor, key, int(sizeof(key)));
     if (std::strcmp(key, coverKey_) != 0) {
         if (coverState == 2) ui_.dirty();
         std::snprintf(coverKey_, sizeof(coverKey_), "%s", key);
@@ -279,11 +286,11 @@ void FileScreen::update(uint32_t now) {
 void FileScreen::list() {
     App& a = app_;
     g_app = &a;
-    g_browser.bind(entries, int(sizeof(entries) / sizeof(entries[0])));
+    projBrowser().bind(entries, int(sizeof(entries) / sizeof(entries[0])));
     // spec 05 §1.3 progress popup while the list loads ("Loading projects list").
     ui_.progress(kLoadingProjects, 0);
-    g_browser.list(a);
-    count = g_browser.count();
+    projBrowser().list(a);
+    count = projBrowser().count();
     // Recent list (spec 02 §7, appendix E2): compacted, last path component.
     Recents rec;
     recentCount_ = loadRecents(a, rec);
@@ -302,15 +309,17 @@ void FileScreen::refreshBar() {
         b.set(3, "Save");
         b.set(4, "Save As");
         b.set(5, "Export");
+#if OT_GAMES
         b.set(6, "Games");   // spec 14 §1: File F7 opens the Games browser
+#endif
     } else if (state == 1 || state == 3) {
         // spec 05 appendix E1.2: labels greyed by selection kind (0x4742c).
         const bool sd = focus == 0;
-        b.set(0, "Enter", nullptr, sd && (g_browser.isFolder(cursor) || g_browser.isUp(cursor)));
-        b.set(2, "Delete", nullptr, sd && (g_browser.isFolder(cursor) || g_browser.isProject(cursor)));
+        b.set(0, "Enter", nullptr, sd && (projBrowser().isFolder(cursor) || projBrowser().isUp(cursor)));
+        b.set(2, "Delete", nullptr, sd && (projBrowser().isFolder(cursor) || projBrowser().isProject(cursor)));
         b.set(3, "New Folder", nullptr, sd);
         b.set(6, "Cancel");
-        if (state == 1) b.set(7, "Open", nullptr, sd ? g_browser.isProject(cursor) : recentCount_ > 0);
+        if (state == 1) b.set(7, "Open", nullptr, sd ? projBrowser().isProject(cursor) : recentCount_ > 0);
         else b.set(7, "Save");
     } else if (state == 2) {
         // spec 05 appendix E1.2 import mode (0x478c0).
@@ -338,9 +347,9 @@ static void enterBrowser(FileScreen& s, int mode) {
     s.state = mode;
     s.focus = 0;
     s.cursor = 0;
-    g_browser.bind(s.entries, int(sizeof(s.entries) / sizeof(s.entries[0])));
+    projBrowser().bind(s.entries, int(sizeof(s.entries) / sizeof(s.entries[0])));
     g_app->ui.progress(kLoadingProjects, 0);   // closed by list()
-    g_browser.reset(*g_app, kProjectsDir);
+    projBrowser().reset(*g_app, kProjectsDir);
     s.list();
 }
 
@@ -451,7 +460,7 @@ static void saveNow(void* ctx, int key) {
     }
     // spec 05 appendix E3: Save As into the Save browser's current folder.
     s->start(0);   // back to the File main page
-    if (!startSaveProjectInto(a, g_browser.path(), g_saveName, saveDone, s)) {
+    if (!startSaveProjectInto(a, projBrowser().path(), g_saveName, saveDone, s)) {
         a.ui.notify("Save failed");
         s->pending = 0;
     }
@@ -468,7 +477,7 @@ static void saveKeyboardDone(void* ctx, bool ok, const char* text) {
         openSaveKeyboard(*s, a, g_saveName);
         return;
     }
-    if (a.projectExists(g_browser.path(), g_saveName)) {
+    if (a.projectExists(projBrowser().path(), g_saveName)) {
         a.ui.ask("Project exists", "Overwrite it?", nullptr, "Cancel", "Overwrite", saveNow, s);
         return;
     }
@@ -504,7 +513,7 @@ void FileScreen::openAction() {
     App& a = app_;
     g_app = &a;
     if (focus == 0) {
-        if (!g_browser.isProject(cursor)) return;
+        if (!projBrowser().isProject(cursor)) return;
     } else if (recentCount_ <= 0) {
         return;
     }
@@ -513,7 +522,7 @@ void FileScreen::openAction() {
         return;
     }
     if (focus == 0) {
-        std::snprintf(g_openFolder, sizeof(g_openFolder), "%s", g_browser.path());
+        std::snprintf(g_openFolder, sizeof(g_openFolder), "%s", projBrowser().path());
         std::snprintf(g_openName, sizeof(g_openName), "%s", entries[cursor]);
         g_openKind = 2;
     } else {
@@ -605,9 +614,11 @@ void FileScreen::onButton(uint8_t id, uint8_t st) {
         switch (id) {
             case btn::F1: doNew(); break;
             case btn::F2: enterBrowser(*this, 1); break;
+#if OT_GAMES
             case btn::F7:   // spec 14 §1: Games browser
                 openGames(a);
                 return;
+#endif
             case btn::F3:
                 // spec 05 appendix E1.2 / spec 11 §1.1: browser mode 2 at "Mod";
                 // Projects/ and Mod/ are created when missing (0x1f274).
@@ -662,10 +673,10 @@ void FileScreen::onButton(uint8_t id, uint8_t st) {
             case btn::F1:   // Enter (0x4577c): folders only
                 if (focus == 0) {
                     ui_.progress(kLoadingProjects, 0);
-                    const bool entered = g_browser.enter(a, cursor);
+                    const bool entered = projBrowser().enter(a, cursor);
                     ui_.progressDone();
                     if (entered) {
-                        count = g_browser.count();
+                        count = projBrowser().count();
                         cursor = 0;
                     }
                 }
@@ -680,7 +691,7 @@ void FileScreen::onButton(uint8_t id, uint8_t st) {
                 break;
             case btn::F3: {   // Delete project / folder (0x454ec)
                 if (focus != 0) break;
-                const ProjectBrowser::Result r = g_browser.canDelete(a, cursor);
+                const ProjectBrowser::Result r = projBrowser().canDelete(a, cursor);
                 if (r == ProjectBrowser::Result::Active || r == ProjectBrowser::Result::ContainsActive) {
                     ui_.notify("Cannot delete active project");
                     break;
@@ -688,14 +699,14 @@ void FileScreen::onButton(uint8_t id, uint8_t st) {
                 if (r != ProjectBrowser::Result::Ok) break;
                 char text[64];
                 std::snprintf(text, sizeof(text), "\"%s\"?", entries[cursor]);
-                ui_.ask(g_browser.isProject(cursor) ? "Delete project:" : "Delete folder:", text, nullptr, "Cancel",
+                ui_.ask(projBrowser().isProject(cursor) ? "Delete project:" : "Delete folder:", text, nullptr, "Cancel",
                         "Delete",
                         [](void* ctx, int key) {
                             auto* self = static_cast<FileScreen*>(ctx);
                             if (key != btn::F8) return;
-                            if (g_browser.remove(self->app_, self->cursor) != ProjectBrowser::Result::Ok)
+                            if (projBrowser().remove(self->app_, self->cursor) != ProjectBrowser::Result::Ok)
                                 self->ui_.notify("Delete failed");
-                            self->count = g_browser.count();
+                            self->count = projBrowser().count();
                             self->cursor = clampi(self->cursor, 0, self->count ? self->count - 1 : 0);
                             self->refreshBar();
                         },
@@ -708,9 +719,9 @@ void FileScreen::onButton(uint8_t id, uint8_t st) {
                             [](void* ctx, bool ok, const char* text) {
                                 auto* self = static_cast<FileScreen*>(ctx);
                                 if (!ok) return;
-                                switch (g_browser.newFolder(self->app_, text)) {
+                                switch (projBrowser().newFolder(self->app_, text)) {
                                     case ProjectBrowser::Result::Ok:
-                                        self->count = g_browser.count();
+                                        self->count = projBrowser().count();
                                         self->cursor = 0;
                                         break;
                                     case ProjectBrowser::Result::TooLong:
@@ -843,7 +854,7 @@ void sdItem(void* c, int i, char* out, int cap) {
     // Stock names every folder (projects included) "/name" [S snap 007].
     std::snprintf(out, size_t(cap), "/%s", static_cast<BrowserCtx*>(c)->s->entries[i]);
 }
-bool sdMarked(void*, int i) { return !g_browser.isUp(i); }   // folders green, "/.." white
+bool sdMarked(void*, int i) { return !projBrowser().isUp(i); }   // folders green, "/.." white
 void recentItem(void* c, int i, char* out, int cap) {
     std::snprintf(out, size_t(cap), "%s", static_cast<BrowserCtx*>(c)->recent[i]);
 }

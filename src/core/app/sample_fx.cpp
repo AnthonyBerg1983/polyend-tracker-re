@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "fmath.h"
+
 namespace ot {
 namespace sfx {
 
@@ -178,9 +180,11 @@ uint32_t wsola(const int16_t* in, uint32_t n, uint32_t m, uint32_t N, int16_t* o
 struct Biquad {
     double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, x1 = 0, x2 = 0, y1 = 0, y2 = 0;
     void peaking(double f, double lin, double q) {
-        const double A = std::sqrt(lin);
+        // fmath.h double helpers: no double libm on the device
+        // (docs/OPTIMIZATION_2X.md OP-4).
+        const double A = fm::sqrtD(lin);
         const double w0 = 2.0 * kPi * f / kRateExact;
-        const double sn = std::sin(w0), cs = std::cos(w0);
+        const double sn = fm::sinD(w0), cs = fm::cosD(w0);
         const double alpha = sn / (2.0 * q);
         const double a0 = 1.0 + alpha / A;
         b0 = (1.0 + alpha * A) / a0;
@@ -201,7 +205,9 @@ struct Biquad {
 
 // Limiter / compressor smoothing coefficient (spec 18 §2.2):
 // c = 1 - exp(-2.2 * 1000 / (t_ms * 44100)).
-double dynCoef(float ms) { return ms <= 0.0f ? 1.0 : 1.0 - std::exp(-2.2 * 1000.0 / (double(ms) * 44100.0)); }
+double dynCoef(float ms) {
+    return ms <= 0.0f ? 1.0 : 1.0 - fm::expD(-2.2 * 1000.0 / (double(ms) * 44100.0));
+}
 
 }  // namespace
 
@@ -328,11 +334,11 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
                     y *= 32767.0;
                 } else if (type == 1) {
                     const double k = 4.0 * g;
-                    y = (1.0 - std::exp(-k * ax / 32767.0)) * 32767.0;
+                    y = (1.0 - fm::expD(-k * ax / 32767.0)) * 32767.0;
                 } else {
                     // The integer truncation is the binary's (spec 18 §2.2).
                     const double k = 10.0 * g;
-                    const double t = std::trunc(k * ax / 32767.0);
+                    const double t = double(int64_t(k * ax / 32767.0));   // >= 0, < 2^63
                     y = (1.0 - 1.0 / (1.0 + t)) * 32767.0;
                 }
                 out[i] = sat(x < 0 ? -y : y);
@@ -361,7 +367,7 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
             // Hold H = clamp(round(44117.647 / R), 1, 64) samples; keep the
             // top B bits (B = 16: hold only).
             const int B = clampi(int(p[0]), 1, 16);
-            const int H = clampi(int(std::lround(kRateExact / double(p[1] > 0.0f ? p[1] : 1.0f))), 1, 64);
+            const int H = clampi(int(fm::lroundD(kRateExact / double(p[1] > 0.0f ? p[1] : 1.0f))), 1, 64);
             const int shift = 16 - B;
             int32_t held = 0;
             for (uint32_t i = 0; i < w; ++i) {
@@ -413,7 +419,7 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
                 if (d < 0.0) d = 0.0;
                 if (d > double(L - 1)) d = double(L - 1);
                 const double pos = double(i) - d;
-                const double fl = std::floor(pos);
+                const double fl = fm::floorD(pos);
                 const double fr = pos - fl;
                 const int64_t i0 = int64_t(fl);
                 const double tap = double(at(in, n, i0)) * (1.0 - fr) + double(at(in, n, i0 + 1)) * fr;
@@ -431,7 +437,7 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
             Biquad b[3];
             bool on[3];
             for (int k = 0; k < 3; ++k) {
-                const double lin = std::pow(10.0, double(p[3 * k]) / 20.0);
+                const double lin = fm::pow10D(double(p[3 * k]) / 20.0);
                 const double f = p[3 * k + 1] < 20000.0f ? double(p[3 * k + 1]) : 20000.0;
                 double bw = f / (double(p[3 * k + 2]) + 3.0 * f / 20000.0);
                 if (bw > 20000.0) bw = 20000.0;
@@ -449,7 +455,7 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
             break;
         }
         case kLimiter: {
-            const double thr = std::pow(10.0, double(p[0]) / 20.0) * 32767.0;
+            const double thr = fm::pow10D(double(p[0]) / 20.0) * 32767.0;
             const double ca = dynCoef(p[1]), cr = dynCoef(p[2]);
             // SPEC GAP: c0 (obj+0x74, set at ctor) is not decoded; 1.0 makes
             // e1 the instantaneous |x|.
@@ -507,7 +513,8 @@ uint32_t process(int fx, const float* p, const int16_t* in, uint32_t n, int16_t*
                 for (int t = 0; t < W; ++t) {
                     const uint32_t o = uint32_t(k) * uint32_t(W) + uint32_t(t);
                     if (o >= w) break;
-                    const double v = wa * at(in, n, int64_t(a) * W + t) + (1.0 - wa) * at(in, n, int64_t(a + 1) * W + t);
+                    const double v = wa * double(at(in, n, int64_t(a) * W + t)) +
+                                     (1.0 - wa) * double(at(in, n, int64_t(a + 1) * W + t));
                     out[o] = sat(v);
                 }
             }

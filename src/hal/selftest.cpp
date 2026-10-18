@@ -20,6 +20,7 @@
 #include "pad_leds.h"
 #include "sd_storage.h"
 #include "sdhc.h"
+#include "sdram_cache.h"
 
 namespace ot {
 namespace hal {
@@ -59,7 +60,7 @@ extern "C" char _etext[], _sdata[], _edata[];   // Teensy mk66fx1m0.ld
 void serialLine(const char* s) { diagLog(s); }
 void serialReport(const BootReport& br, bool sdramFull, uint32_t sdramErr, bool sdramRan,
                   uint32_t failMask, uint32_t midiDin, uint32_t midiUsb) {
-    char b[160];
+    char b[224];
     auto ok = [](bool v) { return v ? "OK" : "FAIL"; };
     snprintf(b, sizeof b, "--- OpenTracker selftest %s  t=%lus  boot stage %u  blink mask 0x%02lX",
              OT_VERSION, static_cast<unsigned long>(millis() / 1000), unsigned(br.stage),
@@ -114,6 +115,21 @@ void serialReport(const BootReport& br, bool sdramFull, uint32_t sdramErr, bool 
              static_cast<unsigned long>(sdhc::sectorCount()), static_cast<unsigned long>(sdhc::lastError()),
              si.adma ? "ADMA2" : "PIO", static_cast<unsigned long>(si.clockHz), si.highSpeed ? " HS" : "",
              static_cast<unsigned long>(si.retries), static_cast<unsigned long>(si.degrades));
+    serialLine(b);
+    const cache::Status& cs = cache::status();
+    snprintf(b, sizeof b, "cache: SDRAM system cache %s, coherency selftest %s (eDMA reach %d, stale seen %d, "
+             "fail step %u words %lu), 64 KB read %lu -> %lu cyc",
+             cs.enabled ? "ON write-through" : "OFF", cache::testName(cs.test), int(cs.dmaReach), int(cs.staleSeen),
+             unsigned(cs.failStep), static_cast<unsigned long>(cs.failWords),
+             static_cast<unsigned long>(cs.streamOff), static_cast<unsigned long>(cs.streamOn));
+    serialLine(b);
+    const sdhc::Counters& sc = sdhc::counters();
+    snprintf(b, sizeof b, "SD direct ADMA2<->SDRAM: read check %s, write check %s -> reads %s, writes %s; "
+             "chunks direct %lu bounced %lu, cmds %lu",
+             sdhc::directCheckName(sdhc::directCheck()), sdhc::directCheckName(sdhc::directWriteCheck()),
+             sdhc::sdramDirectRead() ? "direct" : "bounced", sdhc::sdramDirectWrite() ? "direct" : "bounced",
+             static_cast<unsigned long>(sc.direct), static_cast<unsigned long>(sc.bounced),
+             static_cast<unsigned long>(sc.cmds));
     serialLine(b);
     snprintf(b, sizeof b, "MIDI out queue drops %lu", static_cast<unsigned long>(midi().dropped()));
     serialLine(b);
@@ -268,6 +284,15 @@ void runSelftest() {
         label(d, 10, 154, "pads init", input().padsOk());
         label(d, 10, 176, "pad LEDs IS31FL3731", leds().ok());
         label(d, 10, 198, storage().mounted() ? "SD mounted" : "SD card", storage().mounted());
+        {
+            const cache::Status& cs = cache::status();
+            snprintf(buf, sizeof(buf), "SDRAM cache %s (%s)", cs.enabled ? "on" : "off", cache::testName(cs.test));
+            label(d, 300, 176, buf, cs.test == cache::Test::Ok || cs.test == cache::Test::BuildOff);
+            const sdhc::DirectCheck rc = sdhc::directCheck(), wc = sdhc::directWriteCheck();
+            snprintf(buf, sizeof(buf), "SD DMA->SDRAM rd %s wr %s", sdhc::directCheckName(rc),
+                     sdhc::directCheckName(wc));
+            label(d, 300, 198, buf, rc == sdhc::DirectCheck::Ok || rc == sdhc::DirectCheck::Skipped);
+        }
 
         d.colorRGB(200, 200, 255);
         snprintf(buf, sizeof(buf), "enc %ld  btn raw 0x%02X  pad raw 0x%02X",

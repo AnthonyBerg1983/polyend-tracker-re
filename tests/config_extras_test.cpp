@@ -147,7 +147,7 @@ TEST(firmware_list_sorted_max_101) {
         h.fs.files[n] = {1};
     }
     h.tap(btn::Config);
-    for (int i = 0; i < 4; ++i) h.tap(btn::Down);   // Firmware
+    for (int i = 0; i < 5; ++i) h.tap(btn::Down);   // Firmware
     h.tap(btn::Right);
     h.tap(btn::F8);                                 // Firmware update
     CHECK(cfgScreen(h).editing);

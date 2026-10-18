@@ -2,8 +2,8 @@
 // selection, spec 04 §6.1 render jobs). The engine renders faster than real
 // time (AudioEngine::exportWav): before every block it calls App::preBlock,
 // which advances the sequencer by kRenderBlockSeconds; the real-time callback
-// outputs silence meanwhile. Master files or 11 stems (track1..8, reverb,
-// delay, master).
+// outputs silence meanwhile. Master files or 14 stems (track1..8, reverb,
+// delay, master, synth_1..3; Mini names, spec 21 §2).
 #include <cstdio>
 #include <cstring>
 
@@ -11,6 +11,7 @@
 
 #include "app/app.h"
 #include "formats/wav.h"
+#include "sdram_bss.h"
 #include "ui/buttons.h"
 
 namespace ot {
@@ -43,12 +44,12 @@ bool masterFolder(const char* path, char* out, size_t cap) {
 bool g_cancel = false;
 InputEvent g_deferred[16];
 int g_deferredCount = 0;
-BottomBar g_savedBar;
+OT_SDRAM_BSS SdramLazy<BottomBar> g_savedBarMem;   // SDRAM on the device (CPU round 3)
 
 void cancelBegin(App& a) {
     g_cancel = false;
     g_deferredCount = 0;
-    g_savedBar = a.ui.bar;
+    g_savedBarMem.get() = a.ui.bar;
     a.ui.bar.clear();
     a.ui.bar.set(btn::F8, "Cancel");
 }
@@ -72,7 +73,7 @@ bool pollCancel(App& a) {
 }
 
 void cancelEnd(App& a) {
-    a.ui.bar = g_savedBar;
+    a.ui.bar = g_savedBarMem.get();
     a.ui.dirty();
     const int n = g_deferredCount;
     g_deferredCount = 0;
@@ -95,7 +96,8 @@ void removeOutput(IStorage& f, const char* path, bool stems) {
     }
     static const char* const kStemNames[] = {"track1.wav", "track2.wav", "track3.wav", "track4.wav",
                                              "track5.wav", "track6.wav", "track7.wav", "track8.wav",
-                                             "reverb.wav", "delay.wav",  "master.wav"};
+                                             "reverb.wav", "delay.wav",  "master.wav", "synth_1.wav",
+                                             "synth_2.wav", "synth_3.wav"};
     char p[320];
     for (const char* n : kStemNames) {
         std::snprintf(p, sizeof(p), "%s/%s", path, n);
@@ -121,7 +123,7 @@ bool App::exportName(ExportKind kind, char* out, int cap, bool stems) {
     // spec 16 §A.12 (spec 02 §8.3, spec 05 appendix E1.4): every Song /
     // Pattern export gets a new folder, NNNN = first free 0001..9999, the
     // pattern number unpadded (_P3_). A master export writes master.wav into
-    // it, a stems export track1..8, reverb, delay and master.wav.
+    // it, a stems export track1..8, reverb, delay, master and synth_1..3.wav.
     char folder[256];
     for (int n = 1; n <= 9999; ++n) {
         switch (kind) {
@@ -265,7 +267,7 @@ bool App::exportAudio(ExportKind kind, const char* path, const SelRect* sel, boo
     allVoicesOff();
     if (engineDirty_) applyEngineSettings();
     rendering_ = true;
-    stored(patternNumber()) = pattern();
+    commitCurrentPattern();
     const uint8_t startPattern = patternNumber();
     job_ = ExportJob{};
     job_.kind = kind;

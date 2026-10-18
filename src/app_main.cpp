@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstring>
 // OpenTracker device glue: hands the HAL drivers and the SDRAM buffers to the
 // App (core stays free of hal headers; ARCHITECTURE.md rules).
 #include "app/app.h"
@@ -14,6 +15,10 @@
 #include "hal/pad_leds.h"
 #include "hal/radio_si4703.h"
 #include "hal/telemetry.h"
+#include "hal/sd_storage.h"
+#include "hal/usb_storage.h"
+
+extern "C" uint8_t _ssdram_bss[], _esdram_bss[];   // src/hal/opentracker.ld
 
 namespace {
 
@@ -22,30 +27,48 @@ namespace {
 // int16 delay lines of 262,144 samples (spec 04 §5.1) and two int16 reverb
 // rings of 16,384 samples (spec 04 §5.2) -- then the in-memory pattern set,
 // undo rings, clipboard and scratch.
-constexpr uint32_t kPatSize = sizeof(ot::Pattern);
+// 2.x (docs/M1_PLAN.md §1): the resident store keeps 12-track PatternStock
+// records; tracks 13..16 live in the ext-track pool. Every working pattern
+// (sequencer current/preload, undo, file undo, clipboard, performance
+// scratch) is a 16-track Pattern, and the two sequencer buffers moved here
+// from App (SRAM).
+constexpr uint32_t kPatSize = sizeof(ot::Pattern);          // 16 tracks, 12,304 B
+constexpr uint32_t kStockSize = sizeof(ot::PatternStock);   // 12 tracks, 9,228 B
 constexpr uint32_t kUndoSlots = 20;      // spec 05 §5.1 (a)
 constexpr uint32_t kFileUndoSlots = 10;  // spec 05 §5.1 (b)
 constexpr uint32_t kScratch = 0x10000;
+// Ext-track pool: 384 blocks (spec gap 9) + the pool-full write target.
+constexpr int kExtBlocks = ot::ExtTrackPool::kDefaultBlocks + 1;
 constexpr uint32_t kFxSamples = uint32_t(ot::audio::AudioEngine::kFxMemorySamples);
 constexpr uint32_t kFxBytes = kFxSamples * sizeof(int16_t);
 static_assert(kFxBytes == 3u * 262144u * 2u + 2u * 16384u * 2u, "delay 3x262144 + reverb 2x16384 int16");
 static_assert(ot::kSampleBankBytes == 11796480u, "sample pool size, spec 02 §8.2");
+static_assert(kPatSize == 769u * 16u && kStockSize == 769u * 12u, "packed 769-byte track records");
 constexpr uint32_t align(uint32_t v) { return (v + 15u) & ~15u; }
 constexpr uint32_t kOffBank = 0;
 constexpr uint32_t kOffFx = align(kOffBank + ot::kSampleBankBytes);
 constexpr uint32_t kOffPatterns = align(kOffFx + kFxBytes);
-constexpr uint32_t kOffUndo = align(kOffPatterns + kPatSize * ot::kPatternCount);
+constexpr uint32_t kOffExt = align(kOffPatterns + kStockSize * ot::kPatternCount);
+constexpr uint32_t kOffExtMeta = align(kOffExt + ot::ExtTrackPool::blockBytes(kExtBlocks));
+constexpr uint32_t kOffSeqBufs = align(kOffExtMeta + ot::ExtTrackPool::metaBytes(kExtBlocks - 1));
+constexpr uint32_t kOffUndo = align(kOffSeqBufs + kPatSize * 3u);   // current, preload, switch stage
 constexpr uint32_t kOffFileUndo = align(kOffUndo + kPatSize * kUndoSlots);
 constexpr uint32_t kOffClip = align(kOffFileUndo + kPatSize * kFileUndoSlots);
 constexpr uint32_t kOffNums = align(kOffClip + kPatSize);
 constexpr uint32_t kOffScratch = align(kOffNums + 64);
 // Per-track pattern staging for the Performance screen (spec 12 §C.1).
 constexpr uint32_t kOffPerf = align(kOffScratch + kScratch);
-constexpr uint32_t kEnd = kOffPerf + sizeof(ot::PerfPatternMemory);
+constexpr uint32_t kOffStems = align(kOffPerf + sizeof(ot::PerfPatternMemory));
+constexpr uint32_t kEnd = kOffStems + sizeof(ot::audio::StemBlock);   // WAV export stems (was SRAM)
 static_assert(ot::board::kSdramSize == 16u * 1024u * 1024u, "spec 01 §2");
 static_assert(kEnd <= ot::board::kSdramSize, "SDRAM layout exceeds 16 MB");
+// M1 budget (docs/M1_PLAN.md §1): at least 150 KB stay free for M2/M3.
+static_assert(ot::board::kSdramSize - kEnd >= 150u * 1024u, "SDRAM: < 150 KB left after the M1 layout");
+// The linker's `.sdram_bss` (core/sdram_bss.h) sits above the layout.
+static_assert(kEnd <= ot::board::kSdramBssBase - ot::board::kSdramBase, "SDRAM layout overlaps .sdram_bss");
+static_assert(sizeof(ot::PerfPatternMemory) == 769u * 16u * 2u + kPatSize, "perf slots [16][2] + scratch");
 
-constexpr uint32_t kSdramFree = ot::board::kSdramSize - kEnd;
+constexpr uint32_t kSdramFree = ot::board::kSdramBssBase - ot::board::kSdramBase - kEnd;
 
 ot::App gApp;
 ot::diag::Telemetry gTelemetry;
@@ -188,6 +211,14 @@ void telemetryTick() {
     gTelemetry.loopMark(clock.micros());
     recorderInputDiag(clock.millis());
     pollRenderCycles(clock.millis());
+    {   // 2.x "cpu" line, 1 Hz (spec 2x-02 §4, hal/telemetry.h)
+        static ot::diag::CpuTelemetry cpuTel;
+        char cl[320];
+        if (cpuTel.tick(clock.millis(), gApp.engine.cpu(), gApp.engine.governor(), cl, sizeof cl,
+                        &gApp.engine.profile()) &&
+            ot::hal::diagTerminalOpen())
+            ot::hal::diagLog(cl);
+    }
     if (!gTelemetry.due(clock.millis())) return;
     ot::diag::TelemetrySample s;
     s.cycMin = gTelWindow.min();
@@ -204,14 +235,16 @@ void telemetryTick() {
     s.i2c2Errors = ot::hal::i2c2().errorCount();
     s.i2c0Naks = ot::hal::i2c0().nakCount();
     s.i2c2Naks = ot::hal::i2c2().nakCount();
-    char line[384];
+    char line[448];
     ot::diag::formatTelemetry(line, sizeof line, s);
     ot::hal::diagLog(line);
     // UI line (docs/HARDWARE_TESTING.md "telemetry: ui"): frames and render
     // time as before, then the last frame's SPI upload (bytes, time), the
     // frames deferred by a busy display, the longest frame-to-frame gap, the
     // dirty -> frame and input -> frame latencies, the FIFO-space waits and
-    // the dlStart() polls of the last frame, and the coprocessor resets.
+    // the dlStart() polls of the last frame, and the coprocessor resets; 2.x:
+    // the last frame's command-FIFO words (DL words include appended
+    // fragments), cumulative fragment appends / captures and the SPI2 DMA.
     const ot::Ui::RenderStats r = gApp.ui.takeRenderStats();
     ot::hal::Ft81xDisplay& d = ot::hal::display();
     const uint32_t hwDlMax = d.takeMaxDlBytes();
@@ -219,7 +252,8 @@ void telemetryTick() {
                   "telemetry: ui %lu frames (%lu.%lu fps) render avg %lu.%02lu max %lu.%02lu ms, last frame %lu DL words"
                   " %lu B spi %lu.%02lu ms | deferred %lu gap max %lu ms lat dirty %lu.%lu ms input %lu ms"
                   " | fifo waits %lu dlstart polls %lu copro faults %lu (after frame %lu)"
-                  " | dl max %lu words, over %lu, low detail %lu, hw %lu B max %lu B",
+                  " | dl max %lu words, over %lu, low detail %lu, hw %lu B max %lu B"
+                  " | upload %lu words frag hits %lu captures %lu dma %s",
                   static_cast<unsigned long>(r.frames), static_cast<unsigned long>(r.frames / 5),
                   static_cast<unsigned long>((r.frames * 2) % 10),
                   static_cast<unsigned long>(r.frames ? r.usSum / r.frames / 1000 : 0),
@@ -235,7 +269,11 @@ void telemetryTick() {
                   static_cast<unsigned long>(d.lastWaitPolls()), static_cast<unsigned long>(d.faults()),
                   static_cast<unsigned long>(d.frameFaults()), static_cast<unsigned long>(r.wordsMax),
                   static_cast<unsigned long>(r.overBudget), static_cast<unsigned long>(r.lowDetail),
-                  static_cast<unsigned long>(d.lastDlBytes()), static_cast<unsigned long>(hwDlMax));
+                  static_cast<unsigned long>(d.lastDlBytes()), static_cast<unsigned long>(hwDlMax),
+                  static_cast<unsigned long>(gApp.ui.lastUploadWords()),
+                  static_cast<unsigned long>(gApp.ui.fragments.hits),
+                  static_cast<unsigned long>(gApp.ui.fragments.captures),
+                  ot::hal::Ft81xDisplay::dmaActive() ? "on" : "off");
     ot::hal::diagLog(line);
 }
 
@@ -259,6 +297,7 @@ bool selectInputThunk(void* ctx, uint8_t source, uint8_t gain) {
 // App::boot() has run (no card / nothing loaded -> nothing to save).
 void powerOffHook() {
     if (gApp.lastAutosave() == 0) return;
+    if (gApp.usbStorageActive()) return;   // the computer owns the card: nothing of ours to write
     gApp.autosave();
     gApp.saveConfig();
 }
@@ -274,13 +313,21 @@ void otAppMain(ot::hal::HalSet& hal) {
     // and IAudioOut has no volume control, so open it here. Field: no sound on
     // headphones in the app while the selftest (which sets 0.5) was audible.
     hal::audio().setHeadphoneVolume(0.7f);
+    // `.sdram_bss` (core/sdram_bss.h): NOLOAD, zeroed here, before any App code.
+    std::memset(_ssdram_bss, 0, size_t(_esdram_bss - _ssdram_bss));
+    hal::storage().enableSdramFiles();   // FatFs file slots in `.sdram_bss`
     uint8_t* sd = reinterpret_cast<uint8_t*>(board::kSdramBase);
     AppMemory mem;
     mem.sampleBank = reinterpret_cast<int16_t*>(sd + kOffBank);
     mem.sampleBankSamples = kSampleBankBytes / 2;
     mem.fxMemory = reinterpret_cast<int16_t*>(sd + kOffFx);
     mem.fxSamples = kFxSamples;
-    mem.patterns = reinterpret_cast<Pattern*>(sd + kOffPatterns);
+    mem.patterns = reinterpret_cast<PatternStock*>(sd + kOffPatterns);
+    mem.extTracks = reinterpret_cast<Track*>(sd + kOffExt);
+    mem.extTrackBlocks = kExtBlocks;
+    mem.extMeta = sd + kOffExtMeta;
+    mem.seqBuffers = reinterpret_cast<Pattern*>(sd + kOffSeqBufs);
+    mem.seqStage = mem.seqBuffers + 2;
     mem.undo = reinterpret_cast<Pattern*>(sd + kOffUndo);
     mem.undoSlots = int(kUndoSlots);
     mem.fileUndo = reinterpret_cast<Pattern*>(sd + kOffFileUndo);
@@ -291,6 +338,7 @@ void otAppMain(ot::hal::HalSet& hal) {
     mem.scratch = sd + kOffScratch;
     mem.scratchBytes = kScratch;
     mem.perfPatterns = reinterpret_cast<PerfPatternMemory*>(sd + kOffPerf);
+    mem.exportStems = reinterpret_cast<audio::StemBlock*>(sd + kOffStems);
 
     HalRefs refs;
     refs.display = hal.display;
@@ -310,6 +358,7 @@ void otAppMain(ot::hal::HalSet& hal) {
     refs.inputCtx = nullptr;
     refs.radio = &hal::radio();
     refs.nvstore = &hal::nvStore();        // config image in the stock EEPROM area (spec 05 §5.4)
+    refs.usbStorage = hal::usbStorage();   // 2.x USB Storage mode (null in an OT_USB_MSC=0 image)
     if (!gApp.init(refs, mem)) return;   // falls back to the selftest
     hal::setPowerOffHook(&powerOffHook);
     gApp.ui.platform.devStats = &devStats;         // Config /.develop overlay (spec 06 §7.2)

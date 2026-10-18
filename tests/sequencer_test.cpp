@@ -1,6 +1,7 @@
 // Sequencer tests (spec 03).
 #include "test.h"
 
+#include <cstring>
 #include <vector>
 
 #include "model/pattern.h"
@@ -493,6 +494,65 @@ TEST(song_mode_switch_and_preload) {
     CHECK_EQ(r.host.patternAdvances, 2);  // not called on the song wrap
 }
 
+// CPU round 3: a host that loads by track gets the preload spread over the
+// blocks of the preload step (at most 1-2 tracks per block at <= 430 BPM)
+// and the rest at the pattern end; the result is the whole-pattern load.
+struct PartHost : FakeHost {
+    std::vector<int> perBlock;   // tracks copied per block (filled by the test)
+    int inBlock = 0, wholeLoads = 0;
+    bool loadsPatternTracks() const override { return true; }
+    static void fill(uint8_t number, Track& d, int t) {
+        for (auto& st : d.steps) st = Step{};
+        d.lastStep = 3;
+        d.steps[t & 3].note = int8_t((number * 10 + t) % 128);
+        d.steps[t & 3].instrument = uint8_t(t);
+    }
+    void loadPattern(uint8_t number, Pattern& dst, bool sync) override {
+        FakeHost::loadPattern(number, dst, sync);
+        for (int t = 0; t < Sequencer::kTracks; ++t) fill(number, dst.tracks[t], t);
+        ++wholeLoads;
+    }
+    void loadPatternTracks(uint8_t number, Pattern& dst, int first, int count) override {
+        for (int t = first; t < first + count; ++t) fill(number, dst.tracks[t], t);
+        inBlock += count;
+    }
+};
+
+TEST(song_mode_spread_preload) {
+    for (float bpm : {120.0f, 400.0f, 1000.0f}) {
+        Rig r(bpm);
+        PartHost host;
+        host.seq = &r.seq;
+        r.project.playlist[0] = 1;
+        r.project.playlist[1] = 2;
+        r.project.playlist[2] = 0;
+        r.project.setCurrentPattern(1);
+        r.seq.attach(&r.sink, &host, &r.project, &r.a, &r.b);
+        host.loadPattern(1, r.a, true);
+        host.wholeLoads = 0;
+        r.seq.playSong(0);
+        int maxBlock = 0, total = 0;
+        for (int i = 0; i < 20000 && host.patternEnds < 2; ++i) {
+            host.inBlock = 0;
+            r.block();
+            maxBlock = host.inBlock > maxBlock ? host.inBlock : maxBlock;
+            total += host.inBlock;
+        }
+        CHECK_EQ(host.patternEnds, 2);
+        CHECK_EQ(host.wholeLoads, 0);           // no whole-pattern copy in an audio block
+        CHECK_EQ(total, 2 * Sequencer::kTracks); // two preloads, every track once
+        if (bpm <= 400.0f) CHECK(maxBlock <= 2);
+        // Back at pattern 1 after the song wrap: the spread preload's tracks.
+        CHECK_EQ(r.seq.currentPatternNumber(), 1);
+        Pattern want;
+        for (int t = 0; t < Sequencer::kTracks; ++t) PartHost::fill(1, want.tracks[t], t);
+        CHECK(std::memcmp(r.seq.currentPattern(), &want, sizeof want) == 0);
+        auto on = r.sink.of(Ev::NoteOn, 0);
+        CHECK(on.size() >= 2);
+        if (on.size() >= 2) CHECK_EQ(on[1].a, 20);   // pattern 2's track 0 played
+    }
+}
+
 TEST(queued_pattern) {
     Rig r(120.0f);
     r.project.setCurrentPattern(4);
@@ -566,6 +626,139 @@ TEST(switch_pattern_now_stopped_commits_at_once) {
     CHECK_EQ(r.seq.pendingSwitch(), 0);
     r.seq.switchPatternNow(0);     // out of range: ignored
     CHECK_EQ(r.seq.currentPatternNumber(), 12);
+}
+
+// --- OP-1: switchPatternNow with a stage buffer (no pattern copy in the audio block) ---
+
+namespace {
+// Host whose main-loop load fills the destination track by track and can run
+// audio blocks in the middle of it (an audio interrupt preempting the
+// main-loop preload). Loads made from inside a block are recorded apart.
+struct StagedHost : FakeHost {
+    Rig* rig = nullptr;
+    bool inBlock = false;
+    int blocksMidLoad = 0;       // audio blocks to run halfway through the next load
+    std::vector<int> isrLoads;   // pattern numbers loaded from an audio block
+    void loadPattern(uint8_t n, Pattern& dst, bool s) override {
+        if (inBlock) {
+            isrLoads.push_back(n);
+            FakeHost::loadPattern(n, dst, s);
+            return;
+        }
+        loads.push_back({n, s, 0});
+        Pattern tmp;
+        FakeHost tmpHost;
+        tmpHost.loadPattern(n, tmp, s);
+        for (auto& t : tmp.tracks) t.lastStep = 15;
+        for (int t = 0; t < kTrackCount; ++t) {
+            dst.tracks[t] = tmp.tracks[t];
+            if (t == kTrackCount / 2)
+                for (; blocksMidLoad > 0; --blocksMidLoad) block();
+        }
+    }
+    void block() {
+        inBlock = true;
+        rig->block();
+        inBlock = false;
+    }
+};
+}  // namespace
+
+TEST(switch_pattern_now_staged_swaps_pointers_in_the_audio_block) {
+    Rig r(120.0f);
+    Pattern stage;
+    stage.setDefault();
+    StagedHost host;
+    host.seq = &r.seq;
+    host.rig = &r;
+    r.a.tracks[0].lastStep = 15;
+    r.project.setCurrentPattern(4);
+    r.seq.attach(&r.sink, &host, &r.project, &r.a, &r.b, &stage);
+    CHECK(r.seq.stagePattern() == &stage);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 5; });
+    host.loads.clear();
+    host.isrLoads.clear();
+    Pattern* before = r.seq.currentPattern();
+    r.seq.switchPatternNow(9);
+    CHECK_EQ(host.loads.size(), 1u);            // loaded in the main loop
+    CHECK_EQ(r.seq.pendingSwitch(), 9);
+    CHECK_EQ(r.seq.currentPatternNumber(), 4);
+    host.block();
+    CHECK(host.isrLoads.empty());               // no copy in the audio block
+    CHECK(r.seq.currentPattern() == &stage);    // swapped in
+    CHECK(r.seq.stagePattern() == before);      // the old pattern is the next stage
+    CHECK_EQ(r.seq.currentPatternNumber(), 9);
+    CHECK_EQ(int(r.seq.currentPattern()->tracks[0].steps[0].note), 90);
+    CHECK_EQ(r.seq.step(0), 5);                  // step kept
+    // A re-attach without a stage keeps it (the Song screen re-points with two).
+    r.seq.attach(&r.sink, &host, &r.project, r.seq.currentPattern(), r.seq.preloadPattern());
+    CHECK(r.seq.stagePattern() == before);
+    // Stopped: commits at once, still without an audio-block load.
+    r.seq.stop();
+    r.seq.switchPatternNow(3);
+    CHECK_EQ(r.seq.currentPatternNumber(), 3);
+    CHECK(r.seq.currentPattern() == before);
+    CHECK(host.isrLoads.empty());
+}
+
+TEST(switch_pattern_now_audio_block_during_preload) {
+    // An audio block that runs while the main loop is still assembling the
+    // stage buffer must neither swap in the half-filled buffer nor commit the
+    // request it replaces; the next block commits the complete pattern.
+    Rig r(120.0f);
+    Pattern stage;
+    stage.setDefault();
+    StagedHost host;
+    host.seq = &r.seq;
+    host.rig = &r;
+    r.a.tracks[0].lastStep = 15;
+    r.project.setCurrentPattern(4);
+    r.seq.attach(&r.sink, &host, &r.project, &r.a, &r.b, &stage);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 2; });
+    Pattern* playing = r.seq.currentPattern();
+
+    // 1. Blocks during the first preload: nothing pending yet.
+    host.blocksMidLoad = 3;
+    r.seq.switchPatternNow(9);
+    CHECK(r.seq.currentPattern() == playing);
+    CHECK_EQ(r.seq.currentPatternNumber(), 4);
+    CHECK(host.isrLoads.empty());
+
+    // 2. A second switch replaces the first before any block took it; blocks
+    //    run halfway through its preload (the stage holds half of 11, half
+    //    of 9): the first request must not commit.
+    host.blocksMidLoad = 2;
+    r.seq.switchPatternNow(11);
+    CHECK(r.seq.currentPattern() == playing);
+    CHECK_EQ(r.seq.currentPatternNumber(), 4);
+    CHECK_EQ(r.seq.pendingSwitch(), 11);
+    CHECK(host.isrLoads.empty());
+
+    // 3. The next block commits 11, complete.
+    host.block();
+    CHECK(r.seq.currentPattern() == &stage);
+    CHECK_EQ(r.seq.currentPatternNumber(), 11);
+    CHECK(host.isrLoads.empty());
+    const Pattern& p = *r.seq.currentPattern();
+    CHECK_EQ(int(p.tracks[0].steps[0].note), 110);
+    bool allTracks = true;
+    for (const auto& t : p.tracks) allTracks &= t.lastStep == 15;
+    CHECK(allTracks);
+
+    // 4. Blocks during a preload that follows a committed switch: the stage
+    //    is now the old pattern, the playing one stays untouched.
+    host.blocksMidLoad = 2;
+    r.seq.switchPatternNow(7);
+    CHECK(r.seq.currentPattern() == &stage);
+    CHECK_EQ(r.seq.currentPatternNumber(), 11);
+    host.block();
+    CHECK(r.seq.currentPattern() == playing);
+    CHECK_EQ(r.seq.currentPatternNumber(), 7);
+    CHECK_EQ(int(r.seq.currentPattern()->tracks[0].steps[0].note), 70);
+    CHECK(host.isrLoads.empty());
+    CHECK(r.seq.isPlaying());
 }
 
 // --- MIDI clock / transport ----------------------------------------------------------
@@ -917,12 +1110,12 @@ TEST(performance_backward_and_transpose) {
     for (auto& t : r.seq.currentPattern()->tracks) t.lastStep = 3;
     r.seq.setPerformanceMode(true);
     r.seq.setPerfPlayMode(0, 1);
-    r.seq.setPerfPlayMode(8, 1);   // play modes apply to tracks 0..7 only (spec 12 §D)
+    r.seq.setPerfPlayMode(8, 1);   // 2.x: play modes apply to all 16 tracks (M1-WP4)
     r.seq.setPerfTranspose(0, true, 12);
     r.seq.setPerfVelocityOffset(0, -50);
     r.seq.play(0);
     r.runUntil([&] { return r.sink.midiNoteOns().size() >= 5; });
-    CHECK_EQ(r.seq.step(8), r.seq.step(1));
+    CHECK_EQ(r.seq.step(8), r.seq.step(0));   // backward like track 0 (stock: forward)
     auto on = r.sink.midiNoteOns();
     // Backward from the last step.
     const int expect[] = {75, 74, 73, 72, 75};
@@ -1012,4 +1205,194 @@ TEST(selection_play_stops_after_selected_rows) {
     s1.seq.playSelection(9, 9, 0, 0, false);
     s1.runUntil([&] { return !s1.seq.isPlaying(); }, 5000);
     CHECK_EQ(s1.sink.of(Ev::NoteOn, 0).size(), 1u);
+}
+
+// --- 2.x: tracks 13..16 (docs/M1_PLAN.md §3, spec 2x-01 §6, spec 21 §3.2) ---------
+
+TEST(tracks16_sixteen_tracks) {
+    CHECK_EQ(Sequencer::kTracks, 16);
+    CHECK_EQ(Sequencer::kVoiceTracks, 8);
+}
+
+TEST(tracks16_track13_midi_channel_cc_bend) {
+    Rig r(120.0f);
+    r.setNote(12, 0, 60, 52);                // track 13, MIDI 5 -> ch 5 (instr - 47)
+    r.fxA(12, 0, 8, 100);                    // CC A -> cc 1 on ch 5
+    r.fxB(12, 0, 34, 198);                   // pitch bend +4000 on ch 5
+    r.setNote(12, 1, 62, 52);
+    r.fxA(12, 1, 18, 50);                    // velocity 63
+    r.setNote(15, 0, 64, 63);                // track 16, MIDI 16 -> ch 16
+    r.setNote(13, 0, 60, 0);                 // sample instr on track 14: dropped
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 2; });
+    auto ch5 = r.sink.midiStatus(0x94);
+    CHECK_EQ(ch5.size(), 2u);
+    if (ch5.size() == 2) {
+        CHECK_EQ(ch5[0].b, 60); CHECK_EQ(ch5[0].c, 127);
+        CHECK_EQ(ch5[1].b, 62); CHECK_EQ(ch5[1].c, 63);
+    }
+    auto ch16 = r.sink.midiStatus(0x9F);
+    CHECK_EQ(ch16.size(), 1u);
+    if (!ch16.empty()) CHECK_EQ(ch16[0].b, 64);
+    auto cc = r.sink.midiStatus(0xB4);
+    CHECK_EQ(cc.size(), 1u);
+    if (!cc.empty()) { CHECK_EQ(cc[0].b, 1); CHECK_EQ(cc[0].c, 100); }
+    auto pb = r.sink.midiStatus(0xE4);
+    CHECK_EQ(pb.size(), 1u);
+    if (!pb.empty()) CHECK_EQ(pb[0].b | (pb[0].c << 7), 8192 + 4000);
+    CHECK_EQ(r.sink.midiStatus(0x84).size(), 1u);   // monophonic: 60 off before 62
+    CHECK(r.sink.of(Ev::NoteOn, 13).empty());
+    CHECK_EQ(r.sink.midiNoteOns().size(), 3u);
+}
+
+TEST(tracks16_stop_sends_note_off_on_tracks_13_16) {
+    Rig r(120.0f);
+    r.setNote(12, 0, 60, 48);
+    r.setNote(15, 0, 67, 50);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 1; });
+    CHECK_EQ(r.sink.midiNoteOns().size(), 2u);
+    CHECK(r.sink.midiStatus(0x80).empty());
+    r.seq.stop();
+    auto o0 = r.sink.midiStatus(0x80);
+    auto o2 = r.sink.midiStatus(0x82);
+    CHECK_EQ(o0.size(), 1u);
+    CHECK_EQ(o2.size(), 1u);
+    if (!o0.empty()) CHECK_EQ(o0[0].b, 60);
+    if (!o2.empty()) CHECK_EQ(o2[0].b, 67);
+}
+
+TEST(mute_tracks_13_16_from_project_mt) {
+    // Tracker Mini: mutes of tracks 13..16 are project.mt 0x742[4..7]
+    // (MINI_PLAN U13), read through Project::trackMuted.
+    Rig r(120.0f);
+    r.setNote(12, 0, 60, 48);                // held (no note-off in the pattern)
+    r.setNote(12, 2, 62, 48);
+    r.setNote(14, 0, 64, 49);
+    r.project.setTrackMuted(14, true);       // track 15 muted from the start
+    CHECK_EQ(r.project.u8(0x742 + 6), 1);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 1; });
+    CHECK_EQ(r.sink.midiNoteOns().size(), 1u);
+    CHECK(r.sink.midiStatus(0x91).empty());
+    // Muting a track with a held note releases it on the next microstep.
+    r.project.setU8(0x742 + 4, 1);
+    r.block();
+    auto off = r.sink.midiStatus(0x80);
+    CHECK_EQ(off.size(), 1u);
+    if (!off.empty()) CHECK_EQ(off[0].b, 60);
+    r.runUntil([&] { return r.seq.step(0) == 3; });
+    CHECK_EQ(r.sink.midiNoteOns().size(), 1u);  // step 2 is blocked
+    CHECK_EQ(r.seq.step(12), 3);                // muted tracks still advance
+    // Unmuted again: tracks 13 and 15 play.
+    r.project.setTrackMuted(12, false);
+    r.project.setTrackMuted(14, false);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 1; });
+    CHECK_EQ(r.sink.midiStatus(0x90).size(), 2u);
+    CHECK_EQ(r.sink.midiStatus(0x91).size(), 1u);
+}
+
+TEST(tracks16_perf_transpose_velocity_track13) {
+    Rig r(120.0f);
+    r.setNote(12, 0, 60, 48);
+    r.seq.setPerformanceMode(true);
+    r.seq.setPerfTranspose(12, true, 7);
+    r.seq.setPerfVelocityOffset(12, -50);
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 1; });
+    auto on = r.sink.midiNoteOns();
+    CHECK_EQ(on.size(), 1u);
+    if (!on.empty()) { CHECK_EQ(on[0].b, 67); CHECK_EQ(on[0].c, 127 - 63); }
+    // Leaving performance mode clears them.
+    r.seq.setPerformanceMode(false);
+    r.seq.stop();
+    r.seq.play(0);
+    r.runUntil([&] { return r.seq.step(0) == 1; });
+    on = r.sink.midiNoteOns();
+    CHECK_EQ(on.size(), 2u);
+    if (on.size() == 2) { CHECK_EQ(on[1].b, 60); CHECK_EQ(on[1].c, 127); }
+}
+
+TEST(tracks16_live_record_tracks_13_16) {
+    Rig r(40.0f);
+    r.seq.record();
+    r.runUntil([&] { return r.seq.step(0) == 2 && r.seq.microStep(0) >= 10; });
+    r.seq.setRecordEnabled(13, false);
+    CHECK_EQ(r.seq.liveNoteOn(60, 127, 12, 3), 12);   // sample instr -> MIDI 1 on 9..16
+    CHECK_EQ(int(r.step(12, 2).note), 60);
+    CHECK_EQ(int(r.step(12, 2).instrument), 48);
+    CHECK_EQ(r.seq.liveNoteOn(62, 127, 12, 50), 14);  // 13 busy, 14 disarmed
+    CHECK_EQ(r.seq.liveNoteOn(64, 127, 15, 50), 15);
+    CHECK_EQ(r.seq.liveNoteOn(65, 127, 15, 50), -1);  // nothing beyond track 16
+    CHECK_EQ(r.seq.liveNoteOn(66, 127, 16, 50), -1);
+    r.seq.liveNoteOff(64);
+    CHECK_EQ(int(r.step(15, 3).note), int(kNoteOff));
+    // Selection play covers track 16.
+    Rig s(120.0f);
+    s.setNote(15, 0, 60, 48);
+    s.setNote(0, 0, 60, 0);
+    s.seq.playSelection(0, 0, 15, 15, false);
+    s.runUntil([&] { return !s.seq.isPlaying(); }, 5000);
+    CHECK_EQ(s.sink.midiNoteOns().size(), 1u);
+    CHECK(s.sink.of(Ev::NoteOn, 0).empty());
+}
+
+// The pattern end follows a master position at the base length: a perf
+// length / play mode on track 16 (the last processed track) cannot move the
+// song advance (docs/M1_PLAN.md §3 risk).
+TEST(tracks16_track16_perf_length_keeps_song_advance) {
+    // mode 0: reference; 1: song mode, track 16 backward + 2-step length set
+    // after the start; 2: pattern mode, track 16 7 steps long.
+    auto run = [](int mode, bool perf, std::vector<uint64_t>& ends, std::vector<Load>& loads, int& maxStep15) {
+        Rig r(120.0f);
+        for (int i = 0; i < 4; ++i) r.project.playlist[i] = uint8_t(i + 1);
+        r.project.playlist[4] = 0;
+        r.project.setCurrentPattern(1);
+        r.seq.attach(&r.sink, &r.host, &r.project, &r.a, &r.b);
+        r.host.loadPattern(1, r.a, true);          // 4-step patterns
+        r.host.loads.clear();
+        if (perf) {
+            r.seq.setPerformanceMode(true);
+            if (mode == 1) r.seq.setPerfPlayMode(15, seq::kPlayBack);
+        }
+        if (mode == 1) r.seq.playSong(0);
+        else r.seq.play(0);
+        if (perf) r.seq.setPerfTrackLength(15, mode == 1 ? 1 : 6);
+        maxStep15 = 0;
+        r.runUntil([&] {
+            if (r.seq.step(15) > maxStep15) maxStep15 = r.seq.step(15);
+            return r.host.patternEnds >= 5;
+        });
+        ends = r.host.endTicks;
+        loads = r.host.loads;
+    };
+    for (int mode : {1, 2}) {
+        std::vector<uint64_t> e0, e1;
+        std::vector<Load> l0, l1;
+        int m0 = 0, m1 = 0;
+        run(mode, false, e0, l0, m0);
+        run(mode, true, e1, l1, m1);
+        CHECK_EQ(e0.size(), 5u);
+        CHECK(e0 == e1);
+        CHECK_EQ(l0.size(), l1.size());
+        for (size_t i = 0; i < l0.size() && i < l1.size(); ++i) {
+            CHECK_EQ(l0[i].num, l1[i].num);
+            CHECK_EQ(l0[i].tick, l1[i].tick);
+            CHECK_EQ(l0[i].sync, l1[i].sync);
+        }
+        CHECK_EQ(m0, 3);
+        if (mode == 2) CHECK_EQ(m1, 6);           // track 16 really played its own length
+        if (mode == 1) CHECK_EQ(l1.size(), 5u);   // one preload per song step
+    }
+    // Pattern end tick with a 2-step track 16: still after 4 steps.
+    Rig r(120.0f);
+    for (auto& t : r.seq.currentPattern()->tracks) t.lastStep = 3;
+    r.seq.setPerformanceMode(true);
+    r.seq.setPerfTrackLength(15, 1);
+    r.seq.play(0);
+    r.runUntil([&] { return r.host.patternEnds == 1; });
+    CHECK_EQ(r.host.endTicks.size(), 1u);
+    if (!r.host.endTicks.empty()) CHECK_EQ(r.host.endTicks[0], uint64_t(12 + (4 * 48 - 1) * 12));
+    CHECK_EQ(r.seq.patternPosition(), 0);
 }

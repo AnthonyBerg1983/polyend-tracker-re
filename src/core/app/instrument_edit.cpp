@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+#include "sdram_bss.h"
+
 namespace ot {
 namespace iedit {
 
@@ -12,7 +14,7 @@ bool isAuto(InstrParam p) { return p >= InstrParam::AutoType; }
 int dclamp(int dest) { return clampi(dest, 0, kAutomationCount - 1); }
 
 const Instrument& defaults() {
-    static const Instrument def;
+    OT_SDRAM_BSS static const Instrument def;   // built on first use (main loop); SDRAM on the device
     return def;
 }
 }  // namespace

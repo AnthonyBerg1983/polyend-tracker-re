@@ -1,7 +1,18 @@
 // One monophonic sample voice per track (spec 04 §1.2, §2, §3, §4):
 // player (+headroom, +volume envelope) -> bit crusher -> overdrive -> SVF
 // (-> delay/reverb sends) -> ramped volume -> pan.
+//
+// 2.x stereo playback (docs/specs/2x-04 §3, docs/MINI_PLAN.md §2): a planar
+// stereo instrument in one-shot, loop, slice or beat-slice mode plays both
+// channels through one shared playhead, with a second interpolation /
+// crusher / overdrive / filter state; pan becomes balance (stock linear law
+// on the far channel); the sends take (L + R) / 2. Mono instruments keep the
+// unchanged mono path. Wavetable and granular play the left channel only
+// (TODO(2.1): stereo wavetable / granular).
 #pragma once
+
+// Marker for the 2.x test-song generator (tools/make_testsongs/features.h).
+#define OT_FEATURE_STEREO_PLAYBACK 1
 
 #include <cstdint>
 
@@ -57,6 +68,10 @@ struct VoiceControl {
     // Track mute flag (.mt 0x12C+t): dry AMP and post-fader sends are 0; in
     // pre-fader mode the track still feeds the effects (07 Q3).
     bool muted = false;
+    // 2.x stereo voices: o.amp (the side-chain source) is only computed when
+    // set; the engine sets it for the side-chain track (mono voices always
+    // write o.amp).
+    bool ampTap = true;
 };
 
 // Performance-mode offsets of one track (spec 06 §3.2 FX 1..16, 20, 21),
@@ -86,10 +101,12 @@ struct VoiceOut {
 class Voice {
 public:
     void reset();
-    // Sample source for the instrument (mono int16, frames). Called by the
-    // engine on note-on with the bank's current data.
+    // Sample source for the instrument (int16, frames per channel). Called by
+    // the engine on note-on with the bank's current data; dataR is the right
+    // block of a planar stereo instrument (nullptr = mono).
     void noteOn(const Instrument* ins, const int16_t* data, uint32_t frames, uint8_t note, int8_t volume,
-                uint8_t fxAType, uint8_t fxAValue, uint8_t fxBType, uint8_t fxBValue);
+                uint8_t fxAType, uint8_t fxAValue, uint8_t fxBType, uint8_t fxBValue,
+                const int16_t* dataR = nullptr);
     void noteOff(int8_t mode);   // NoteOffMode values: -2 fade, -3 cut, -4 off
     void applyFx(uint8_t slot, uint8_t type, uint8_t value);
     void resetFx();
@@ -100,6 +117,8 @@ public:
     bool active() const { return playing_ || env_.active(); }
     bool playing() const { return playing_; }
     const Instrument* instrument() const { return ins_; }
+    // The current note plays both channels (stereo instrument, stereo mode).
+    bool stereo() const { return stereo_; }
     void setSeed(uint32_t s) { seed_ = s ? s : 1u; }
     // Track-0 step index at the next note-on / LFO FX: S_on of the synced
     // LFO phase (spec 07 Q5).
@@ -116,6 +135,9 @@ public:
                 float* mixR = nullptr, bool keepLR = true);
     // Peak |post-pan output| of the last rendered block (meters).
     float blockPeak() const { return peak_; }
+    // Sends the last render() added into: bit 0 delay, bit 1 reverb (0 when
+    // it returned false). A send it did not touch keeps its input exactly.
+    uint8_t sendsTouched() const { return sendsTouched_; }
 
     // Introspection for tests / UI.
     float rate() const { return targetRate_ + glideOff_; }
@@ -129,6 +151,7 @@ private:
         uint32_t frames = 0;
         uint8_t note = 60;
         bool valid = false;
+        const int16_t* dataR = nullptr;   // right block (stereo), else nullptr
     };
     struct Mod {          // automation slots 1..5 (spec 04 §4.8)
         uint8_t mode = 0; // 0 off, 1 envelope, 2 LFO
@@ -163,6 +186,10 @@ private:
     int16_t curStep0_ = 0;
     uint32_t rnd(uint32_t n);
     void renderPlayer(float* out, uint32_t n);
+    // Stereo player / block render (2x-04 §3). Kept apart from the mono
+    // functions so the mono path compiles exactly as before.
+    void renderPlayerSt(float* outL, float* outR, uint32_t n);
+    bool renderSt(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsend, float* mixL, float* mixR);
     float computeRate() const;
 
     // binding
@@ -232,6 +259,15 @@ private:
     bool firstBlock_ = true;
     float tempo_ = 130.0f;
     bool aa_ = true;
+
+    // Stereo state (2x-04 §3), after the mono members so their offsets stay.
+    bool stereo_ = false;      // current note plays L and R (2x-04 §3.1)
+    bool lastSt_ = false;      // the previous block ran the stereo chain
+    bool stBlock_ = false;     // stereo_ || a stereo note is pending: next block runs the stereo chain
+    const int16_t* dataR_ = nullptr;   // right block (stereo instrument), else nullptr
+    float filtLastR_ = 0.0f;
+    Svf svfR_;                 // right channel filter (stereo notes)
+    uint8_t sendsTouched_ = 0; // see sendsTouched()
 };
 
 }  // namespace audio

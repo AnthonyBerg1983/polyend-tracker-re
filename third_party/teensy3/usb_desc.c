@@ -591,7 +591,15 @@ static uint8_t flightsim_report_desc[] = {
 #define MULTITOUCH_INTERFACE_DESC_SIZE	0
 #endif
 
-#define CONFIG_DESC_SIZE		MULTITOUCH_INTERFACE_DESC_POS+MULTITOUCH_INTERFACE_DESC_SIZE
+// OPENTRACKER PATCH (see PATCHES.txt): mass-storage interface last.
+#define MSC_INTERFACE_DESC_POS		MULTITOUCH_INTERFACE_DESC_POS+MULTITOUCH_INTERFACE_DESC_SIZE
+#ifdef  MSC_INTERFACE
+#define MSC_INTERFACE_DESC_SIZE		9+7+7
+#else
+#define MSC_INTERFACE_DESC_SIZE		0
+#endif
+
+#define CONFIG_DESC_SIZE		MSC_INTERFACE_DESC_POS+MSC_INTERFACE_DESC_SIZE
 
 
 
@@ -1570,6 +1578,35 @@ static uint8_t config_descriptor[CONFIG_DESC_SIZE] = {
         MULTITOUCH_SIZE, 0,                     // wMaxPacketSize
         1,                                      // bInterval
 #endif // KEYMEDIA_INTERFACE
+
+#ifdef MSC_INTERFACE
+        // OPENTRACKER PATCH (see PATCHES.txt): USB Mass Storage Class,
+        // Bulk-Only Transport 1.0, SCSI transparent command set.
+        // interface descriptor, USB spec 9.6.5, page 267-269, Table 9-12
+        9,                                      // bLength
+        4,                                      // bDescriptorType
+        MSC_INTERFACE,                          // bInterfaceNumber
+        0,                                      // bAlternateSetting
+        2,                                      // bNumEndpoints
+        0x08,                                   // bInterfaceClass (0x08 = Mass Storage)
+        0x06,                                   // bInterfaceSubClass (0x06 = SCSI transparent)
+        0x50,                                   // bInterfaceProtocol (0x50 = Bulk-Only)
+        0,                                      // iInterface
+        // endpoint descriptor, USB spec 9.6.6, page 269-271, Table 9-13
+        7,                                      // bLength
+        5,                                      // bDescriptorType
+        MSC_TX_ENDPOINT | 0x80,                 // bEndpointAddress
+        0x02,                                   // bmAttributes (0x02=bulk)
+        MSC_TX_SIZE, 0,                         // wMaxPacketSize
+        0,                                      // bInterval
+        // endpoint descriptor, USB spec 9.6.6, page 269-271, Table 9-13
+        7,                                      // bLength
+        5,                                      // bDescriptorType
+        MSC_RX_ENDPOINT,                        // bEndpointAddress
+        0x02,                                   // bmAttributes (0x02=bulk)
+        MSC_RX_SIZE, 0,                         // wMaxPacketSize
+        0,                                      // bInterval
+#endif // MSC_INTERFACE
 };
 
 
@@ -1677,11 +1714,21 @@ struct usb_string_descriptor_struct usb_string_product_name_default = {
         3,
         PRODUCT_NAME
 };
+#ifdef MSC_INTERFACE
+// OPENTRACKER PATCH (see PATCHES.txt): room for the 20-digit hex serial of
+// the mass-storage device (usb_init_serialnumber() below).
+struct usb_string_descriptor_struct usb_string_serial_number_default = {
+        12,
+        3,
+        {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+};
+#else
 struct usb_string_descriptor_struct usb_string_serial_number_default = {
         12,
         3,
         {0,0,0,0,0,0,0,0,0,0}
 };
+#endif
 #ifdef MIDI_INTERFACE
         struct usb_string_descriptor_struct usb_string_midi_port1_default = {
                 14,
@@ -1803,6 +1850,10 @@ struct usb_string_descriptor_struct usb_string_mtp = {
 };
 #endif
 
+// OPENTRACKER PATCH (see PATCHES.txt): OT_USB_DESC_HOST_TEST compiles this file
+// on the host for the descriptor check (tests/usb_desc_test.cpp) without the
+// flash-register serial number reader.
+#ifndef OT_USB_DESC_HOST_TEST
 void usb_init_serialnumber(void)
 {
 	char buf[11];
@@ -1826,6 +1877,27 @@ void usb_init_serialnumber(void)
 	kinetis_hsrun_enable();
 #endif
 	__enable_irq();
+#ifdef MSC_INTERFACE
+	// OPENTRACKER PATCH (see PATCHES.txt): Windows' USBSTOR uses a mass-storage
+	// device's serial number only when it has >= 12 characters of 0-9 / A-F
+	// (else it makes up an instance ID per port). 20 hex digits from the
+	// chip's unique ID (SIM_UIDMH[15:0], SIM_UIDML, SIM_UIDL: unique per
+	// K66); the factory serial above, in hex, if the UID reads as zero.
+	{
+		static const char hex[] = "0123456789ABCDEF";
+		uint32_t w[3];
+		w[0] = SIM_UIDMH & 0xFFFF;
+		w[1] = SIM_UIDML;
+		w[2] = SIM_UIDL;
+		if (!(w[0] | w[1] | w[2])) w[2] = num;
+		for (i = 0; i < 4; i++) usb_string_serial_number_default.wString[i] = hex[(w[0] >> (12 - 4 * i)) & 15];
+		for (i = 0; i < 8; i++) usb_string_serial_number_default.wString[4 + i] = hex[(w[1] >> (28 - 4 * i)) & 15];
+		for (i = 0; i < 8; i++) usb_string_serial_number_default.wString[12 + i] = hex[(w[2] >> (28 - 4 * i)) & 15];
+		usb_string_serial_number_default.bLength = 20 * 2 + 2;
+		(void)buf;
+		return;
+	}
+#endif
 	// add extra zero to work around OS-X CDC-ACM driver bug
 	if (num < 10000000) num = num * 10;
 	ultoa(num, buf, 10);
@@ -1836,6 +1908,7 @@ void usb_init_serialnumber(void)
 	}
 	usb_string_serial_number_default.bLength = i * 2 + 2;
 }
+#endif // OT_USB_DESC_HOST_TEST
 
 
 // **************************************************************

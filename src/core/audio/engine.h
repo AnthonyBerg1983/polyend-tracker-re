@@ -10,7 +10,11 @@
 #include <cstdint>
 
 #include "audio/audio_tables.h"
+#include "audio/block_profile.h"
+#include "audio/cpu_meter.h"
 #include "audio/effects.h"
+#include "audio/governor.h"
+#include "audio/synth_bank.h"
 #include "audio/voice.h"
 #include "hal_api.h"
 #include "model/instrument.h"
@@ -130,9 +134,11 @@ struct MixerSettings {
 };
 
 // One block of every stem, interleaved stereo int16 (spec 04 §6.1 queues):
-// 0..7 track1..8 (post-pan), 8 reverb, 9 delay, 10 master.
+// 0..7 track1..8 (post-pan), 8 reverb, 9 delay, 10 master, 11..13 Synth 1..3
+// (2.x: slot bus after gain and pan, before the sends; 2x-04 §6, 2x-05 §9).
 struct StemBlock {
-    static constexpr int kStems = 11;
+    static constexpr int kStems = 14;
+    static constexpr int kFirstSynthStem = 11;
     int16_t data[kStems][kBlock * 2];
 };
 
@@ -208,11 +214,15 @@ public:
     void renderOfflineBlock(int16_t* masterInterleaved, StemBlock* stems);
     void endOffline();
     // Render into WAV files: stems=false -> `path` is the master file;
-    // stems=true -> `path` is a directory receiving track1..8/reverb/delay/master.wav.
+    // stems=true -> `path` is a directory receiving track1..8/reverb/delay/master
+    // and synth_1..3.wav (Mini %s/synth_%d.wav, spec 21 §2; 1-based: U13).
     // Stops after maxBlocks or when running(ctx) returns false. Header sample
     // rate field is 44117 (spec 04 §6.1). Returns blocks rendered, <0 on I/O error.
     int32_t exportWav(IStorage& fs, const char* path, bool stems, uint32_t maxBlocks, bool (*running)(void*),
                       void* ctx);
+    // Stem block buffer for exportWav (~7 KB; SDRAM on the device). Without
+    // one, exportWav allocates it for the export.
+    void setExportScratch(StemBlock* s) { exportScratch_ = s; }
 
     // Meters.
     float limiterGainReduction() const { return limL_.meanGain(); }
@@ -220,6 +230,30 @@ public:
     float tempo() const { return tempo_; }
     bool metronomeActive() const { return voices_[kMetronomeVoice].active(); }
     uint64_t blocksRendered() const { return blocks_; }
+    // 2.x render load (live blocks through fillCallback, cpu_meter.h) and the
+    // synth voice governor evaluated after each of them (governor.h).
+    CpuMeter& cpu() { return cpu_; }
+    const CpuMeter& cpu() const { return cpu_; }
+    Governor& governor() { return gov_; }
+    const Governor& governor() const { return gov_; }
+    // 2.x synth slots, voice pool and slot mixer (synth_bank.h); the
+    // governor's IVoicePool.
+    SynthBank& synth() { return synth_; }
+    const SynthBank& synth() const { return synth_; }
+    // Peak-block attribution of the live render (block_profile.h): the
+    // costliest block of each 1 s CpuMeter window, split by phase, with its
+    // events. Filled only while the meter has a cycle source.
+    const ProfileWindow& profile() const { return profWin_; }
+    // The profile of the last timed live block (benches, tests).
+    const BlockProfile& lastBlockProfile() const { return prof_; }
+    // What the pre-block hook (App::preBlock, the sequencer) did in this
+    // block (block_profile.h SeqWork bits, pattern tracks copied). Counted
+    // only inside the hook of a timed live block; main-loop calls are not.
+    void noteSeqWork(uint8_t why, uint32_t patTracks = 0) {
+        if (!inHook_) return;
+        prof_.seqWhy = uint8_t(prof_.seqWhy | why);
+        BlockProfile::add(prof_.nPatTracks, patTracks);
+    }
 
     // ISequencerSink (spec 03 §6).
     void voiceNoteOn(uint8_t track, const VoiceNoteOn& n) override;
@@ -229,6 +263,11 @@ public:
     void engineBlockUpdate(float smoothedTempoBpm) override { tempo_ = smoothedTempoBpm > 0.0f ? smoothedTempoBpm : tempo_; }
     void metronomeClick(bool accent, uint8_t velocity) override;
     void midiSend(uint8_t portMask, const uint8_t* bytes, uint8_t len) override;
+    void synthNoteOn(uint8_t track, const SynthNoteOn& n) override;
+    void synthNoteOff(uint8_t track, NoteOffMode mode) override;
+    void synthApplyFx(uint8_t track, uint8_t type, uint8_t value) override;
+    void synthMacroFx(uint8_t slot, uint8_t macro, uint8_t value) override;
+    void synthTransportStop() override;
 
 private:
     void renderBlock(bool offline, int16_t* master, StemBlock* stems);
@@ -236,6 +275,7 @@ private:
     void controlBlock(float blockUs);
     template <int kMode>
     void masterSum(float l0, float li);
+    void masterSumClean(float l0, float li);   // masterSum<0>
 
     SampleBank bank_;
     const Instrument* instruments_ = nullptr;
@@ -277,6 +317,7 @@ private:
     void* transportCtx_ = nullptr;
 
     PreBlockFn hook_ = nullptr;
+    StemBlock* exportScratch_ = nullptr;
     void* hookCtx_ = nullptr;
     IMidiPort* midi_ = nullptr;
     const int16_t* lineIn_ = nullptr;
@@ -284,6 +325,16 @@ private:
     volatile float lineMonPeak_ = 0.0f;
     float tempo_ = 130.0f;
     uint64_t blocks_ = 0;
+    CpuMeter cpu_;
+    Governor gov_;
+    BlockProfile prof_;          // the block being rendered (live, timed)
+    ProfileWindow profWin_;
+    bool profOn_ = false;        // stamp this block (live with a cycle source)
+    bool inHook_ = false;        // inside the pre-block hook (note work is attributed)
+    SynthBank synth_;
+    SynthMixInputs synthIn_;
+    bool playing_ = false;       // transport state of the last block (governor reset on Stop)
+    bool govPlaying_ = false;
     bool callbackDisabled_ = false;
     bool offline_ = false;
     bool ready_ = false;

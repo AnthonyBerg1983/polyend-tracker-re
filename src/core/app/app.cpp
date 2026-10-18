@@ -2,10 +2,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 #include "app/project_fields.h"
 #include "app/project_io.h"
 #include "formats/file_io.h"
+#include "sdram_bss.h"
 #include "ui/screens.h"
 
 namespace ot {
@@ -15,12 +17,39 @@ constexpr uint32_t kAutosaveMs = 10000;   // OpenTracker: workspace autosave per
 constexpr uint32_t kConfigSaveMs = 5000;  // spec 05 §1.7 settings write-back
 }  // namespace
 
+#if defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE
+namespace {
+// Storage of the OT_APP_SDRAM_MEMBER members (app.h). Raw bytes, so nothing
+// runs on it at static initialisation (the SDRAM is not up yet).
+struct AppSdram {
+    alignas(PatternNames) unsigned char names[sizeof(PatternNames)];
+    alignas(ProjectJob) unsigned char pj[sizeof(ProjectJob)];
+};
+OT_SDRAM_BSS AppSdram gAppSdram;
+}  // namespace
+
+App::App()
+    : names(*reinterpret_cast<PatternNames*>(gAppSdram.names)), bank(engine.bank()), ui(*this),
+      pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
+#else
 App::App() : bank(engine.bank()), ui(*this) {}
+#endif
 
 bool App::init(const HalRefs& hal, const AppMemory& mem) {
+#if defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE
+    // The SDRAM members (app.h OT_APP_SDRAM_MEMBER): constructed now, after
+    // otAppMain() zeroed `.sdram_bss`.
+    new (&names) PatternNames();
+    new (&pj_) ProjectJob();
+#endif
     hal_ = hal;
     mem_ = mem;
-    if (!hal_.storage || !hal_.clock || !mem_.patterns || !mem_.clipboard) return false;
+    if (!hal_.storage || !hal_.clock || !mem_.patterns || !mem_.clipboard || !mem_.seqBuffers) return false;
+    // 2.x ext-track pool (docs/M1_PLAN.md §1); the last record is the
+    // pool-full write target of storedTrack().
+    if (!mem_.extTracks || mem_.extTrackBlocks < 2 || !mem_.extMeta) return false;
+    extDiscard_ = &mem_.extTracks[mem_.extTrackBlocks - 1];
+    ext_.attach(mem_.extTracks, mem_.extTrackBlocks - 1, mem_.extMeta);
     // spec 04: delay/reverb memory and the sample pool are caller-provided (SDRAM).
     if (!engine.init(mem_.fxMemory, mem_.fxSamples, mem_.sampleBank, mem_.sampleBankSamples, instruments))
         return false;
@@ -37,14 +66,18 @@ bool App::init(const HalRefs& hal, const AppMemory& mem) {
         },
         this);
     seq.setPerfPatternMemory(mem_.perfPatterns);   // spec 12 §C.1 staging (SDRAM)
+    engine.setExportScratch(mem_.exportStems);
+    // Synth slots play the App's patches (2.x M3, audio/synth_bank.h).
+    for (int s = 0; s < kSynthSlotCount; ++s) engine.synth().bindPatch(s, &patches_[s]);
     undo.attach(mem_.undo, mem_.undoNums, mem_.undoSlots);
     fileUndo.attach(mem_.fileUndo, mem_.fileUndoNums, mem_.fileUndoSlots);
     for (auto& in : instruments) in.setDefault();
     project.setDefault();
     names.clear();
-    for (int n = 1; n <= kPatternCount; ++n) defaultPattern(stored(n));
-    defaultPattern(bufA_);
-    defaultPattern(bufB_);
+    resetPatternStore();
+    defaultPattern(mem_.seqBuffers[0]);
+    defaultPattern(mem_.seqBuffers[1]);
+    if (mem_.seqStage) defaultPattern(*mem_.seqStage);
     attachSequencer();
     applyEngineSettings();
     ui.attach(hal_.display, hal_.leds);
@@ -56,9 +89,10 @@ bool App::init(const HalRefs& hal, const AppMemory& mem) {
 }
 
 void App::attachSequencer() {
-    Pattern* a = seq.currentPattern() ? seq.currentPattern() : &bufA_;
-    Pattern* b = seq.preloadPattern() ? seq.preloadPattern() : &bufB_;
-    seq.attach(&engine, this, &project, a, b);
+    Pattern* a = seq.currentPattern() ? seq.currentPattern() : &mem_.seqBuffers[0];
+    Pattern* b = seq.preloadPattern() ? seq.preloadPattern() : &mem_.seqBuffers[1];
+    Pattern* c = seq.stagePattern() ? seq.stagePattern() : mem_.seqStage;
+    seq.attach(&engine, this, &project, a, b, c);
 }
 
 void App::defaultPattern(Pattern& p) const {
@@ -66,6 +100,14 @@ void App::defaultPattern(Pattern& p) const {
     uint16_t len = project.defaultPatternLength();
     if (len < 1 || len > kStepCount) len = 32;
     pops::setLength(p, len);
+}
+
+void App::defaultPattern(PatternStock& p) const {
+    // Same as the Pattern overload (pops::setLength: every track one length).
+    p.setDefault();
+    uint16_t len = project.defaultPatternLength();
+    if (len < 1 || len > kStepCount) len = 32;
+    for (auto& t : p.tracks) t.lastStep = uint8_t(len - 1);
 }
 
 bool App::boot() {
@@ -110,10 +152,16 @@ void App::applySequencerSettings() {
 void App::preBlockThunk(void* ctx, float seconds) { static_cast<App*>(ctx)->preBlock(seconds); }
 
 void App::preBlock(float seconds) {
-    if (engineDirty_) applyEngineSettings();
+    if (engineDirty_) {
+        applyEngineSettings();
+        engine.noteSeqWork(audio::kSeqEngineApply);
+    }
     const int16_t* in = hal_.lineIn && !rendering_ ? hal_.lineIn(hal_.lineInCtx) : nullptr;
     // Recorder input tap (spec 05 appendix C §2): meter / count-in / record.
-    if (!rendering_) capture.process(in, audio::kBlock, &engine);
+    if (!rendering_) {
+        capture.process(in, audio::kBlock, &engine);
+        if (capture.recording()) engine.noteSeqWork(audio::kSeqRecorder);
+    }
     // Monitor off (appendix C §2.7) keeps the input out of the mix. Monitor
     // On in the Recorder mixes it at unity, not at the Global Mixer line
     // level / mute (spec 22 §5).
@@ -138,6 +186,10 @@ void App::applyEngineSettings() {
     const uint8_t lineCh = cfg.lineInChannel > 2 ? 2 : cfg.lineInChannel;
     m.lineInChannel = lineCh;
     capture.setChannelMode(lineCh);
+    // 2.x synth slots: the project records (spec 21 §3.3) and the voice
+    // budget from Config (OPTIMIZATION_2X item 10 / OP-8).
+    for (int s = 0; s < kSynthSlotCount; ++s) engine.synth().setSlotRecord(s, project.synthSlot(s));
+    if (engine.governor().budget() != cfg.synthVoices) engine.governor().setBudget(cfg.synthVoices);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,9 +197,9 @@ void App::applyEngineSettings() {
 
 int App::auditionTrack(uint16_t voiceId, int from) const {
     // Scan from the cursor track (FW:0x114B8).
-    const int start = from >= 0 && from < kTrackCount ? from : editorTrack;
-    for (int k = 0; k < kTrackCount; ++k) {
-        const int t = (start + k) % kTrackCount;
+    const int start = from >= 0 && from < kAuditionTracks ? from : editorTrack;
+    for (int k = 0; k < kAuditionTracks; ++k) {
+        const int t = (start + k) % kAuditionTracks;
         if (aud_[t].busy && aud_[t].id == voiceId) return t;
     }
     return -1;
@@ -192,20 +244,26 @@ int App::previewOn(uint16_t voiceId, uint8_t instrument, uint8_t note, uint8_t v
     // §1.4 step 5); each note-off releases one.
     if (voiceId < kAuditionMidiIn || voiceId >= kAuditionMidiIn + 128) previewOff(voiceId);
     const bool midi = isMidiInstrument(instrument);
+    if (isSynthInstrument(instrument)) {
+        // 2.x synth slots: the framework's audition track (one note at a time).
+        engine.synth().auditionOn(synthSlotOf(instrument), uint8_t(note & 127));
+        synthAudVoice_ = voiceId;
+        return -1;
+    }
     if (!midi && instrument >= kSampleInstrumentCount) return -1;
     // spec 17 §1.4 step 6: the track is claimed even when nothing can sound
     // (empty sample slot, no MIDI port), so step entry still applies.
     const bool sound = midi ? hal_.midi != nullptr : bank.loaded(instrument);
     int track = -1;
     if (forceTrack >= 0) {
-        if (forceTrack < kTrackCount && (midi || forceTrack < audio::kVoices)) {
+        if (forceTrack < kAuditionTracks && (midi || forceTrack < audio::kVoices)) {
             track = forceTrack;
             releaseAudition(track);
         }
     } else {
-        const int start = startTrack >= 0 && startTrack < kTrackCount ? startTrack : editorTrack;
-        for (int k = 0; k < kTrackCount && track < 0; ++k) {
-            const int t = (start + k) % kTrackCount;
+        const int start = startTrack >= 0 && startTrack < kAuditionTracks ? startTrack : editorTrack;
+        for (int k = 0; k < kAuditionTracks && track < 0; ++k) {
+            const int t = (start + k) % kAuditionTracks;
             if (!midi && t >= audio::kVoices) continue;
             if (trackMuted(t) || aud_[t].busy) continue;
             track = t;   // tracks playing pattern notes are not skipped
@@ -243,12 +301,18 @@ int App::previewOn(uint16_t voiceId, uint8_t instrument, uint8_t note, uint8_t v
 }
 
 void App::previewOff(uint16_t voiceId, int startTrack) {
+    if (voiceId == synthAudVoice_) {
+        engine.synth().auditionOff();
+        synthAudVoice_ = kNoSynthAudition;
+    }
     const int t = auditionTrack(voiceId, startTrack);
     if (t >= 0) releaseAudition(t);
 }
 
 void App::previewAllOff() {
     for (int t = 0; t < kTrackCount; ++t) releaseAudition(t);
+    if (synthAudVoice_ != kNoSynthAudition) engine.synth().auditionOff();
+    synthAudVoice_ = kNoSynthAudition;
     engine.previewStop();   // SD file preview
 }
 
@@ -271,6 +335,12 @@ void App::loop() {
                 g.endFrame();
             }
         }
+        return;
+    }
+    // 2.x USB Storage mode: the computer owns the card. Only the UI (the mode
+    // page) and the USB block I/O run; nothing here may touch the card.
+    if (usbActive_) {
+        loopUsbStorage(now);
         return;
     }
     // Card pulled while running: "Please insert SD card" screen until it returns.
@@ -483,13 +553,23 @@ void App::setPresent(int num, bool on) {
 
 bool App::patternHasData(int num) {
     if (num < 1 || num > kPatternCount) return false;
-    const Pattern& p = num == patternNumber() ? pattern() : stored(num);
-    if (num != patternNumber() && !patternPresent(num)) return false;
-    for (const auto& t : p.tracks)
+    auto hasData = [](const Track& t) {
         for (int s = 0; s < kStepCount; ++s) {
             const Step& st = t.steps[s];
             if (st.note != kNoteEmpty || st.fx[0].type || st.fx[1].type) return true;
         }
+        return false;
+    };
+    if (num == patternNumber()) {
+        for (const auto& t : pattern().tracks)
+            if (hasData(t)) return true;
+        return false;
+    }
+    if (!patternPresent(num)) return false;
+    for (const auto& t : storedStock(num).tracks)
+        if (hasData(t)) return true;
+    for (int e = 0; e < kExtTrackCount; ++e)
+        if (const Track* t = ext_.find(num, e); t && hasData(*t)) return true;
     return false;
 }
 
@@ -508,15 +588,142 @@ void App::markPatternDirty(int num) {
 
 void App::patternEdited() {
     const int num = patternNumber();
-    stored(num) = pattern();
+    // VERIFY_M1 R2: an edit of tracks 13..16 that does not fit the full
+    // ext-track pool is refused: the working pattern is re-assembled from
+    // the store, so what is shown (and played) is what will be saved. The
+    // pool-full notice comes from storePattern().
+    if (!storePattern(num, pattern())) assemblePattern(num, pattern());
     markPatternDirty(num);
     ui.dirty();
 }
 
 void App::reloadCurrentFromStore() {
     const int num = patternNumber();
-    pattern() = stored(num);
+    assemblePattern(num, pattern());
     ui.dirty();
+}
+
+// ---------------------------------------------------------------------------
+// Resident pattern store: stock tracks + ext-track pool (docs/M1_PLAN.md §1)
+
+namespace {
+bool validNum(int num) { return num >= 1 && num <= kPatternCount; }
+}  // namespace
+
+void App::reportExtPoolFull() {
+    // One notice per burst of refused allocations.
+    if (ext_.fullEvents() == extFullReported_) return;
+    extFullReported_ = ext_.fullEvents();
+    ui.notify("Track memory full");
+}
+
+Track& App::storedTrack(int num, int t) {
+    if (!validNum(num) || t < 0 || t >= kTrackCount) return *extDiscard_;
+    if (t < kStockTrackCount) return storedStock(num).tracks[t];
+    const int e = t - kStockTrackCount;
+    if (Track* b = ext_.find(num, e)) return *b;
+    // The discard record doubles as the initial image (no stack copy).
+    defaultExtTrack(*extDiscard_, storedStock(num));
+    if (Track* b = ext_.alloc(num, e, *extDiscard_)) return *b;
+    reportExtPoolFull();
+    return *extDiscard_;
+}
+
+bool App::storedTrackWritable(int num, int t) const {
+    if (!validNum(num) || t < 0 || t >= kTrackCount) return false;
+    if (t < kStockTrackCount) return true;
+    return ext_.find(num, t - kStockTrackCount) != nullptr || ext_.freeBlocks() > 0;
+}
+
+const Track* App::findStoredTrack(int num, int t) const {
+    if (!validNum(num) || t < 0 || t >= kTrackCount) return nullptr;
+    if (t < kStockTrackCount) return &storedStock(num).tracks[t];
+    return ext_.find(num, t - kStockTrackCount);
+}
+
+void App::readStoredTrack(int num, int t, Track& out) const {
+    if (const Track* src = findStoredTrack(num, t)) out = *src;
+    else if (validNum(num)) defaultExtTrack(out, storedStock(num));
+    else out.clear(kDefaultTrackLastStep);
+}
+
+bool App::storePattern(int num, const Pattern& p) {
+    if (!validNum(num)) return false;
+    PatternStock& st = storedStock(num);
+    p.copyStockTo(st);
+    bool ok = true;
+    for (int e = 0; e < kExtTrackCount; ++e) {
+        const Track& src = p.tracks[kStockTrackCount + e];
+        if (Track* b = ext_.find(num, e)) {
+            *b = src;   // kept until compactExtTracks(), also when default again
+        } else if (!extTrackIsDefault(src, st.tracks[0].lastStep)) {
+            if (!ext_.alloc(num, e, src)) ok = false;
+        }
+    }
+    if (!ok) reportExtPoolFull();
+    return ok;
+}
+
+void App::assemblePattern(int num, Pattern& dst) const {
+    // Audio context too (loadPattern): reads only, no allocation, O(1) per
+    // track (16 x 769-byte copies).
+    if (!validNum(num)) num = 1;
+    const PatternStock& st = storedStock(num);
+    dst.copyStockFrom(st);
+    for (int e = 0; e < kExtTrackCount; ++e) {
+        Track& d = dst.tracks[kStockTrackCount + e];
+        if (const Track* b = ext_.find(num, e)) d = *b;
+        else defaultExtTrack(d, st);
+    }
+}
+
+int App::compactExtTracks(int num) {
+    int freed = 0;
+    const int n0 = num ? num : 1, n1 = num ? num : kPatternCount;
+    if (!validNum(n0) || !validNum(n1)) return 0;
+    for (int n = n0; n <= n1; ++n) {
+        const uint8_t base = storedStock(n).tracks[0].lastStep;
+        for (int e = 0; e < kExtTrackCount; ++e) {
+            const Track* b = ext_.find(n, e);
+            if (b && extTrackIsDefault(*b, base)) {
+                ext_.release(n, e);
+                ++freed;
+            }
+        }
+    }
+    return freed;
+}
+
+void App::clearExtTracks(int num) {
+    ext_.releasePattern(num);
+    if (validNum(num)) extKeep_[num] = 0;   // dropped on purpose: nothing to keep from the file
+}
+
+void App::defaultStored(int num) {
+    if (!validNum(num)) return;
+    clearExtTracks(num);
+    defaultPattern(storedStock(num));
+}
+
+void App::resetPatternStore() {
+    ext_.clear();
+    std::memset(extKeep_, 0, sizeof(extKeep_));
+    extFullReported_ = 0;
+    for (int n = 1; n <= kPatternCount; ++n) defaultPattern(storedStock(n));
+}
+
+void App::pushFileUndo(int num) {
+    if (!validNum(num)) return;
+    if (Pattern* slot = fileUndo.pushSlot(uint8_t(num))) assemblePattern(num, *slot);
+}
+
+bool App::popFileUndo(uint8_t* num) {
+    uint8_t n = 0;
+    const Pattern* p = fileUndo.popSlot(&n);
+    if (!p) return false;
+    if (num) *num = n;
+    storePattern(n, *p);
+    return true;
 }
 
 void App::selectPattern(int num) {
@@ -530,7 +737,7 @@ void App::selectPattern(int num) {
         return;
     }
     if (num == patternNumber()) return;
-    stored(patternNumber()) = pattern();
+    commitCurrentPattern();
     loadPattern(uint8_t(num), pattern(), true);
     project.setCurrentPattern(uint8_t(num));
     attachSequencer();   // re-point the sequencer (spec 06 §1.7 "0x11a34")
@@ -547,9 +754,10 @@ void App::switchPatternNow(int num) {
     if (num > kPatternCount) num = kPatternCount;
     if (num == effectivePatternNumber()) return;
     // Main loop: the store already holds every edit (patternEdited); copy
-    // once more so the outgoing buffer's state is kept. The audio context
-    // then loads the new pattern into the preload buffer and swaps it in.
-    if (!seq.pendingSwitch()) stored(patternNumber()) = pattern();
+    // once more so the outgoing buffer's state is kept. The sequencer then
+    // assembles the new pattern into its stage buffer (here, in the main
+    // loop) and the audio context swaps it in.
+    if (!seq.pendingSwitch()) commitCurrentPattern();
     seq.switchPatternNow(uint8_t(num));
     markProjectDirty();
     ui.dirty();
@@ -558,10 +766,38 @@ void App::switchPatternNow(int num) {
 void App::loadPattern(uint8_t number, Pattern& dst, bool sync) {
     (void)sync;
     // The whole pattern set lives in memory, so loads are a copy (safe in the
-    // audio-block context).
+    // audio-block context): stock tracks + ext blocks, no allocation.
     if (number < 1 || number > kPatternCount) number = 1;
-    if (patternPresent(number)) dst = stored(number);
+    if (patternPresent(number)) assemblePattern(number, dst);
     else defaultPattern(dst);
+    engine.noteSeqWork(audio::kSeqWholeLoad, kTrackCount);   // only counted in the audio block
+}
+
+void App::loadPatternTracks(uint8_t number, Pattern& dst, int first, int count) {
+    // Audio context: tracks [first, first + count) of what loadPattern
+    // writes (assemblePattern / defaultPattern), one 769-byte copy each.
+    if (number < 1 || number > kPatternCount) number = 1;
+    if (first < 0) first = 0;
+    const int end = first + count < kTrackCount ? first + count : kTrackCount;
+    if (first >= end) return;
+    if (patternPresent(number)) {
+        const PatternStock& st = storedStock(number);
+        for (int t = first; t < end; ++t) {
+            Track& d = dst.tracks[t];
+            if (t < kStockTrackCount) d = st.tracks[t];
+            else if (const Track* b = ext_.find(number, t - kStockTrackCount)) d = *b;
+            else defaultExtTrack(d, st);
+        }
+    } else {
+        uint16_t len = project.defaultPatternLength();
+        if (len < 1 || len > kStepCount) len = 32;
+        for (int t = first; t < end; ++t) {
+            Track& d = dst.tracks[t];
+            d.lastStep = uint8_t(len - 1);
+            for (auto& s : d.steps) s = Step{};
+        }
+    }
+    engine.noteSeqWork(audio::kSeqPreloadPart, uint32_t(end - first));   // only counted in the audio block
 }
 
 void App::pushUndo() { undo.push(pattern(), patternNumber()); }
@@ -604,7 +840,8 @@ void App::copyToClipboard(const SelRect& r) {
 
 void App::setCurrentInstrument(int i) {
     if (i < 0) i = 0;
-    if (i >= kInstrumentCount) i = kInstrumentCount - 1;
+    // 2.x: synth slots 64..66 are instruments too (Tracker Mini).
+    if (i >= kFirstSynthInstrument + kSynthSlotCount) i = kFirstSynthInstrument + kSynthSlotCount - 1;
     if (project.u8(pf::kCurInstrument) != i) {
         project.setU8(pf::kCurInstrument, uint8_t(i));
         markProjectDirty();
@@ -622,16 +859,16 @@ void App::setStepJump(int v) {
 }
 
 bool App::trackMuted(int t) const {
-    if (t < 0 || t >= kTrackCount) return false;
-    return t < 8 ? project.u8(pf::kMute0 + uint32_t(t)) != 0 : project.u8(pf::kMute8 + uint32_t(t - 8)) != 0;
+    // project.mt: 0x12C (tracks 0..7), 0x742[0..7] (tracks 8..15; 12..15
+    // as the Tracker Mini, MINI_PLAN U13).
+    return project.trackMuted(t);
 }
 
 void App::setTrackMute(int t, bool m) {
-    if (t < 0 || t >= kTrackCount) return;
-    if (t < 8) project.setU8(pf::kMute0 + uint32_t(t), m ? 1 : 0);
-    else project.setU8(pf::kMute8 + uint32_t(t - 8), m ? 1 : 0);
+    if (!project.setTrackMuted(t, m)) return;
     // Sample voices are not cut (spec 03 §2.4): the engine zeroes the dry
-    // path and post-fader sends of a muted track (spec 07 Q3).
+    // path and post-fader sends of a muted track (spec 07 Q3). Tracks 8..15
+    // are MIDI only; the sequencer reads the flag at the next step.
     markProjectDirty();   // engine mute follows via applyEngineSettings
 }
 

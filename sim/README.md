@@ -36,6 +36,7 @@ Options:
 | `--screenshot OUT.png` | headless: save the framebuffer when the script ends |
 | `--panel` | screenshots show the whole front panel, not only the 800x480 screen |
 | `--wav OUT.wav` | headless: record the rendered audio |
+| `--instant-display` | show every frame at once (also `OT_SIM_BUSY=0`). Default: FT81x frame pacing -- a frame is uploaded, then shown at the next 54 Hz vsync, `frameReady()` false meanwhile |
 
 The workspace is autosaved to the SD folder when the window closes.
 
@@ -116,9 +117,31 @@ pad N down|up|tap [VEL]     pad 0..47
 enc DELTA                   encoder detents (+ = clockwise)
 screenshot FILE.png         save the framebuffer now (--panel: whole panel)
 panelshot FILE.png          save the whole front panel now
-usbstorage on|off           show / hide the USB Storage Mode page (interface event 10)
+usbstorage on|off           2.x USB Storage mode on / off (interface event 10; Config >
+                            USB > USB Storage): the sim has no USB, the card directory is
+                            locked while the mode is on
+usbhost none|waiting|inuse|ejected
+                            what the simulated computer does with the drive (mode page line,
+                            eject reminder on Exit while "inuse")
+expect-usbstorage on|off    fail unless the mode, its page and the card lock all match, or if
+                            the app touched the locked card
+expect-usbwarn on|off       fail unless the eject reminder is (not) shown
 theme N / font N            config Display theme 0..2 / Display font 0..1 (no Config key flow)
 echo TEXT                   print to stderr
+budget-reset                start a display-budget window
+budget NAME WORDS           fail if a frame since the reset uploaded > WORDS
+                            display-list words (or RAM_DL > 2000); a screen at
+                            rest is redrawn until its fragments are cached
+fragcheck NAME              fail unless the screen is pixel-identical with
+                            cached fragments off and on
+expect-open-ok              fail unless the last project job ended without
+                            errors, no popup is open and no notice other than
+                            "Project opened" was shown since the last check
+expect-project NAME         fail unless the current project is NAME
+expect-playing              fail unless the sequencer is playing
+expect-sound N              fail if the output peak since the last
+                            expect-sound / sound-reset is below N (0..32767)
+sound-reset                 restart the output peak
 ```
 
 Button names: `F1`..`F8`, the panel labels or `INSTRPARAMS PERFORMANCE FILE

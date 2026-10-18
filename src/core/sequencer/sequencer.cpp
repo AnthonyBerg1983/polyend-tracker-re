@@ -10,7 +10,14 @@ namespace {
 inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 inline bool isMidiInstr(uint8_t i) { return i >= 48 && i < 64; }
-inline bool isMidiLike(uint8_t i) { return i >= 48; }          // 48..63 MIDI, 64..66 reserved
+inline bool isMidiLike(uint8_t i) { return i >= 48; }          // 48..63 MIDI, 64..66 synths
+inline bool isSynth(uint8_t i) { return isSynthInstrument(i); }  // 64..66 = Synth 1..3 (MINI_PLAN §3)
+// Release the track's note before a new note (MIDI tracks are monophonic).
+// A synth note following a synth note is left to the synth bank, which
+// releases the old voice or reuses it (polyphony-1 legato / glide).
+inline bool releaseBefore(uint8_t last, uint8_t next) {
+    return (isMidiLike(last) || isMidiLike(next)) && !(isSynth(last) && isSynth(next));
+}
 inline bool isNoteOffSentinel(int8_t n) { return n == kNoteFade || n == kNoteCut || n == kNoteOff; }
 
 // Engine slot for a column: FX-B (model fx[0], column 0) -> slot 1,
@@ -58,12 +65,16 @@ void Sequencer::resetState() {
 }
 
 void Sequencer::attach(ISequencerSink* sink, ISequencerHost* host, Project* project, Pattern* bufA,
-                       Pattern* bufB) {
+                       Pattern* bufB, Pattern* stage) {
     sink_ = sink;
     host_ = host ? host : &defaultHost_;
     project_ = project;
+    if (bufB != next_) dropPreload();   // a spread preload went into the old buffer
     cur_ = bufA;
     next_ = bufB;
+    Pattern* st = stage ? stage : stage_.load(std::memory_order_relaxed);
+    if (st == bufA || st == bufB) st = nullptr;
+    stage_.store(st, std::memory_order_relaxed);
     if (project_) {
         curPatternNum_ = project_->currentPattern() ? project_->currentPattern() : 1;
         songPos_ = project_->playlistPos < kSongSlots ? project_->playlistPos : 0;
@@ -98,7 +109,7 @@ void Sequencer::setPerformanceMode(bool on) {
 
 void Sequencer::reloadPerfLengths() {
     if (!cur_) return;
-    for (int t = 0; t < 8; ++t) perfLen_[t] = playTrack(t).lastStep;
+    for (int t = 0; t < kTracks; ++t) perfLen_[t] = playTrack(t).lastStep;
 }
 
 void Sequencer::setPerfPlayMode(int t, uint8_t mode) {
@@ -127,7 +138,7 @@ void Sequencer::resyncTrack(int t) {
 bool Sequencer::setTrackPattern(int t, uint8_t number, bool immediate) {
     // Main loop. Handshake: clear the queue first so the ISR cannot flip to
     // the staging slot while it is being written; publish it last.
-    if (!perfMem_ || !cur_ || t < 0 || t >= 8 || number == 0) return false;
+    if (!perfMem_ || !cur_ || !validTrack(t) || number == 0) return false;
     if (!perfMode_) setPerformanceMode(true);  // spec 12 §C.1
     pendImm_[t].store(false, std::memory_order_relaxed);
     pendNum_[t].store(0, std::memory_order_seq_cst);
@@ -152,7 +163,7 @@ void Sequencer::commitTrackPattern(int t) {
     ovSlot_[t] ^= 1;
     ovActive_[t] = 1;
     ovNum_[t] = num;
-    freshCommit_ = uint8_t(freshCommit_ | (1u << t));
+    freshCommit_ = uint16_t(freshCommit_ | (1u << t));
     perfLen_[t] = perfMem_->slot[t][ovSlot_[t]].lastStep;
     // Position fix when beyond the new length (spec 12 §C.1).
     TrackState& tr = tracks_[t];
@@ -171,7 +182,7 @@ void Sequencer::discardTrackOverrides() {
     // Song advance / queued pattern change (spec 12 §C.3). Pending queues stay.
     // OT: a queue that committed at this same boundary survives (stock commits
     // into the outgoing buffer and loses it).
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < kTracks; ++t) {
         if (freshCommit_ & (1u << t)) continue;
         ovActive_[t] = 0;
         ovNum_[t] = 0;
@@ -179,7 +190,7 @@ void Sequencer::discardTrackOverrides() {
 }
 
 void Sequencer::clearTrackPatterns() {
-    for (int t = 0; t < 8; ++t) {
+    for (int t = 0; t < kTracks; ++t) {
         pendNum_[t].store(0);
         pendImm_[t].store(false);
         ovActive_[t] = 0;
@@ -248,6 +259,8 @@ void Sequencer::processElapsed(float seconds) {
 
 void Sequencer::advance(float seconds) {
     if (pendSwitch_.load(std::memory_order_relaxed)) commitSwitch();
+    blockUs_ = seconds * 1e6f;
+    if (partNext_ < kTracks) preloadPart(preloadTracksPerBlock());
     updateExternalTempo(seconds);
     const bool internal = settings_.clockIn == 0 || rendering_ || selection_;
     if (internal) {
@@ -337,6 +350,7 @@ void Sequencer::microStep() {
             return;
         }
     }
+    bool stepEnd = false;
     for (int t = 0; t < kTracks; ++t) {
         processTrack(t);
         if (!playing_) return;
@@ -345,8 +359,10 @@ void Sequencer::microStep() {
             tr.micro = 1;
             advanceStep(t);
             if (!playing_) return;
+            stepEnd = true;
         }
     }
+    if (stepEnd) advanceMaster();
 }
 
 // ---------------------------------------------------------------------------
@@ -358,17 +374,25 @@ int Sequencer::lastIndex(int t) const {
     int li = cur_ ? cur_->tracks[0].lastStep : kDefaultTrackLastStep;
     if (perfMode_) {
         if (perfGlobalLen_ >= 0) li = perfGlobalLen_;
-        else if (t < 8) li = perfLen_[t];
+        else li = perfLen_[t];
     }
+    return clampi(li, 0, kStepCount - 1);
+}
+
+int Sequencer::baseLastIndex() const {
+    // The length every track had before 2.x gave tracks 8..11 performance
+    // lengths: what stock's pattern-end track (11) wrapped at.
+    if (selection_) return clampi(selEnd_, 0, kStepCount - 1);
+    int li = cur_ ? cur_->tracks[0].lastStep : kDefaultTrackLastStep;
+    if (perfMode_ && perfGlobalLen_ >= 0) li = perfGlobalLen_;
     return clampi(li, 0, kStepCount - 1);
 }
 
 bool Sequencer::isMuted(int t) const {
     // spec 03 §2.4: project mute flags; RAM 0x200001cc+0x46e0 / +0x4cf6 are
     // values-block file offsets 0x12C (tracks 0..7) and 0x742 (tracks 8..11).
-    if (!project_) return false;
-    if (t < 8) return project_->u8(0x12C + uint32_t(t)) != 0;
-    return project_->u8(0x742 + uint32_t(t & 7)) != 0;
+    // 2.x tracks 12..15: 0x742[4..7] as the Tracker Mini (MINI_PLAN U13).
+    return project_ && project_->trackMuted(t);
 }
 
 const MidiInstrument Sequencer::midiInstr(uint8_t instr) const {
@@ -379,7 +403,7 @@ const MidiInstrument Sequencer::midiInstr(uint8_t instr) const {
 void Sequencer::processTrack(int t) {
     TrackState& tr = tracks_[t];
     // spec 12 §C.2 immediate switch: the track's next step reads the new data.
-    if (t < 8 && tr.micro == 1 && pendImm_[t].load(std::memory_order_relaxed)) commitTrackPattern(t);
+    if (tr.micro == 1 && pendImm_[t].load(std::memory_order_relaxed)) commitTrackPattern(t);
     // spec 03 §3.2 (1) trigger timer.
     if (tr.sinceTrigger < 0xFFFF) ++tr.sinceTrigger;
     const bool muted = isMuted(t);
@@ -388,13 +412,15 @@ void Sequencer::processTrack(int t) {
         ++tr.gate;
         if (tr.gateLimit != -1 && tr.gate >= tr.gateLimit) noteOffTrack(t, NoteOffMode::Off);
     }
-    if (muted && tr.midiCount) noteOffTrack(t, NoteOffMode::Off);
+    if (muted && (tr.midiCount || (tr.sounding && isSynth(tr.last.instr)))) noteOffTrack(t, NoteOffMode::Off);
     // (3) track 0 duties.
     if (t == 0 && playing_) {
         if ((tr.micro - 1) % kMicrosPerClock == 0 && !(selection_ && !selLoop_))
             sendRealtime(settings_.clockOut, 0xF8);
         if (tr.micro == 1) {
-            if (tr.step == lastIndex(0)) startPreload();
+            // One step before the pattern end (masterPos_, not track 0's own
+            // performance length or play mode).
+            if (masterPos_ == baseLastIndex()) startPreload();
             if (recording_ && settings_.metronome && sink_) {
                 const int bar = (settings_.tsNum + 1) * (settings_.tsDen + 1);
                 if (tr.step % bar == 0) sink_->metronomeClick(true, 100);
@@ -555,7 +581,15 @@ void Sequencer::stepStart(int t) {
                 if (p.rec.note >= 0) p.rec.volume = int8_t(rng_.rangeIncl(0, v > 100 ? 100 : v));
                 break;
             case 8: case 9: case 10: case 11: case 12: case 37:
-                if (isMidiInstr(p.rec.instr)) sendCcFx(t, uint8_t(ccLetter(type)), v, p.rec);
+                if (isMidiInstr(p.rec.instr)) {
+                    sendCcFx(t, uint8_t(ccLetter(type)), v, p.rec);
+                } else if (sink_) {
+                    // Synth step: macro 1..6 of the slot (Mini manual 7.38). An
+                    // FX-only step uses the synth the track plays.
+                    uint8_t in = p.rec.instr;
+                    if (!isSynth(in) && p.rec.note < 0 && isSynth(tr.last.instr)) in = tr.last.instr;
+                    if (isSynth(in)) sink_->synthMacroFx(uint8_t(synthSlotOf(in)), uint8_t(ccLetter(type)), v > 127 ? 127 : v);
+                }
                 break;
             case 13:  // Break
                 breakPending_ = true;
@@ -629,7 +663,7 @@ void Sequencer::handleNote(int t, Pending& p) {
     NoteRec rec = p.rec;
     if (rec.note >= 0) {
         // MIDI tracks are monophonic; sample voices are retriggered by the engine.
-        if ((tr.sounding || tr.midiCount) && (isMidiLike(tr.last.instr) || isMidiLike(rec.instr)))
+        if ((tr.sounding || tr.midiCount) && releaseBefore(tr.last.instr, rec.instr))
             noteOffTrack(t, NoteOffMode::Off);
         if (!tr.rollThisStep) clearRoll(tr);
         clearArp(tr);
@@ -658,8 +692,16 @@ void Sequencer::handleNote(int t, Pending& p) {
         clearRoll(tr);
         clearArp(tr);
     } else {
-        // Empty step: unconsumed FX modulate the sounding voice (tracks 0..7).
-        if (t < kVoiceTracks && sink_) {
+        // Empty step: unconsumed FX modulate the sounding voice (tracks 0..7),
+        // or the track's sounding synth note (any track).
+        if (sink_ && tr.sounding && isSynth(tr.last.instr)) {
+            const StepFx* col[2] = {&rec.fxB, &rec.fxA};
+            for (int c = 0; c < 2; ++c) {
+                const uint8_t type = col[c]->type;
+                if (consumedBySequencer(type)) continue;
+                sink_->synthApplyFx(uint8_t(t), type, col[c]->value);
+            }
+        } else if (t < kVoiceTracks && sink_) {
             const StepFx* col[2] = {&rec.fxB, &rec.fxA};
             for (int c = 0; c < 2; ++c) {
                 const uint8_t type = col[c]->type;
@@ -691,7 +733,26 @@ void Sequencer::triggerNote(int t, const NoteRec& rec, bool chord, uint8_t chord
         tr.midiCount = 0;
         return;
     }
-    if (rec.instr >= 64) {  // reserved 64..66: no output (spec 03 §4.4)
+    if (isSynth(rec.instr)) {  // Synth 1..3 on any track (MINI_PLAN §3)
+        if (sink_) {
+            SynthNoteOn n;
+            n.slot = uint8_t(synthSlotOf(rec.instr));
+            int note = rec.note;
+            if (perfMode_ && tr.transposeOn) note = clampi(note + tr.transpose, 0, 127);
+            n.note = uint8_t(note);
+            int vol = rec.volume;
+            if (perfMode_ && tr.velOffset) vol = clampi((vol < 0 ? 100 : vol) + tr.velOffset, 0, 100);
+            n.volume = int8_t(vol);
+            n.fxA = rec.fxA;
+            n.fxB = rec.fxB;
+            n.tickPeriodUs = tickPeriodUs();
+            sink_->synthNoteOn(uint8_t(t), n);
+        }
+        tr.sounding = true;
+        tr.midiCount = 0;
+        return;
+    }
+    if (rec.instr >= 64) {  // 67..: no output (spec 03 §4.4)
         tr.sounding = false;
         return;
     }
@@ -734,6 +795,8 @@ void Sequencer::noteOffTrack(int t, NoteOffMode mode) {
         tr.midiCount = 0;
     } else if (t < kVoiceTracks && tr.last.instr < 48 && tr.last.note >= 0 && sink_) {
         sink_->voiceNoteOff(uint8_t(t), mode);
+    } else if (isSynth(tr.last.instr) && sink_) {
+        sink_->synthNoteOff(uint8_t(t), mode);
     }
     tr.sounding = false;
 }
@@ -849,9 +912,16 @@ void Sequencer::advanceStep(int t) {
     } else {
         tr.step = int16_t(wrapped ? ls : tr.step + 1);
     }
+}
 
-    if (t != kTracks - 1) return;
-    // Track 11 finished its step.
+void Sequencer::advanceMaster() {
+    // Every track finished its step. Stock tests "track 11 wraps" here
+    // (spec 03 §2.2); 2.x uses a master position that wraps at the base
+    // pattern length, so a per-track length or play mode (now on every
+    // track) never moves the song advance (docs/M1_PLAN.md §3).
+    const int li = baseLastIndex();
+    const bool wrapped = masterPos_ + 1 > li || breakPending_;
+    masterPos_ = int16_t(wrapped ? loopStart() : masterPos_ + 1);
     swingPhase_ = !swingPhase_;  // spec 03 §1.3
     if (stopAtStepEnd_) {        // Tempo FX "STP" (spec 03 §2.2)
         stopAtStepEnd_ = false;
@@ -870,19 +940,47 @@ void Sequencer::startPreload() {
     // spec 03 §2.2 "One step before the end".
     if (!next_) return;
     if (queueActive_ && queued_ != 0) {
-        host_->loadPattern(uint8_t(queued_), *next_, false);
-        nextPatternNum_ = uint8_t(queued_);
+        beginPreload(uint8_t(queued_));
         queueReady_ = true;
-        preloadIssued_ = true;
     } else if (songMode_ && project_) {
         int np = songPos_ + 1;
         if (np >= kSongSlots || project_->playlist[np] == 0) np = 0;
         uint8_t num = project_->playlist[np];
         if (num == 0) num = curPatternNum_;
-        host_->loadPattern(num, *next_, false);
-        nextPatternNum_ = num;
-        preloadIssued_ = true;
+        beginPreload(num);
     }
+}
+
+void Sequencer::beginPreload(uint8_t num) {
+    nextPatternNum_ = num;
+    preloadIssued_ = true;
+    if (host_->loadsPatternTracks()) {
+        partNext_ = 0;   // copied by the next blocks (advance), finished at the pattern end
+        return;
+    }
+    partNext_ = kTracks;
+    host_->loadPattern(num, *next_, false);
+}
+
+void Sequencer::preloadPart(int maxTracks) {
+    // Audio context: the next tracks of a spread preload into next_.
+    if (!preloadIssued_ || !next_ || partNext_ >= kTracks) {
+        partNext_ = kTracks;
+        return;
+    }
+    const int n = maxTracks < kTracks - partNext_ ? maxTracks : kTracks - partNext_;
+    host_->loadPatternTracks(nextPatternNum_, *next_, partNext_, n);
+    partNext_ = uint8_t(partNext_ + n);
+}
+
+int Sequencer::preloadTracksPerBlock() const {
+    // Spread the 16 tracks over 3/4 of the preload step (a swung step can be
+    // 25 % shorter): 1 track per block up to ~210 BPM, 2 up to ~430 BPM.
+    const float stepUs = tickPeriodUs() * float(kTicksPerStep);
+    const float blocks = blockUs_ > 0.0f ? 0.75f * stepUs / blockUs_ : 1.0f;
+    if (!(blocks >= 1.0f)) return kTracks;
+    const int n = int(float(kTracks) / blocks) + 1;
+    return n > kTracks ? kTracks : n;
 }
 
 void Sequencer::swapBuffers() {
@@ -890,6 +988,10 @@ void Sequencer::swapBuffers() {
     Pattern* tmp = cur_;
     cur_ = next_;
     next_ = tmp;
+    afterSwap();
+}
+
+void Sequencer::afterSwap() {
     tempoOverride_ = false;
     for (auto& tr : tracks_) {
         clearRoll(tr);
@@ -902,6 +1004,7 @@ void Sequencer::swapBuffers() {
 void Sequencer::resetPositions(int startStep) {
     startStep = clampi(startStep, 0, kStepCount - 1);
     syncOrigin_ = masterStep_ - startStep;
+    masterPos_ = int16_t(startStep);
     for (int t = 0; t < kTracks; ++t) {
         TrackState& tr = tracks_[t];
         tr.micro = 1;
@@ -922,12 +1025,14 @@ void Sequencer::patternEnd() {
     if (queueActive_ && queueReady_) {
         songMode_ = false;
         if (!preloadIssued_ || nextPatternNum_ != queued_) host_->loadPattern(uint8_t(queued_), *next_, true);
+        else preloadPart(kTracks);   // the tracks a spread preload has not copied yet
+        partNext_ = kTracks;
         swapBuffers();
         curPatternNum_ = uint8_t(queued_);
         if (project_) project_->setCurrentPattern(curPatternNum_);
         queueActive_ = queueReady_ = false;
         queued_ = 0;
-        preloadIssued_ = false;
+        dropPreload();
         resetPositions(0);
         host_->onPatternEnd();
         host_->onPatternAdvanced();
@@ -943,7 +1048,8 @@ void Sequencer::patternEnd() {
         uint8_t num = project_->playlist[pos];
         if (num == 0) num = curPatternNum_;
         if (!preloadIssued_ || nextPatternNum_ != num) host_->loadPattern(num, *next_, true);
-        preloadIssued_ = false;
+        else preloadPart(kTracks);   // the tracks a spread preload has not copied yet
+        dropPreload();
         swapBuffers();
         songPos_ = pos;
         project_->playlistPos = uint8_t(pos);
@@ -954,7 +1060,7 @@ void Sequencer::patternEnd() {
         if (!songWrapped) host_->onPatternAdvanced();
         return;
     }
-    preloadIssued_ = false;
+    dropPreload();
     host_->onPatternEnd();
     host_->onPatternAdvanced();
 }
@@ -970,11 +1076,11 @@ void Sequencer::startPlayback(int startStep, bool keepSongMode, bool afterCountI
     selection_ = false;
     masterStep_ = 0;
     // Pending immediate per-track switches take effect from the first step.
-    for (int t = 0; t < 8; ++t)
+    for (int t = 0; t < kTracks; ++t)
         if (pendImm_[t].load(std::memory_order_relaxed)) commitTrackPattern(t);
     resetPositions(startStep);
     // spec 12 §D: table-mode tracks are evaluated with k = 0 at playback start.
-    for (int t = 0; t < kVoiceTracks; ++t) {
+    for (int t = 0; t < kTracks; ++t) {
         TrackState& tr = tracks_[t];
         if (!perfTrack(t) || !isTableMode(tr.playMode)) continue;
         uint8_t rollSel = 0;
@@ -997,7 +1103,7 @@ void Sequencer::startPlayback(int startStep, bool keepSongMode, bool afterCountI
     accUs_ = 0;  // OT: deterministic start phase
     breakPending_ = breakPreloadDone_ = false;
     stopAtStepEnd_ = false;
-    preloadIssued_ = false;
+    dropPreload();
     countInSteps_ = 0;
     sendRealtime(settings_.transportOut, 0xFA);
 }
@@ -1049,6 +1155,7 @@ void Sequencer::stop() {
     for (int t = 0; t < kTracks; ++t) {
         TrackState& tr = tracks_[t];
         if (tr.midiCount) noteOffTrack(t, NoteOffMode::Off);
+        else if (isSynth(tr.last.instr) && sink_) sink_->synthNoteOff(uint8_t(t), NoteOffMode::Off);
         else if (t < kVoiceTracks && sink_) sink_->voiceNoteOff(uint8_t(t), NoteOffMode::Off);
         tr.sounding = false;
         clearRoll(tr);
@@ -1069,8 +1176,9 @@ void Sequencer::stop() {
     armed_ = false;
     breakPending_ = breakPreloadDone_ = false;
     selection_ = false;
-    preloadIssued_ = false;
+    dropPreload();
     resetPositions(0);
+    if (sink_) sink_->synthTransportStop();   // macro overrides -> page values
     sendRealtime(settings_.transportOut, 0xFC);
     if (host_->exportActive()) host_->finaliseExport();
 }
@@ -1094,21 +1202,35 @@ void Sequencer::record() {
 
 void Sequencer::switchPatternNow(uint8_t num) {
     if (num < 1 || num > kPatternCount || !cur_ || !next_) return;
+    // Take the stage buffer back first (a request the audio context has not
+    // committed yet is dropped): from here on an audio block reads 0 and
+    // leaves stage_ alone, so it may run in the middle of the load below.
+    pendSwitch_.exchange(0, std::memory_order_acq_rel);
+    if (Pattern* st = stage_.load(std::memory_order_relaxed)) host_->loadPattern(num, *st, true);
     pendSwitch_.store(num, std::memory_order_release);
     if (!playing_) commitSwitch();
 }
 
 void Sequencer::commitSwitch() {
-    // Audio context (or main loop while stopped). The preload buffer is not
-    // being played, so it is loaded and then swapped in (spec 03 §2.2 0x11a34).
+    // Audio context (or main loop while stopped). The new pattern goes in
+    // through a buffer that is not being played (spec 03 §2.2 0x11a34): the
+    // stage buffer the main loop filled (pointer swap), else the preload
+    // buffer, loaded here.
     const uint8_t num = pendSwitch_.exchange(0, std::memory_order_acquire);
     if (num == 0 || !cur_ || !next_) return;
-    host_->loadPattern(num, *next_, true);
-    swapBuffers();
+    if (Pattern* st = stage_.load(std::memory_order_relaxed)) {
+        stage_.store(cur_, std::memory_order_relaxed);
+        cur_ = st;
+        afterSwap();
+    } else {
+        host_->loadPattern(num, *next_, true);
+        swapBuffers();
+    }
     curPatternNum_ = num;
     if (project_) project_->setCurrentPattern(num);
-    // Any preload went into the buffer that is now the old pattern.
-    preloadIssued_ = false;   // patternEnd reloads a queued pattern (sync)
+    // A preload is for the pattern before the switch (or, without a stage
+    // buffer, went into the buffer that is now the old pattern).
+    dropPreload();   // patternEnd reloads a queued pattern (sync)
     // SPEC GAP (spec 16 §A.2 / 06 §1.7 do not say): 0x3d548 re-points the
     // sequencer without the "reset positions" of a pattern end, so playback
     // keeps its step; a step beyond the new length wraps into it.
@@ -1118,6 +1240,8 @@ void Sequencer::commitSwitch() {
         if (tr.step > li) tr.step = int16_t(tr.step % (li + 1));
         if (tr.stepsPlayed > li) tr.stepsPlayed = int16_t(tr.stepsPlayed % (li + 1));
     }
+    const int bli = baseLastIndex();
+    if (masterPos_ > bli) masterPos_ = int16_t(masterPos_ % (bli + 1));
 }
 
 void Sequencer::queuePattern(int delta) {

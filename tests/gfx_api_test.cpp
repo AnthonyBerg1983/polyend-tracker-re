@@ -72,6 +72,7 @@ TEST(custom_fonts_bind_to_handles) {
 
 TEST(glyph_run_fallback_is_text) {
     RecordingDisplay d;
+    setRomTextMode(kRomWholeText);
     applyFontSet(&d, 0);
     Gfx g(d);
     g.beginFrame(0);
@@ -84,6 +85,34 @@ TEST(glyph_run_fallback_is_text) {
     CHECK(has(d.last, "TEXT 21 30 f18 o0 \"-\""));
     CHECK(has(d.last, "TEXT 5 5 f27 o0 \"VOL\""));
     CHECK_EQ(count(d.last, "VERTEX2II"), 0);
+    setRomTextMode(kRomGlyphs);
+}
+
+// OP-6: without custom fonts glyphRun draws the ROM font bitmaps (handles
+// 16-31, cell = character code) at the romMetrics advances; runs clipped at
+// the left / top edge keep CMD_TEXT.
+TEST(glyph_run_rom_fonts_vertex2ii) {
+    RecordingDisplay d;
+    setRomTextMode(kRomGlyphs);
+    applyFontSet(&d, 0);
+    CHECK(!customFontsBound());
+    Gfx g(d);
+    g.beginFrame(0);
+    g.glyphRun(600, 20, kFont1, "Pa t", 0xFFFFFF);   // f26: P 7, a 7, ' ' 4
+    g.glyphRun(10, 30, kFont2, "--", 0x777777, 11);  // f18, fixed pitch
+    g.glyphRun(-3, 40, kFont2, "AB", 0xFFFFFF);      // clipped left: CMD_TEXT
+    g.endFrame();
+    CHECK(has(d.last, "BEGIN 1"));   // kBitmaps
+    CHECK(has(d.last, "TRANSLATE_X 6400"));                  // x 600 -> 600 - 400
+    CHECK(has(d.last, "VERTEX2II 200 20 26 80"));            // 'P'
+    CHECK(has(d.last, "VERTEX2II 207 20 26 97"));            // 'a' at 600 + 7
+    CHECK(has(d.last, "VERTEX2II 218 20 26 116"));           // 't' after a 4-px space
+    CHECK(has(d.last, "VERTEX2II 10 30 18 45"));
+    CHECK(has(d.last, "VERTEX2II 21 30 18 45"));
+    CHECK_EQ(count(d.last, "VERTEX2II"), 5);
+    CHECK(has(d.last, "TEXT -3 40 f18 o0 \"AB\""));
+    CHECK_EQ(count(d.last, "TEXT "), 1);
+    CHECK_EQ(g.textWidth(kFont1, "Pa t"), 7 + 7 + 4 + 5);
 }
 
 TEST(gradient_hairline_roundrect_icons) {

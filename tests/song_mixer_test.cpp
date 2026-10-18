@@ -2,11 +2,17 @@
 // "Loop Pattern" / "Continue Song" state machine, the Master key combination,
 // the Track Mixer meter law and the smaller fixes from the line-by-line pass.
 #include <cmath>
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "test.h"
 #include "ui_fakes.h"
 
+#include "app/perf_presets.h"
+#include "app/project_fields.h"
 #include "ui/screens.h"
 #include "ui/widgets.h"
 
@@ -28,6 +34,18 @@ bool posChanges(Harness& h, int pos, int blocks) {
         if (h.app->seq.songPosition() != pos) return true;
     }
     return false;
+}
+bool hasText(Harness& h, const char* s) {
+    for (auto& l : h.disp.last)
+        if (l.rfind("TEXT", 0) == 0 && l.find(std::string("\"") + s + "\"") != std::string::npos) return true;
+    return false;
+}
+// Master key twice: the Track Mixer (page 2/3).
+MixerScreen& trackMixer(Harness& h) {
+    h.tap(btn::Master);
+    h.tap(btn::Master);
+    CHECK_EQ(mixer(h).page, 1);
+    return mixer(h);
 }
 void threeSlotSong(Harness& h) {
     App& a = *h.app;
@@ -202,6 +220,125 @@ TEST(song_grid_shift_extends_down) {
     h.up(btn::Shift);
 }
 
+// Rotated header texts of the grid (y above the first row, x < 490).
+static std::vector<std::string> songHeaders(Harness& h) {
+    std::vector<std::string> out;
+    for (auto& l : h.disp.last) {
+        int x = 0, y = 0;
+        char txt[64] = {};
+        if (std::sscanf(l.c_str(), "TEXT %d %d f%*u o%*u \"%63[^\"]\"", &x, &y, txt) == 3 && y < 92 && x < 490)
+            out.push_back(txt);
+    }
+    return out;
+}
+
+// 2.x (docs/M1_PLAN.md §4, spec gap 4): 12-column window over 16 tracks;
+// the first shown track is 0 or 4 and follows the grid cursor.
+TEST(song_grid_window_follows_cursor_over_16_tracks) {
+    Harness h;
+    App& a = *h.app;
+    threeSlotSong(h);
+    h.tap(btn::Song);
+    SongScreen& s = song(h);
+    a.ui.dirty();
+    h.run(40);
+    std::vector<std::string> hd = songHeaders(h);
+    CHECK(std::find(hd.begin(), hd.end(), "12") != hd.end());
+    CHECK(std::find(hd.begin(), hd.end(), "13") == hd.end());
+    h.tap(btn::Rec);
+    h.tap(btn::Left);   // list -> grid: rightmost shown column (stock: track 12)
+    CHECK_EQ(s.focus, 0);
+    CHECK_EQ(s.selTrack0, 11);
+    CHECK_EQ(s.firstTrack, 0);
+    h.tap(btn::Right);
+    CHECK_EQ(s.selTrack0, 12);
+    CHECK_EQ(s.firstTrack, 4);
+    a.ui.dirty();
+    h.run(40);
+    hd = songHeaders(h);
+    CHECK(std::find(hd.begin(), hd.end(), "16") != hd.end());
+    CHECK(std::find(hd.begin(), hd.end(), "Midi") != hd.end());
+    CHECK(std::find(hd.begin(), hd.end(), "4") == hd.end());
+    CHECK(std::find(hd.begin(), hd.end(), "5") != hd.end());
+    for (int i = 0; i < 3; ++i) h.tap(btn::Right);
+    CHECK_EQ(s.selTrack0, 15);
+    h.tap(btn::Right);  // past track 16: the list
+    CHECK_EQ(s.focus, 1);
+    h.tap(btn::Left);   // back on the rightmost shown column, track 16
+    CHECK_EQ(s.selTrack0, 15);
+    CHECK_EQ(s.firstTrack, 4);
+    for (int i = 0; i < 11; ++i) h.tap(btn::Left);
+    CHECK_EQ(s.selTrack0, 4);
+    CHECK_EQ(s.firstTrack, 4);
+    h.tap(btn::Left);
+    CHECK_EQ(s.selTrack0, 3);
+    CHECK_EQ(s.firstTrack, 0);
+    // Shift+Right extends to 16 tracks; the window follows the moving edge.
+    h.down(btn::Shift);
+    for (int i = 0; i < 20; ++i) h.tap(btn::Right);
+    h.up(btn::Shift);
+    CHECK_EQ(s.selTracks, kTrackCount - 3);
+    CHECK_EQ(s.firstTrack, 4);
+}
+
+// Copy / paste / delete of track ranges reach tracks 13..16 (ext-track pool).
+TEST(song_copy_delete_over_16_tracks) {
+    Harness h;
+    App& a = *h.app;
+    threeSlotSong(h);
+    Track& t13 = a.storedTrack(1, 12);
+    t13.steps[0].note = 60;
+    t13.steps[0].instrument = uint8_t(kFirstMidiInstrument + 12);
+    a.storedTrack(1, 15).steps[2].note = 64;
+    a.markPatternDirty(1);
+    a.reloadCurrentFromStore();
+    h.tap(btn::Song);
+    SongScreen& s = song(h);
+    h.tap(btn::Rec);
+    h.tap(btn::Up);
+    h.tap(btn::Up);
+    h.tap(btn::Left);   // grid, slot 0, track 12
+    h.tap(btn::Right);  // track 13
+    CHECK_EQ(s.selTrack0, 12);
+    h.down(btn::Shift);
+    for (int i = 0; i < 3; ++i) h.tap(btn::Right);
+    h.up(btn::Shift);
+    CHECK_EQ(s.selTracks, 4);
+    h.tap(btn::Copy);
+    h.tap(btn::Down);   // slot 1 = pattern 2
+    CHECK_EQ(s.selRow0, 1);
+    CHECK(a.findStoredTrack(2, 12) == nullptr);
+    h.down(btn::Shift);
+    h.tap(btn::Copy);   // paste
+    h.up(btn::Shift);
+    const Track* d = a.findStoredTrack(2, 12);
+    CHECK(d != nullptr);
+    if (d) CHECK_EQ(int(d->steps[0].note), 60);
+    d = a.findStoredTrack(2, 15);
+    CHECK(d != nullptr);
+    if (d) CHECK_EQ(int(d->steps[2].note), 64);
+    // Empty ext tracks 14/15 take no block.
+    CHECK(a.findStoredTrack(2, 13) == nullptr);
+    // Delete the range on slot 1.
+    h.tap(btn::Delete);
+    d = a.findStoredTrack(2, 12);
+    CHECK(!d || d->steps[0].note == kNoteEmpty);
+    d = a.findStoredTrack(2, 15);
+    CHECK(!d || d->steps[2].note == kNoteEmpty);
+    CHECK_EQ(int(a.findStoredTrack(1, 12)->steps[0].note), 60);   // source untouched
+    // List focus: the slot's whole pattern (16 tracks) is copied.
+    s.focus = 1;
+    s.cursor = 0;
+    h.tap(btn::Copy);
+    s.cursor = 2;       // pattern 3
+    h.down(btn::Shift);
+    h.tap(btn::Copy);
+    h.up(btn::Shift);
+    d = a.findStoredTrack(3, 15);
+    CHECK(d != nullptr);
+    if (d) CHECK_EQ(int(d->steps[2].note), 64);
+}
+
 // P17: Master key combination.
 // spec 20 §4.3 / VISUAL_DIFF §3.9: stock Song layout. Strip mask 0xbf, the
 // bar model keeps every label's text (labels 0..5 are drawn by the screen in
@@ -217,7 +354,7 @@ TEST(song_stock_layout_and_dl_budget) {
     for (int i = 0; i < 16; ++i) a.project.playlist[i] = uint8_t(1 + i % 4);
     a.project.playlist[16] = 0;
     for (int n = 1; n <= 4; ++n) {
-        for (int t = 0; t < kTrackCount; t += n) a.stored(n).tracks[t].steps[0].note = 60;
+        for (int t = 0; t < kStockTrackCount; t += n) a.stored(n).tracks[t].steps[0].note = 60;
         a.markPatternDirty(n);
     }
     h.tap(btn::Song);
@@ -329,4 +466,167 @@ TEST(global_mixer_solo_toggle) {
     h.tap(btn::F2);
     h.up(btn::Shift);
     for (int i = 0; i < 4; ++i) CHECK_STR(a.ui.bar.label[i].bottom, "Mute");
+}
+
+// ---- 2.x Track Mixer bank B (docs/specs/2x-01 §4; Tracker Mini, MINI_PLAN §1) --
+
+TEST(mixer_bank_switch_no_bank_b_levels) {
+    // The Tracker Mini's Track Mixer has faders for tracks 1-8 only: bank B
+    // keeps mute / solo / rename, the encoder and Delete do nothing there.
+    Harness h;
+    App& a = *h.app;
+    MixerScreen& m = trackMixer(h);
+    CHECK_EQ(m.bank, 0);
+    a.ui.dirty();
+    h.run(20);
+    CHECK(hasText(h, "Track Mixer 2/3"));
+    CHECK(!hasText(h, "Tracks 9-16"));
+    h.tap(btn::Right);
+    CHECK_EQ(m.bank, 1);
+    a.ui.dirty();
+    h.run(20);
+    CHECK(hasText(h, "Track Mixer 2/3"));   // the title stays (spec gap 5)
+    CHECK(hasText(h, "Tracks 9-16"));
+    CHECK(hasText(h, "Midi 9"));            // bank B column headers
+    CHECK(hasText(h, "Midi 16"));
+    CHECK_STR(a.ui.bar.label[1].top, "");   // no level text
+    h.tap(btn::Right);                      // Right again: stays on bank B
+    CHECK_EQ(m.bank, 1);
+    static Project before;
+    before = a.project;
+    h.down(btn::F2);
+    h.tap(btn::Up);
+    h.enc(3);
+    h.tap(btn::Delete);
+    h.enc(-100);
+    h.up(btn::F2);
+    CHECK(std::memcmp(before.values, a.project.values, sizeof(before.values)) == 0);
+    CHECK_EQ(trk::level(a, 9), 0);
+    // The encoder was turned: the release does not mute; a plain tap does.
+    CHECK(!a.trackMuted(9));
+    h.tap(btn::F2);
+    CHECK(a.trackMuted(9));
+    h.tap(btn::F2);
+    CHECK(!a.trackMuted(9));
+    // Left: bank A levels work as stock.
+    h.tap(btn::Left);
+    CHECK_EQ(m.bank, 0);
+    const uint8_t stock1 = a.project.u8(pf::kTrackVolume + 1);
+    h.down(btn::F2);
+    h.enc(1);
+    h.up(btn::F2);
+    CHECK_EQ(a.project.u8(pf::kTrackVolume + 1), stock1 + 1);
+    CHECK_EQ(trk::level(a, 1), stock1 + 1);
+}
+
+TEST(mixer_bank_b_activity_dot) {
+    Harness h;
+    App& a = *h.app;
+    Pattern& p = a.pattern();
+    for (int s = 0; s < kStepCount; ++s) {
+        p.tracks[8].steps[s].note = int8_t(60);   // track 9: a note on every step
+        p.tracks[8].steps[s].instrument = 48;
+    }
+    a.patternEdited();
+    MixerScreen& m = trackMixer(h);
+    h.tap(btn::Right);
+    for (bool on : m.activity) CHECK(!on);
+    h.tap(btn::Play);
+    bool lit9 = false, lit10 = false;
+    for (int i = 0; i < 60; ++i) {
+        h.audio.pump(4);
+        h.run(10);
+        lit9 |= m.activity[0];
+        lit10 |= m.activity[1];
+    }
+    CHECK(lit9);
+    CHECK(!lit10);                            // no notes on track 10
+    h.tap(btn::Play);
+    h.run(20);
+    CHECK(!m.activity[0]);                    // stopped: dots off
+}
+
+TEST(mixer_solo_and_mute_across_16) {
+    Harness h;
+    App& a = *h.app;
+    MixerScreen& m = trackMixer(h);
+    h.tap(btn::Right);
+    // Plain tap on F6 (track 14): project.mt 0x742[5] (Tracker Mini, U13).
+    h.tap(btn::F6);
+    CHECK_EQ(a.project.u8(0x742 + 5), 1);
+    CHECK(trk::muted(a, 13));
+    CHECK_STR(a.ui.bar.label[5].bottom, "Unmute");
+    h.tap(btn::F6);
+    CHECK_EQ(a.project.u8(0x742 + 5), 0);
+    // Plain tap on F2 (track 10): the stock mute (0x742[1]).
+    h.tap(btn::F2);
+    CHECK(a.trackMuted(9));
+    h.tap(btn::F2);
+    CHECK(!a.trackMuted(9));
+    // Shift + F5: solo track 13 mutes the 15 others, both banks.
+    h.down(btn::Shift);
+    h.tap(btn::F5);
+    CHECK_STR(a.ui.bar.label[4].bottom, "Unsolo");
+    h.up(btn::Shift);
+    for (int t = 0; t < kTrackCount; ++t) CHECK_EQ(trk::muted(a, t), t != 12);
+    CHECK(a.trackMuted(0) && a.trackMuted(7) && a.trackMuted(11));
+    CHECK_EQ(a.project.u8(0x742 + 4), 0);
+    CHECK_EQ(a.project.u8(0x742 + 7), 1);
+    // Solo another track from bank A: track 2 alone.
+    h.tap(btn::Left);
+    h.down(btn::Shift);
+    h.tap(btn::F2);
+    h.up(btn::Shift);
+    for (int t = 0; t < kTrackCount; ++t) CHECK_EQ(trk::muted(a, t), t != 1);
+    // The same key again: unsolo unmutes all 16 (1.9.3 rule, spec gap 6).
+    h.down(btn::Shift);
+    h.tap(btn::F2);
+    h.up(btn::Shift);
+    for (int t = 0; t < kTrackCount; ++t) CHECK(!trk::muted(a, t));
+    CHECK_EQ(m.bank, 0);
+}
+
+TEST(mixer_rename_bank_b) {
+    Harness h;
+    App& a = *h.app;
+    MixerScreen& m = trackMixer(h);
+    h.tap(btn::Right);
+    h.tap(btn::Rec);
+    CHECK(m.rename);
+    CHECK_STR(a.ui.bar.label[4].bottom, "Edit");
+    // Track 13: the keyboard starts on the current name, 7 characters max.
+    h.tap(btn::F5);
+    CHECK(a.ui.kb.isOpen());
+    CHECK_STR(a.ui.kb.text(), "Midi 13");
+    for (int i = 0; i < 10; ++i) h.tap(btn::Delete);
+    h.type("synthbass");
+    CHECK_STR(a.ui.kb.text(), "synthba");
+    h.tap(btn::F8);
+    CHECK(!a.ui.kb.isOpen());
+    char nm[24];
+    trk::name(a, 12, nm, sizeof nm);
+    CHECK_STR(nm, "synthba");
+    a.project.trackName(12, nm, sizeof nm);
+    CHECK_STR(nm, "synthba");                 // project.mt 0x603 slot 4 (spec 21 §3.2)
+    a.ui.dirty();
+    h.run(20);
+    CHECK(hasText(h, "synthba"));             // column header
+    // Track 9: the stock name slot.
+    h.tap(btn::F1);
+    for (int i = 0; i < 10; ++i) h.tap(btn::Delete);
+    h.type("lead");
+    h.tap(btn::F8);
+    a.project.trackName(8, nm, sizeof nm);
+    CHECK_STR(nm, "lead");
+    // An empty name clears the slot (VERIFY_M1 R5: no fallback name).
+    h.tap(btn::F5);
+    for (int i = 0; i < 10; ++i) h.tap(btn::Delete);
+    h.tap(btn::F8);
+    trk::name(a, 12, nm, sizeof nm);
+    CHECK_STR(nm, "");
+    trk::setName(a, 15, "");
+    trk::name(a, 15, nm, sizeof nm);
+    CHECK_STR(nm, "");
+    h.tap(btn::Rec);
+    CHECK(!m.rename);
 }

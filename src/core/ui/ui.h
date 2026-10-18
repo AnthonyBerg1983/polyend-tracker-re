@@ -4,7 +4,9 @@
 //
 // Rendering is change-driven: anything that changes what is shown calls
 // Ui::dirty(); the main loop renders a full FT81x display list when dirty
-// (rate-limited), instead of the stock per-control RAM_G fragments.
+// (rate-limited). Static blocks (title strip, bottom bar, Pattern grid parts)
+// go through Gfx::cached(): RAM_G fragments appended with CMD_APPEND like the
+// stock per-control lists (spec 05 §3.3), keyed by the hash of their output.
 #pragma once
 
 #include <cstdint>
@@ -34,6 +36,7 @@ enum Module : int8_t {
     kModConfig = 7,
     kModRecorder = 8,
     kModPerformance = 9,
+    kModSynth = 10,          // 2.x synth slots (Tracker Mini; Instrument Params on S1..S3)
     kModGames = 11,          // spec 14 §1.1 (no module key; File F7)
     kModMaster = 12,
     kModCount = 13,
@@ -262,6 +265,9 @@ struct UiPlatform {
     // in Ui::render dropped `dropped` primitives at `words`); device: diag
     // log, host tests: a hard failure (tests/ui_fakes.h).
     void (*dlOverflow)(const char* screen, uint32_t words, uint32_t dropped, bool lowDetail) = nullptr;
+    // Every Ui::notify() text (host checks: the sim's expect-open-ok and the
+    // test-song host test fail on load notices). Null on the device.
+    void (*notified)(const char* text) = nullptr;
 };
 
 class Ui {
@@ -272,6 +278,7 @@ public:
         kNone,
         kRight,   // Instruments / Fx popups: header x 600..799, F7 / F8 labels hidden
         kFull,    // Notes popup: full-width header, no bottom bar, no hairline
+        kRightBar,  // Synth Load Patch (Tracker+ 1.0): the kRight header, all bottom labels stay
     };
 
     explicit Ui(App& app);
@@ -338,6 +345,8 @@ public:
     // independent of the popup header; reset on a screen switch.
     void hideStatus(bool hidden) { statusHidden_ = hidden; dirty(); }
     bool statusHidden() const { return statusHidden_ || popupKind_ != PopupHeader::kNone; }
+    // 2.x CPU cell state as last polled (host tests).
+    const wg::CpuCell& cpuCell() const { return cpuCell_; }
     // Title hairline colour for the current screen (kThemeColour = theme
     // slot): Monochrome Config draws it in ffffff (034: rows 27 / 28
     // bfbfc0 / dfdfe0). Reset on a screen switch.
@@ -360,7 +369,9 @@ public:
     void closeFactoryTest();   // back to Config
     bool factoryTestActive() const { return factory.active(); }
     // USB Storage Mode page (interface event 10, spec 01 §6.1): shown over
-    // the active screen until Exit; no mass-storage hand-over (as stock).
+    // the active screen until Exit. 2.x: on = App::enterUsbStorage() (the
+    // card goes to the computer; refused with a notice when busy), off = Exit
+    // (App::exitUsbStorage(): card back, Workspace reloaded).
     void setUsbStorageMode(bool on);
     bool usbStorageMode() const { return usb.active(); }
 
@@ -413,9 +424,15 @@ public:
     uint32_t overBudgetFrames() const { return overBudget_; }
     uint32_t lowDetailFrames() const { return lowDetailFrames_; }
     bool lowDetail() const { return lowDetail_; }
+    // Display-list words of the last frame including appended fragments
+    // (RAM_DL budget), and the words uploaded through the command FIFO.
     uint32_t lastDlWords() const { return lastWords_; }
+    uint32_t lastUploadWords() const { return lastUpload_; }
     // Frames skipped because the display was still busy (non-blocking swap).
     uint32_t framesDeferred() const { return deferred_; }
+    // Cached display-list fragments (gfx.h); `fragments.enabled = false`
+    // draws everything inline (A/B checks).
+    FragmentCache fragments;
 
 private:
     void dispatchButton(uint8_t id, uint8_t state);
@@ -452,7 +469,9 @@ private:
     char lastRight_[48] = {};
     bool lastHasRight_ = false, lastStatus_ = true, lastTitleValid_ = false;
     uint32_t lastTitleGen_ = 0;
-    uint32_t frames_ = 0, lastWords_ = 0, deferred_ = 0;
+    uint32_t frames_ = 0, lastWords_ = 0, lastUpload_ = 0, deferred_ = 0;
+    bool readyRetry_ = false;             // frameReady() was false: next poll at readyRetryAt_
+    uint32_t readyRetryAt_ = 0;
     uint32_t maxWords_ = 0, overBudget_ = 0, lowDetailFrames_ = 0, statOver0_ = 0, statLow0_ = 0;
     uint32_t overLogged_ = 0;             // modules whose first overflow was logged
     uint32_t dlFrameLimit_ = kDlFrameWords;
@@ -488,6 +507,12 @@ private:
     PopupHeader popupKind_ = PopupHeader::kNone;
     char popupTitle_[32] = {};
     bool statusHidden_ = false;
+    // 2.x CPU cell (spec 2x-02 §2.2): polled at 5 Hz in update(), the frame
+    // is marked dirty only when the shown state changes.
+    static constexpr uint32_t kCpuPollMs = 200;
+    wg::CpuCell cpuCell_;
+    uint32_t cpuPollAt_ = 0;
+    void pollCpuCell(uint32_t now);
     uint32_t hairline_ = wg::kThemeColour;
     int cursorStep_ = -1;
 

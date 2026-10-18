@@ -294,7 +294,7 @@ bool ModImport::nextPattern(int& p) {
     return false;
 }
 
-void ModImport::convertPattern(Pattern& pat, bool first) {
+void ModImport::convertPattern(PatternStock& pat, bool first) {
     pat.setDefault();
     for (int t = 0; t < 8; ++t) pat.tracks[t].lastStep = 63;   // spec 11 §1.2 step 4
     const float entryBpm = ts_.bpm();
@@ -379,7 +379,7 @@ ImportStep ModImport::step(uint32_t& cost) {
                 return ImportStep::Failed;
             }
             const bool first = !projTempoSet_;
-            Pattern* pat = t_.pattern(t_.ctx, p + 1);
+            PatternStock* pat = t_.pattern(t_.ctx, p + 1);
             if (pat) convertPattern(*pat, first);
             done_[p >> 3] |= uint8_t(1 << (p & 7));
             cost += bytes;

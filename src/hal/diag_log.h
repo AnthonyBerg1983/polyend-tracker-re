@@ -24,8 +24,9 @@ struct Fmt {
     Fmt& ms(uint32_t ms);                   // "[  12.345] "
 };
 
-constexpr uint32_t kRingSize = 8192;    // power of two (SRAM budget: 2026-10-15 field build had 25 KB stack headroom)
-constexpr uint32_t kBootSize = 6144;    // first lines of the boot, kept for replay (field boot logs ~4 KB)
+// SRAM budget (docs/OPTIMIZATION_2X.md OP-5): the whole LogBuf stays <= 8 KB.
+constexpr uint32_t kRingSize = 4096;    // power of two
+constexpr uint32_t kBootSize = 4032;    // first lines of the boot, kept for replay (field boot logs ~4 KB)
 
 struct LogBuf {
     char ring[kRingSize];

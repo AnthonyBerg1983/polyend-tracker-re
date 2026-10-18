@@ -1,7 +1,6 @@
 // WAV import/export, spec 02 §8.1 and §8.3.
 #include "formats/wav.h"
 
-#include <cmath>
 #include <cstring>
 
 #include "formats/bytes.h"
@@ -146,12 +145,22 @@ int16_t wavDecodeSample(const uint8_t* p, uint16_t format, uint16_t bits) {
 
 // --------------------------------------------------------------- resampler
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+constexpr bool kLittleEndian = true;
+#else
+constexpr bool kLittleEndian = false;
+#endif
+
 void CubicResampler::begin(uint32_t srcRate, uint32_t srcFrames, int16_t* dst) {
     *this = CubicResampler{};
     srcRate_ = srcRate ? srcRate : kSampleRate;
+    // spec 07 Q8: ratio = srcRate / 44100 in single precision (the same value
+    // the per-sample expression gave; computed once here).
+    ratio_ = float(srcRate_) / float(kSampleRate);
     srcFrames_ = srcFrames;
     outTotal_ = wavResampledFrames(srcFrames, srcRate_);
     dst_ = dst;
+    locate();
 }
 
 int32_t CubicResampler::src(int64_t j) const {
@@ -159,54 +168,47 @@ int32_t CubicResampler::src(int64_t j) const {
     return hist_[j & 3];
 }
 
-// Source position of output frame i in single precision (spec 07 Q8):
-// t = i * ratio, n = floor(t), mu = t - n.
-static inline int64_t srcIndex(uint64_t i, uint32_t srcRate, float* mu) {
-    const float ratio = float(srcRate) / float(kSampleRate);
-    const float t = float(i) * ratio;
-    const float n = std::floor(t);
-    if (mu) *mu = t - n;
-    return int64_t(n);
-}
-
-bool CubicResampler::ready(uint64_t i) const {
-    if (ended_) return true;
-    const int64_t ni = srcIndex(i, srcRate_, nullptr);
-    const uint64_t n = ni < 0 ? 0 : uint64_t(ni);
-    uint64_t need = n + 2;
+// Source position of output frame outNext_ (spec 07 Q8): t = i * ratio,
+// n = floor(t), mu = t - n. t >= 0, so floor(t) is the truncation of t.
+void CubicResampler::locate() {
+    const float t = float(outNext_) * ratio_;
+    const int64_t n = int64_t(t);
+    curN_ = n;
+    curMu_ = t - float(n);
+    // Ready once source samples n-1..n+2 (clamped to the last one) are in.
+    uint64_t need = uint64_t(n < 0 ? 0 : n) + 2;
     if (need >= srcFrames_) need = srcFrames_ - 1;
-    return need < received_;
+    curNeed_ = need;
 }
 
-void CubicResampler::emit() {
-    while (outNext_ < outTotal_ && ready(outNext_)) {
-        // spec 02 §8.1 / 07 Q8: t = i * srcRate/44100, n = floor(t), mu = t - n.
-        float mu = 0.0f;
-        const int64_t n = srcIndex(outNext_, srcRate_, &mu);
-        const float p0 = float(src(n - 1)), p1 = float(src(n)), p2 = float(src(n + 1)), p3 = float(src(n + 2));
-        const float a0 = p3 - p2 - p0 + p1;
-        const float a1 = p0 - p1 - a0;
-        const float a2 = p2 - p0;
-        const float a3 = p1;
-        const float y = ((a0 * mu + a1) * mu + a2) * mu + a3;
-        // Truncation toward zero, then clamp (spec 07 Q8).
-        int32_t v = int32_t(y);
-        if (v > 32767) v = 32767;
-        if (v < -32768) v = -32768;
-        dst_[outNext_++] = int16_t(v);
+void CubicResampler::emitOne() {
+    const int64_t n = curN_;
+    const float mu = curMu_;
+    const float p0 = float(src(n - 1)), p1 = float(src(n)), p2 = float(src(n + 1)), p3 = float(src(n + 2));
+    const float a0 = p3 - p2 - p0 + p1;
+    const float a1 = p0 - p1 - a0;
+    const float a2 = p2 - p0;
+    const float a3 = p1;
+    const float y = ((a0 * mu + a1) * mu + a2) * mu + a3;
+    // Truncation toward zero, then clamp (spec 07 Q8).
+    int32_t v = int32_t(y);
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    dst_[outNext_++] = int16_t(v);
+    locate();
+}
+
+void CubicResampler::pushBlock(const int16_t* s, uint32_t n) {
+    for (uint32_t k = 0; k < n; ++k) {
+        if (received_ >= srcFrames_) return;
+        hist_[received_ & 3] = s[k];
+        ++received_;
+        while (outNext_ < outTotal_ && curNeed_ < received_) emitOne();
     }
 }
 
-void CubicResampler::push(int16_t s) {
-    if (received_ >= srcFrames_) return;
-    hist_[received_ & 3] = s;
-    ++received_;
-    emit();
-}
-
 void CubicResampler::finish() {
-    ended_ = true;
-    emit();
+    while (outNext_ < outTotal_) emitOne();
 }
 
 // ---------------------------------------------------------------- importer
@@ -232,20 +234,70 @@ FmtStatus WavImporter::begin(const WavInfo& info, const WavImportOptions& opt, i
     plan_ = wavPlanImport(info, opt);
     if (size_t(plan_.outFrames) * plan_.outChannels > outCapSamples) return FmtStatus::NoSpace;
     bpf_ = wavBytesPerFrame(info);
-    rs_[0].begin(info.sampleRate, plan_.srcFrames, out);
-    if (plan_.outChannels == 2) rs_[1].begin(info.sampleRate, plan_.srcFrames, out + plan_.outFrames);
+    out_[0] = out;
+    out_[1] = plan_.outChannels == 2 ? out + plan_.outFrames : nullptr;
+    // 44.1 kHz: output frame i == source frame i exactly while float(i) is
+    // exact (i < 2^24, i.e. well beyond the 0xB40000-byte sample bank).
+    direct_ = info.sampleRate == kSampleRate && plan_.outFrames < (1u << 24);
+    directRead_ = direct_ && kLittleEndian && info.format == wav::kFormatPcm && info.bitsPerSample == 16 &&
+                  info.channels == 1;
+    if (!direct_) {
+        rs_[0].begin(info.sampleRate, plan_.srcFrames, out);
+        if (plan_.outChannels == 2) rs_[1].begin(info.sampleRate, plan_.srcFrames, out + plan_.outFrames);
+    }
     return FmtStatus::Ok;
 }
 
-void WavImporter::frame(const uint8_t* f) {
-    if (frameIdx_ >= plan_.srcStart && frameIdx_ < uint64_t(plan_.srcStart) + plan_.srcFrames) {
-        const uint16_t bps = info_.bitsPerSample / 8;
-        // Channel 0 always; channel 1 only in stereo-import mode. Mono import
-        // of a stereo file keeps the left channel only, no averaging (spec 07 Q8).
-        rs_[0].push(wavDecodeSample(f, info_.format, info_.bitsPerSample));
-        if (plan_.outChannels == 2) rs_[1].push(wavDecodeSample(f + bps, info_.format, info_.bitsPerSample));
+// `count` whole source frames starting at frameIdx_. Channel 0 always;
+// channel 1 only in stereo-import mode. Mono import of a stereo file keeps
+// the left channel only, no averaging (spec 07 Q8).
+void WavImporter::frames(const uint8_t* f, uint64_t count) {
+    uint64_t idx = frameIdx_;
+    frameIdx_ += count;
+    const uint64_t lo = plan_.srcStart, hi = lo + plan_.srcFrames;
+    if (idx + count <= lo || idx >= hi) return;
+    if (idx < lo) {
+        f += (lo - idx) * bpf_;
+        count -= lo - idx;
+        idx = lo;
     }
-    ++frameIdx_;
+    if (idx + count > hi) count = hi - idx;
+    const bool two = plan_.outChannels == 2;
+    const uint16_t fmt = info_.format, bits = info_.bitsPerSample;
+    const uint32_t bps = bits / 8u, bpf = bpf_;
+    const bool pcm16 = fmt == wav::kFormatPcm && bits == 16;
+    if (direct_) {
+        const uint32_t k0 = uint32_t(idx - lo);
+        int16_t* L = out_[0] + k0;
+        int16_t* R = two ? out_[1] + k0 : nullptr;
+        if (pcm16 && bpf == 2 && kLittleEndian) {
+            std::memcpy(L, f, size_t(count) * 2);
+        } else if (pcm16) {
+            for (uint64_t i = 0; i < count; ++i, f += bpf) {
+                L[i] = rdI16(f);
+                if (R) R[i] = rdI16(f + 2);
+            }
+        } else {
+            for (uint64_t i = 0; i < count; ++i, f += bpf) {
+                L[i] = wavDecodeSample(f, fmt, bits);
+                if (R) R[i] = wavDecodeSample(f + bps, fmt, bits);
+            }
+        }
+        written_ = k0 + uint32_t(count);
+        return;
+    }
+    // Resampler path: decode a block, then push it.
+    int16_t tmp[2][128];
+    while (count) {
+        const uint32_t m = count < 128 ? uint32_t(count) : 128u;
+        for (uint32_t i = 0; i < m; ++i, f += bpf) {
+            tmp[0][i] = pcm16 ? rdI16(f) : wavDecodeSample(f, fmt, bits);
+            if (two) tmp[1][i] = pcm16 ? rdI16(f + 2) : wavDecodeSample(f + bps, fmt, bits);
+        }
+        rs_[0].pushBlock(tmp[0], m);
+        if (two) rs_[1].pushBlock(tmp[1], m);
+        count -= m;
+    }
 }
 
 void WavImporter::feed(const uint8_t* bytes, size_t n) {
@@ -256,21 +308,47 @@ void WavImporter::feed(const uint8_t* bytes, size_t n) {
             --n;
         }
         if (carryLen_ < bpf_) return;
-        frame(carry_);
+        frames(carry_, 1);
         carryLen_ = 0;
     }
-    while (n >= bpf_) {
-        frame(bytes);
-        bytes += bpf_;
-        n -= bpf_;
-    }
+    const size_t whole = n / bpf_;
+    if (whole) frames(bytes, whole);
+    bytes += whole * bpf_;
+    n -= whole * bpf_;
     while (n) {
         carry_[carryLen_++] = *bytes++;
         --n;
     }
 }
 
+uint8_t* WavImporter::directBuffer(uint32_t& maxBytes) {
+    maxBytes = 0;
+    if (!directRead_ || carryLen_ || frameIdx_ < plan_.srcStart || complete()) return nullptr;
+    const uint64_t left = uint64_t(plan_.srcStart) + plan_.srcFrames - frameIdx_;
+    maxBytes = left * 2 > 0x7FFFFFFFu ? 0x7FFFFFFEu : uint32_t(left * 2);
+    return reinterpret_cast<uint8_t*>(out_[0] + (frameIdx_ - plan_.srcStart));
+}
+
+void WavImporter::directCommit(uint32_t bytes) {
+    const uint32_t k0 = uint32_t(frameIdx_ - plan_.srcStart);
+    frameIdx_ += bytes / 2;
+    written_ = k0 + bytes / 2;
+    if (bytes & 1) {
+        // Half a frame: keep its byte for the next feed().
+        carry_[0] = reinterpret_cast<const uint8_t*>(out_[0] + written_)[0];
+        carryLen_ = 1;
+    }
+}
+
 uint32_t WavImporter::finish() {
+    if (direct_) {
+        // Source frames that never arrived read as zero (resampler rule).
+        for (int c = 0; c < plan_.outChannels; ++c)
+            if (out_[c] && written_ < plan_.outFrames)
+                std::memset(out_[c] + written_, 0, size_t(plan_.outFrames - written_) * sizeof(int16_t));
+        written_ = plan_.outFrames;
+        return plan_.outFrames;
+    }
     rs_[0].finish();
     if (plan_.outChannels == 2) rs_[1].finish();
     return plan_.outFrames;

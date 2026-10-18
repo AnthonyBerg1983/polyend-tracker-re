@@ -1,5 +1,6 @@
 // Sample voice (spec 04 §2-§4).
 #include "audio/voice.h"
+#include "fastrun.h"
 #include "audio/ring_io.h"
 #include "audio/zero_snap.h"
 
@@ -56,6 +57,100 @@ void fusedOut(const float* __restrict p, const float* __restrict eg, OutRamps g,
     }
 }
 
+// Fused chain (Voice::render, OP-3): player * envelope (* headroom), bit
+// crusher, overdrive, the SVF (kFilt = type + 1, 0 = off), sends, AMP clamp,
+// pan and the dry-bus sum in one pass. Every stage does the same operations
+// in the same order as the separate passes of the general path (and the SVF
+// as Svf::run), so the result is bit-identical; only o.l / o.r are not
+// written (keepLR = false, like fusedOut). kExtra: headroom, crusher or
+// overdrive on (else those checks are compiled out). kSends: both sends are
+// fed; an inactive one goes to a scratch bus (the real bus is untouched).
+struct ChainCfg {
+    float hs;          // headroom gain (1 = none)
+    int32_t mask;      // crusher AND mask (sign-extended)
+    float od;          // overdrive pre-gain (0 = off)
+    float fmT, dpT;    // SVF coefficient targets
+};
+template <int kFilt, bool kSends, bool kExtra>
+void fusedChain(const float* __restrict p, const float* __restrict eg, OutRamps g, const ChainCfg& cf, Svf& svf,
+                float* __restrict ds, float* __restrict rs, float* __restrict oa, float* __restrict mL,
+                float* __restrict mR, float& last) {
+    const bool hsOn = kExtra && cf.hs != 1.0f, crush = kExtra && cf.mask != -1, odOn = kExtra && cf.od > 0.0f;
+    const float hs = cf.hs, odg = cf.od;
+    const int32_t m = cf.mask;
+    float dfm = 0.0f, ddp = 0.0f, f = 0.0f, d = 0.0f, l = 0.0f, b = 0.0f, ip = 0.0f;
+    if (kFilt) {
+        dfm = (cf.fmT - svf.fm) / float(kBlock);
+        ddp = (cf.dpT - svf.dp) / float(kBlock);
+        f = svf.fm;
+        d = svf.dp;
+        l = svf.lp;
+        b = svf.bp;
+        ip = svf.inPrev;
+    }
+    float x = 0.0f;
+    for (uint32_t i = 0; i < kBlock; ++i) {
+        x = hsOn ? p[i] * (eg[i] * hs) : p[i] * eg[i];
+        if (crush) x = float(int32_t(toS16(x)) & m) * (1.0f / 32768.0f);
+        if (odOn) {
+            const float y = x * odg;
+            const float a = y < 0.0f ? -y : y;
+            float v;
+            if (a < 0.25f) v = 3.0f * a;
+            else if (a < 0.5f) {
+                const float t = 2.0f - 4.0f * a;
+                v = 1.0f - t * t * 0.25f;
+            } else v = 1.0f;
+            x = y < 0.0f ? -v : v;
+        }
+        if (kFilt) {
+            f += dfm;
+            d += ddp;
+            const float in = x;
+            l += f * b;
+            float h = (in + ip) * 0.5f - l - d * b;
+            ip = in;
+            b += f * h;
+            const float l1 = l, b1 = b, h1 = h;
+            l += f * b;
+            h = in - l - d * b;
+            b += f * h;
+            const float y = kFilt == 1 ? (l + l1) : (kFilt == 2 ? (h + h1) : (b + b1));
+            x = clampUnitFast(y * 0.5f);
+        }
+        if (kSends) {
+            g.s0 += g.di;
+            ds[i] += x * g.s0;
+            g.s1 += g.ri;
+            rs[i] += x * g.s1;
+        }
+        g.a0 += g.ai;
+        g.l0 += g.li;
+        g.r0 += g.rri;
+        const float a = clampFast(x * g.a0);
+        oa[i] = a;
+        mL[i] += a * g.l0;
+        mR[i] += a * g.r0;
+    }
+    last = x;
+    if (kFilt) {
+        svf.lp = l > 16.0f ? 16.0f : (l < -16.0f ? -16.0f : l);
+        svf.bp = b > 16.0f ? 16.0f : (b < -16.0f ? -16.0f : b);
+        svf.inPrev = ip;
+        svf.fm = cf.fmT;
+        svf.dp = cf.dpT;
+    }
+}
+typedef void (*FusedChainFn)(const float*, const float*, OutRamps, const ChainCfg&, Svf&, float*, float*, float*,
+                             float*, float*, float&);
+// [kFilt][kSends * 2 + kExtra]; [0][0] (no filter, no extras) is fusedOut's case.
+const FusedChainFn kChain[4][4] = {
+    {nullptr, &fusedChain<0, false, true>, &fusedChain<0, true, false>, &fusedChain<0, true, true>},
+    {&fusedChain<1, false, false>, &fusedChain<1, false, true>, &fusedChain<1, true, false>, &fusedChain<1, true, true>},
+    {&fusedChain<2, false, false>, &fusedChain<2, false, true>, &fusedChain<2, true, false>, &fusedChain<2, true, true>},
+    {&fusedChain<3, false, false>, &fusedChain<3, false, true>, &fusedChain<3, true, false>, &fusedChain<3, true, true>},
+};
+
 // clampUnit() with the common in-range case decided on the bit pattern
 // (|v| <= 1 <=> (bits & 0x7FFFFFFF) <= 0x3F800000; NaN goes to clampUnit).
 inline float clampFast(float v) {
@@ -66,6 +161,10 @@ inline float clampFast(float v) {
 
 // frames = uint(length * x / 65535) (spec 04 §2.3).
 inline int32_t pointToFrames(uint32_t len, uint32_t x) { return int32_t(uint64_t(len) * x / 65535u); }
+
+// Play modes that play a stereo instrument in stereo in 2.0.0 (2x-04 §3.1;
+// playMode > 7 plays as one-shot). TODO(2.1): wavetable and granular.
+inline bool stereoPlayMode(uint8_t m) { return m > 7 || m <= uint8_t(PlayMode::BeatSlice); }
 
 // Linear interpolation with the 16-bit fraction of spec 04 §2.2.
 inline int32_t interp(int32_t s0, int32_t s1, uint32_t frac) {
@@ -105,6 +204,7 @@ void Voice::stop() {
     playing_ = false;
     env_.stop();
     pending_.valid = false;
+    stBlock_ = stereo_;
     for (auto& m : mods_) m.st = 0;
 }
 
@@ -203,7 +303,7 @@ void Voice::resetFx() {
 // --- note on / off ----------------------------------------------------------
 
 void Voice::noteOn(const Instrument* ins, const int16_t* data, uint32_t frames, uint8_t note, int8_t volume,
-                   uint8_t aT, uint8_t aV, uint8_t bT, uint8_t bV) {
+                   uint8_t aT, uint8_t aV, uint8_t bT, uint8_t bV, const int16_t* dataR) {
     if (!ins || !data || frames == 0) return;
     noteVolume_ = volume;
     for (auto& m : mods_) m.stepOn = curStep0_;   // S_on latch at note-on (spec 07 Q5)
@@ -213,9 +313,11 @@ void Voice::noteOn(const Instrument* ins, const int16_t* data, uint32_t frames, 
     applyFx(1, bT, bV);
     pending_.ins = ins;
     pending_.data = data;
+    pending_.dataR = dataR;
     pending_.frames = frames;
     pending_.note = note;
     pending_.valid = true;
+    stBlock_ = stereo_ || (dataR && stereoPlayMode(ins->playMode));
     ins_ = ins;   // envelope / modulator parameters come from the new instrument
     setupVolumeEnvelope(tempo_);
     if (!env_.noteOn()) startNote();
@@ -236,6 +338,7 @@ void Voice::noteOff(int8_t mode) {
         }
     }
     pending_.valid = false;
+    stBlock_ = stereo_;
 }
 
 void Voice::startNote() {
@@ -243,9 +346,12 @@ void Voice::startNote() {
     const bool wasActive = playing_;
     ins_ = pending_.ins;
     data_ = pending_.data;
+    dataR_ = pending_.dataR;
     frames_ = pending_.frames;
     pending_.valid = false;
     mode_ = ins_->playMode > 7 ? 0 : ins_->playMode;
+    stereo_ = dataR_ != nullptr && stereoPlayMode(mode_);
+    stBlock_ = stereo_;
     note_ = mode_ == uint8_t(PlayMode::BeatSlice) ? uint8_t(kUnityNote) : pending_.note;   // §2.3
     reverse_ = reverseFx_ != perf_.reverse;
     slideSemis_ = 0.0f;
@@ -622,6 +728,10 @@ void Voice::control(const VoiceControl& c) {
         sendR_.jump(gr);
         svf_.fm = fmTarget_;
         svf_.dp = dpTarget_;
+        // Stereo note: the right filter starts at the same coefficients (it
+        // would otherwise ramp from the previous note's, 2x-04 §3).
+        svfR_.fm = fmTarget_;
+        svfR_.dp = dpTarget_;
         firstBlock_ = false;
     } else {
         amp_.set(g);
@@ -634,7 +744,7 @@ void Voice::control(const VoiceControl& c) {
 
 // --- player (spec 04 §2.2, §3) -----------------------------------------------
 
-void Voice::renderPlayer(float* out, uint32_t n) {
+OT_FASTRUN_FN void Voice::renderPlayer(float* out, uint32_t n) {
     if (!playing_ || !data_ || frames_ == 0) {
         zeroFloats(out, n);
         return;
@@ -850,7 +960,7 @@ void Voice::renderPlayer(float* out, uint32_t n) {
 
 // --- block render (spec 04 §4.1 order) ----------------------------------------
 
-bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsend, float* mixL, float* mixR,
+OT_FASTRUN_FN bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsend, float* mixL, float* mixR,
                    bool keepLR) {
     if (!ins_ || (!playing_ && !env_.active())) {
         if (cleanOut_ != &o) {   // zeroed once after the voice went silent
@@ -860,9 +970,14 @@ bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsen
             cleanOut_ = &o;
         }
         peak_ = 0.0f;
+        sendsTouched_ = 0;
         return false;
     }
     cleanOut_ = nullptr;
+    // The stereo chain runs for the whole block when the current or the
+    // pending (retriggered in this block) note is stereo (2x-04 §3).
+    if (stBlock_) return renderSt(c, o, dsend, rsend, mixL, mixR);
+    lastSt_ = false;
     float x[kBlock], eg[kBlock];
     const float hs = c.headroom ? 0.5f : 1.0f;   // extra headroom (§1.4)
     // Envelope in 8-sample groups; the player runs in one call up to each
@@ -895,6 +1010,7 @@ bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsen
         const float panMax =
             std::fmax(std::fmax(g.l0, g.l0 + g.li * float(kBlock)), std::fmax(g.r0, g.r0 + g.rri * float(kBlock)));
         const bool sd = g.s0 != 0.0f || g.di != 0.0f, sr = g.s1 != 0.0f || g.ri != 0.0f;
+        sendsTouched_ = uint8_t((sd ? 1 : 0) | (sr ? 2 : 0));
         const int v = (sd ? 1 : 0) | (sr ? 2 : 0) | (keepLR ? 4 : 0);
         switch (v) {
             case 0: fusedOut<false, false, false>(x, eg, g, dsend, rsend, o, mixL, mixR); break;
@@ -906,6 +1022,40 @@ bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsen
             case 6: fusedOut<false, true, true>(x, eg, g, dsend, rsend, o, mixL, mixR); break;
             default: fusedOut<true, true, true>(x, eg, g, dsend, rsend, o, mixL, mixR); break;
         }
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < kBlock; i += 2) {
+            const float aa = oa[i] < 0.0f ? -oa[i] : oa[i];
+            amax = aa > amax ? aa : amax;
+        }
+        peak_ = amax * panMax;
+        return true;
+    }
+    if (!filtXfade_ && mixL && mixR && !keepLR) {
+        // Crusher / overdrive / filter on: the whole chain in one pass.
+        OutRamps g;
+        g.di = sendD_.begin(g.s0);
+        g.ri = sendR_.begin(g.s1);
+        g.ai = amp_.begin(g.a0);
+        g.li = panL_.begin(g.l0);
+        g.rri = panR_.begin(g.r0);
+        const float panMax =
+            std::fmax(std::fmax(g.l0, g.l0 + g.li * float(kBlock)), std::fmax(g.r0, g.r0 + g.rri * float(kBlock)));
+        const bool sd = g.s0 != 0.0f || g.di != 0.0f, sr = g.s1 != 0.0f || g.ri != 0.0f;
+        sendsTouched_ = uint8_t((sd ? 1 : 0) | (sr ? 2 : 0));
+        ChainCfg cf;
+        cf.hs = hs;
+        cf.mask = int32_t(int16_t(mask_));
+        cf.od = odGain_;
+        cf.fmT = fmTarget_;
+        cf.dpT = dpTarget_;
+        const int ft = filtOn_ ? (filtType_ == 0 ? 1 : (filtType_ == 1 ? 2 : 3)) : 0;
+        const bool extra = hs != 1.0f || mask_ != 0xFFFF || odGain_ > 0.0f;
+        // One send off: it feeds a scratch bus with its (all-zero) ramp.
+        float scratch[kBlock];
+        float* ds = sd ? dsend : scratch;
+        float* rs = sr ? rsend : scratch;
+        if (sd != sr) zeroFloats(scratch, kBlock);
+        kChain[ft][((sd || sr) ? 2 : 0) | (extra ? 1 : 0)](x, eg, g, cf, svf_, ds, rs, oa, mixL, mixR, filtLast_);
         float amax = 0.0f;
         for (uint32_t i = 0; i < kBlock; i += 2) {
             const float aa = oa[i] < 0.0f ? -oa[i] : oa[i];
@@ -953,6 +1103,7 @@ bool Voice::render(const VoiceControl& c, VoiceOut& o, float* dsend, float* rsen
     const float di = sendD_.begin(s0);
     const float ri = sendR_.begin(s1);
     const bool sd = s0 != 0.0f || di != 0.0f, sr = s1 != 0.0f || ri != 0.0f;
+    sendsTouched_ = uint8_t((sd ? 1 : 0) | (sr ? 2 : 0));
     if (sd && sr) {
         for (uint32_t i = 0; i < kBlock; ++i) {
             s0 += di;

@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "app/perf_presets.h"
 #include "app/project_fields.h"
 #include "ui/screens.h"
 
@@ -19,6 +20,16 @@ const char* kSatNames[5] = {"Hard Clip", "Soft Clip", "Saturate", "Overdrive", "
 const uint32_t kGlobalLevel[4] = {pf::kMixDelay, pf::kMixReverb, pf::kMixDry, pf::kLineInLevel};
 const uint32_t kGlobalMute[4] = {pf::kMixDelayMute, pf::kMixReverbMute, pf::kMixDryMute, pf::kLineInMute};
 const char* kGlobalNames[4] = {"Delay", "Reverb", "Dry Mix", "Line In"};
+// 2.x Global Mixer 3/3 synth columns F5..F7 (Tracker Mini manual p.220):
+// level = the slot gain (record +0x00, -96..12 dB), no mute / solo.
+constexpr int kSynthCol = 4;
+const char* kSynthNames[3] = {"Synth 1", "Synth 2", "Synth 3"};
+float synthBar(float db) { return clampf((db + 96.0f) / 108.0f, 0.0f, 1.0f); }
+void synthGainStep(App& a, int s, float d, bool reset) {
+    SynthSlotRecord r = a.synthSlot(s);
+    r.gainDb = reset ? 0.0f : clampf(std::round((r.gainDb + 0.5f * d) * 2.0f) / 2.0f, -96.0f, 12.0f);
+    a.setSynthSlotRecord(s, r);
+}
 const int kMainParams[4] = {0, 5, 6, 7};   // Volume, Saturation, Bass Boost, Space (F-index)
 // Delay sync rate index -> note value, in DSYNC order (spec 04 §5.1,
 // spec 16 §B.6).
@@ -108,10 +119,18 @@ void optionList(Gfx& g, const Theme& th, int k, const char* const* names, int co
 }
 }  // namespace
 
+// 2.x bank B (docs/specs/2x-01 §4): right-hand title text.
+constexpr const char* kBankBText = "Tracks 9-16";
+
 void MixerScreen::start(int opt) {
     const int hi = (opt >> 8) & 0xFF;
     if (hi >= 1 && hi <= 3) page = hi - 1;
     for (auto& h : held_) h = false;
+    for (int i = 0; i < 8; ++i) {
+        activity[i] = false;
+        actStep_[i] = -1;
+        actUntil_[i] = 0;
+    }
     // The entering Master press is consumed by the switch (spec 06 §0.3).
     masterPending_ = otherKeyDuringMaster_ = masterHoldFired_ = false;
     refreshBar();
@@ -126,6 +145,15 @@ int MixerScreen::meterBar(float meanLevel) {
     if (db <= kLoDb) return 0;
     if (db >= kHiDb) return 100;
     return int((db - kLoDb) * 100.0f / (kHiDb - kLoDb));
+}
+
+int MixerScreen::synthMeterBar(float meanPeak) {
+    constexpr float kLoDb = -48.0f;
+    if (!(meanPeak > 0.0f)) return 0;
+    const float db = 20.0f * std::log10(meanPeak);
+    if (db <= kLoDb) return 0;
+    if (db >= 0.0f) return 100;
+    return int((db - kLoDb) * 100.0f / -kLoDb);
 }
 
 void MixerScreen::refreshBar() {
@@ -181,7 +209,7 @@ void MixerScreen::refreshBar() {
             b.set(1, "LimiterRls", v);
             // Displayed threshold = 20 log10(LIMTHR[v*100/32767] / 32767) (spec 07 Q2).
             const float thr = audio::limiterThreshold(p.u16(pf::kLimThreshold) > 32767 ? 32767 : p.u16(pf::kLimThreshold));
-            std::snprintf(v, sizeof(v), "%.1f dB", thr > 0.0f ? 20.0 * std::log10(double(thr)) : -96.0);
+            std::snprintf(v, sizeof(v), "%.1f dB", thr > 0.0f ? double(20.0f * std::log10(thr)) : -96.0);
             b.set(2, "LimiterThr", v);
             std::snprintf(v, sizeof(v), "-%.1f dB", double(gainReduction));
             b.set(3, "Gain Reduce", v, false);   // read-only meter (spec 06 §4.3)
@@ -202,12 +230,18 @@ void MixerScreen::refreshBar() {
         // Label: fader level (grey) / action (white); the track name is
         // the column header [S snap 023]. A muted channel's label uses the
         // disabled colours [S snap 024 Line In].
-        for (int t = 0; t < 8; ++t) {
-            levelText(p.u8(pf::kTrackVolume + uint32_t(t)), v, sizeof(v));
-            if (rename) b.set(t, v, "Edit");
-            else if (ui_.shift()) b.set(t, v, solo_ == t ? "Unsolo" : "Solo");
-            else b.set(t, v, a.trackMuted(t) ? "Unmute" : "Mute", !a.trackMuted(t));
-            b.highlight(t, held_[t]);
+        // 2.x: F1..F8 address the tracks of the bank (2x-01 §4).
+        // Bank B (tracks 9-16) has no fader on the Tracker Mini: the top
+        // line is left empty.
+        for (int i = 0; i < 8; ++i) {
+            const int t = bank * 8 + i;
+            const bool m = trk::muted(a, t);
+            if (bank) v[0] = 0;
+            else levelText(trk::level(a, t), v, sizeof(v));
+            if (rename) b.set(i, v, "Edit");
+            else if (ui_.shift()) b.set(i, v, solo_ == t ? "Unsolo" : "Solo");
+            else b.set(i, v, m ? "Unmute" : "Mute", !m);
+            b.highlight(i, held_[i]);
         }
         return;
     }
@@ -215,6 +249,11 @@ void MixerScreen::refreshBar() {
         levelText(p.u8(kGlobalLevel[i]), v, sizeof(v));
         b.set(i, v, p.u8(kGlobalMute[i]) ? "Unmute" : "Mute", !p.u8(kGlobalMute[i]));
         b.highlight(i, held_[i]);
+    }
+    for (int s = 0; s < kSynthSlotCount; ++s) {
+        synthui::gainText(a.synthSlot(s).gainDb, v, sizeof(v));
+        b.set(kSynthCol + s, v);
+        b.highlight(kSynthCol + s, held_[kSynthCol + s]);
     }
 }
 
@@ -284,27 +323,29 @@ void MixerScreen::change(int d) {
         if (!held_[i]) continue;
         any = true;
         changed_[i] = true;
-        if (page == 1) a.project.setU8(pf::kTrackVolume + uint32_t(i), uint8_t(clampi(a.project.u8(pf::kTrackVolume + uint32_t(i)) + d, 0, 100)));
-        else if (i < 4) a.project.setU8(kGlobalLevel[i], uint8_t(clampi(a.project.u8(kGlobalLevel[i]) + d, 0, 100)));
+        if (page == 1) {
+            if (bank) continue;   // no bank-B levels (Tracker Mini: Track Mixer 1-8 only)
+            trk::setLevel(a, i, uint8_t(clampi(trk::level(a, i) + d, 0, 100)));
+        } else if (i < 4) a.project.setU8(kGlobalLevel[i], uint8_t(clampi(a.project.u8(kGlobalLevel[i]) + d, 0, 100)));
+        else if (i < kSynthCol + kSynthSlotCount) synthGainStep(a, i - kSynthCol, float(d), false);
     }
-    if (any) a.markProjectDirty();
+    if (any && !(page == 1 && bank)) a.markProjectDirty();
 }
 
 void MixerScreen::mixerKey(int i, uint8_t state) {
     App& a = app_;
-    if (page == 2 && i >= 4) return;
+    if (page == 2 && i >= kSynthCol + kSynthSlotCount) return;
     if (state == kPress) {
         if (rename && page == 1) {
+            // Tracks 9-16 too: 7 characters (2x-01 §1.1, stock 02 §3.3).
             char nm[24];
-            a.project.trackName(i, nm, sizeof(nm));
             static int renameTrack;
-            renameTrack = i;
+            renameTrack = bank * 8 + i;
+            trk::name(a, renameTrack, nm, sizeof(nm));
             ui_.kb.open("Track name", nm, 7, "Enter",
                         [](void* ctx, bool ok, const char* text) {
                             if (!ok) return;
-                            App& ap = *static_cast<App*>(ctx);
-                            ap.project.setTrackName(renameTrack, text);
-                            ap.markProjectDirty();
+                            trk::setName(*static_cast<App*>(ctx), renameTrack, text);
                         },
                         &a);
             return;
@@ -316,18 +357,22 @@ void MixerScreen::mixerKey(int i, uint8_t state) {
     if (state != kRelease || !held_[i]) return;
     held_[i] = false;
     if (changed_[i]) return;
+    if (page == 2 && i >= kSynthCol) return;   // synth columns: level only (no mute / solo)
     // spec 06 §4.4 release without change: mute / solo.
     if (page == 1) {
+        // 2.x: solo mutes the 15 other tracks of both banks; unsolo unmutes
+        // all 16 (1.9.3 rule, M1 plan spec gap 6).
+        const int ts = bank * 8 + i;
         if (ui_.shift()) {
-            if (solo_ == i) {
+            if (solo_ == ts) {
                 solo_ = -1;
-                for (int t = 0; t < 8; ++t) a.setTrackMute(t, false);
+                for (int t = 0; t < kTrackCount; ++t) trk::setMuted(a, t, false);
             } else {
-                solo_ = i;
-                for (int t = 0; t < 8; ++t) a.setTrackMute(t, t != i);
+                solo_ = ts;
+                for (int t = 0; t < kTrackCount; ++t) trk::setMuted(a, t, t != ts);
             }
         } else {
-            a.setTrackMute(i, !a.trackMuted(i));
+            trk::setMuted(a, ts, !trk::muted(a, ts));
         }
     } else {
         Project& p = a.project;
@@ -417,7 +462,17 @@ void MixerScreen::onButton(uint8_t id, uint8_t state) {
         case btn::Down: change(-1); break;
         case btn::Left:
         case btn::Right:
-            if (page == 0 && sub == 0) param = clampi(param + (id == btn::Right ? 1 : -1), 0, 3);
+            if (page == 1) {
+                // 2.x Track Mixer bank: Left = tracks 1-8, Right = 9-16
+                // (unbound on the stock Track Mixer, 2x-01 §4).
+                const int nb = id == btn::Right ? 1 : 0;
+                if (nb != bank) {
+                    bank = nb;
+                    for (int k = 0; k < 8; ++k) held_[k] = changed_[k] = false;
+                    for (int k = 0; k < 8; ++k) actStep_[k] = -1;
+                    ui_.dirty();
+                }
+            } else if (page == 0 && sub == 0) param = clampi(param + (id == btn::Right ? 1 : -1), 0, 3);
             else if (page == 0) {
                 const int mx = sub == 1 ? 4 : sub == 2 ? 6 : sub == 3 ? 3 : 4;
                 param = clampi(param + (id == btn::Right ? 1 : -1), 0, mx);
@@ -430,12 +485,16 @@ void MixerScreen::onButton(uint8_t id, uint8_t state) {
             break;
         case btn::Delete:
             // Delete resets held faders to 86 = 0 dB (spec 06 §4.4, spec 07 Q3/Q6).
+            if (page == 1 && bank) break;   // no bank-B levels
             if (page == 1)
-                for (int t = 0; t < 8; ++t)
-                    if (held_[t]) app_.project.setU8(pf::kTrackVolume + uint32_t(t), 86);
-            if (page == 2)
+                for (int i = 0; i < 8; ++i)
+                    if (held_[i]) trk::setLevel(app_, i, 86);
+            if (page == 2) {
                 for (int i = 0; i < 4; ++i)
                     if (held_[i]) app_.project.setU8(kGlobalLevel[i], 86);
+                for (int s = 0; s < kSynthSlotCount; ++s)
+                    if (held_[kSynthCol + s]) synthGainStep(app_, s, 0.0f, true);   // 0 dB like the faders
+            }
             app_.markProjectDirty();
             break;
         case btn::Rec:
@@ -453,6 +512,53 @@ void MixerScreen::onButton(uint8_t id, uint8_t state) {
 void MixerScreen::onEncoder(int d) {
     change(d);
     refreshBar();
+}
+
+// Bank B activity dot (M1 plan §4): a step with a note starting on the track
+// lights the dot for kActivityMs. Muted tracks start no notes.
+void MixerScreen::updateActivity(uint32_t now) {
+    App& a = app_;
+    Sequencer& q = a.seq;
+    bool changed = false;
+    for (int i = 0; i < 8; ++i) {
+        const int t = 8 + i;
+        if (q.isPlaying()) {
+            const Track& tr = a.pattern().tracks[t];
+            int st = q.step(t);
+            if (st < 0 || st >= kStepCount) st = 0;
+            if (st != actStep_[i]) {
+                actStep_[i] = int16_t(st);
+                if (tr.steps[st].note >= 0 && !trk::muted(a, t)) actUntil_[i] = now + kActivityMs;
+            }
+        } else {
+            actStep_[i] = -1;
+            actUntil_[i] = now;
+        }
+        const bool on = int32_t(actUntil_[i] - now) > 0;
+        if (on != activity[i]) changed = true;
+        activity[i] = on;
+    }
+    if (changed) ui_.dirty();
+}
+
+// Bank B (tracks 9-16): the stock column geometry (header, 47-px fader
+// well, 47-px meter well) with an activity dot in the meter well. The
+// Tracker Mini has no levels for these MIDI tracks, so the fader well stays
+// empty; the mute state shows in the F-key label and the activity dot.
+void MixerScreen::drawBankB(Gfx& g, uint32_t off) {
+    App& a = app_;
+    const Theme& th = ui_.th();
+    const uint32_t green = th.slot(slot::kGreen);
+    ui_.drawTitle(g, "Track Mixer 2/3", rename ? "RENAME  Tracks 9-16" : kBankBText);
+    for (int i = 0; i < 8; ++i) {
+        const int t = 8 + i, x = colX(i);
+        char nm[24];
+        trk::name(a, t, nm, sizeof(nm));
+        header(g, th, i, nm);
+        body(g, th, x, 47);
+        body(g, th, x + 50, 47);
+        wg::dot(g, x + 73, 400, 6.0f, activity[i] ? green : off);
+    }
 }
 
 float MixerScreen::reductionDb(float meanGain) {
@@ -474,7 +580,27 @@ void MixerScreen::update(uint32_t now) {
         }
         return;
     }
+    if (page == 2) {   // synth slot meters (2.x)
+        if (now - lastMeter_ < 10) return;
+        lastMeter_ = now;
+        histPos_ = (histPos_ + 1) % 10;
+        bool changed = false;
+        for (int s = 0; s < kSynthSlotCount; ++s) {
+            synthHist_[s][histPos_] = app_.engine.synth().slotPeak(s);
+            float sum = 0;
+            for (float v : synthHist_[s]) sum += v;
+            const int bar = synthMeterBar(sum / 10.0f);
+            if (bar != synthMeter[s]) changed = true;
+            synthMeter[s] = bar;
+        }
+        if (changed) ui_.dirty();
+        return;
+    }
     if (page != 1) return;
+    if (bank == 1) {
+        updateActivity(now);
+        return;
+    }
     // Hold decay: 1 unit per 500 ms (spec 06 §4.4 step 3).
     if (now - lastDecay_ >= 500) {
         lastDecay_ = now;
@@ -571,6 +697,10 @@ void MixerScreen::draw(Gfx& g) {
     if (page == 1) {
         // spec 06 §4.4 / VISUAL_DIFF §8.12: per track a header, a 47-px
         // fader (x 2 + 100 k) and a 47-px level meter (x 52 + 100 k).
+        if (bank == 1) {
+            drawBankB(g, off);
+            return;
+        }
         ui_.drawTitle(g, "Track Mixer 2/3", rename ? "RENAME" : nullptr);
         for (int t = 0; t < 8; ++t) {
             const int x = colX(t);
@@ -602,7 +732,18 @@ void MixerScreen::draw(Gfx& g) {
         bar(g, th, x + 32, 64, 32, 359, 0.0f, green);
         bar(g, th, x + 64, 64, 32, 359, 0.0f, green);
     }
-    wg::panel(g, th, 402, 30, 396, wg::kPanelH - 1);
+    // 2.x synth slots (manual p.220): the level setting (left) and the
+    // actual level (right: the live slot-bus meter), Track Mixer geometry;
+    // the rest one empty panel.
+    for (int s = 0; s < kSynthSlotCount; ++s) {
+        const int k = kSynthCol + s, x = colX(k);
+        header(g, th, k, kSynthNames[s]);
+        body(g, th, x, 47);
+        body(g, th, x + 50, 47);
+        bar(g, th, x, 64, 47, 359, synthBar(a.synthSlot(s).gainDb));
+        bar(g, th, x + 50, 64, 47, 359, float(synthMeter[s]) / 100.0f, green);
+    }
+    wg::panel(g, th, colX(7), 30, 96, wg::kPanelH - 1);
 }
 
 }  // namespace ot

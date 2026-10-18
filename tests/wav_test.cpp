@@ -515,3 +515,143 @@ TEST(writer_and_file_import) {
     fs.files["bad.wav"] = {'R', 'I', 'F', 'F'};
     CHECK(wavImportFile(fs, "bad.wav", o, out.data(), out.size(), r) == FmtStatus::Unsupported);
 }
+
+// ---- 2.x loading performance: the block / 44.1 kHz / direct-read importer
+// paths must give exactly the samples of the 1.9.3 per-sample importer
+// (copied below as the reference: per-sample float position, push + emit).
+namespace {
+struct OldResampler {
+    int16_t hist[4] = {};
+    uint32_t rate = 44100;
+    uint64_t frames = 0, received = 0, next = 0, total = 0;
+    bool ended = false;
+    int16_t* dst = nullptr;
+    void begin(uint32_t r, uint32_t f, int16_t* d) {
+        *this = OldResampler{};
+        rate = r ? r : 44100;
+        frames = f;
+        total = wavResampledFrames(f, rate);
+        dst = d;
+    }
+    int32_t src(int64_t j) const { return (j < 0 || uint64_t(j) >= frames || uint64_t(j) >= received) ? 0 : hist[j & 3]; }
+    int64_t index(uint64_t i, float* mu) const {
+        const float ratio = float(rate) / float(44100);
+        const float t = float(i) * ratio;
+        const float n = std::floor(t);
+        if (mu) *mu = t - n;
+        return int64_t(n);
+    }
+    bool ready(uint64_t i) const {
+        if (ended) return true;
+        const int64_t ni = index(i, nullptr);
+        uint64_t need = (ni < 0 ? 0 : uint64_t(ni)) + 2;
+        if (need >= frames) need = frames - 1;
+        return need < received;
+    }
+    void emit() {
+        while (next < total && ready(next)) {
+            float mu = 0;
+            const int64_t n = index(next, &mu);
+            const float p0 = float(src(n - 1)), p1 = float(src(n)), p2 = float(src(n + 1)), p3 = float(src(n + 2));
+            const float a0 = p3 - p2 - p0 + p1, a1 = p0 - p1 - a0, a2 = p2 - p0, a3 = p1;
+            const float y = ((a0 * mu + a1) * mu + a2) * mu + a3;
+            int32_t v = int32_t(y);
+            v = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+            dst[next++] = int16_t(v);
+        }
+    }
+    void push(int16_t s) {
+        if (received >= frames) return;
+        hist[received & 3] = s;
+        ++received;
+        emit();
+    }
+    void finish() {
+        ended = true;
+        emit();
+    }
+};
+
+std::vector<int16_t> oldImport(const WavInfo& info, const WavImportOptions& opt, const uint8_t* data, size_t n) {
+    const WavImportPlan p = wavPlanImport(info, opt);
+    std::vector<int16_t> out(size_t(p.outFrames) * p.outChannels + 1, 0x5A5A);
+    OldResampler rs[2];
+    rs[0].begin(info.sampleRate, p.srcFrames, out.data());
+    if (p.outChannels == 2) rs[1].begin(info.sampleRate, p.srcFrames, out.data() + p.outFrames);
+    const uint32_t bpf = wavBytesPerFrame(info), bps = info.bitsPerSample / 8u;
+    for (uint64_t k = 0; (k + 1) * bpf <= n; ++k) {
+        if (k < p.srcStart || k >= uint64_t(p.srcStart) + p.srcFrames) continue;
+        const uint8_t* f = data + k * bpf;
+        rs[0].push(wavDecodeSample(f, info.format, info.bitsPerSample));
+        if (p.outChannels == 2) rs[1].push(wavDecodeSample(f + bps, info.format, info.bitsPerSample));
+    }
+    rs[0].finish();
+    if (p.outChannels == 2) rs[1].finish();
+    return out;
+}
+}  // namespace
+
+TEST(block_and_direct_importer_match_per_sample_reference) {
+    uint32_t seed = 12345;
+    auto rnd = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    const uint32_t rates[] = {44100, 44100, 48000, 22050, 32000, 96000, 8000, 11025};
+    const uint16_t bitsList[] = {8, 16, 16, 24, 32};
+    int cases = 0, bad = 0;
+    for (int it = 0; it < 120; ++it) {
+        WavBuild b;
+        b.rate = rates[rnd() % 8];
+        const bool flt = rnd() % 6 == 0;
+        b.format = flt ? 3 : 1;
+        b.bits = flt ? 32 : bitsList[rnd() % 5];
+        b.channels = uint16_t(1 + rnd() % 2);
+        const uint32_t frames = 1 + rnd() % 3000;
+        const uint32_t bpf = b.channels * b.bits / 8u;
+        b.data.resize(size_t(frames) * bpf);
+        for (size_t i = 0; i < b.data.size(); ++i) b.data[i] = uint8_t(rnd());
+        if (flt)
+            for (size_t i = 0; i + 4 <= b.data.size(); i += 4) {
+                const float x = float(int(rnd() % 4001) - 2000) / 1700.0f;
+                std::memcpy(&b.data[i], &x, 4);
+            }
+        auto file = b.build();
+        if (rnd() % 4 == 0) file.resize(file.size() - std::min<size_t>(file.size() - 60, 1 + rnd() % 200));
+        WavInfo info;
+        CHECK(wavParseHeader(file.data(), file.size(), info));
+        WavImportOptions opt;
+        opt.stereo = rnd() % 2;
+        if (rnd() % 3 == 0) {
+            opt.startMarker = uint16_t(rnd() % 30000);
+            opt.endMarker = uint16_t(35000 + rnd() % 30535);
+        }
+        const size_t avail = std::min<size_t>(file.size() - info.dataOffset, info.dataSize);
+        const std::vector<int16_t> want = oldImport(info, opt, file.data() + info.dataOffset, avail);
+        // New importer: random chunking, direct reads when offered.
+        std::vector<int16_t> got(want.size(), 0x5A5A);
+        WavImporter imp;
+        CHECK(imp.begin(info, opt, got.data(), got.size() - 1) == FmtStatus::Ok);
+        const uint8_t* d = file.data() + info.dataOffset;
+        size_t left = avail;
+        while (left) {
+            uint32_t maxb = 0;
+            uint8_t* direct = imp.directBuffer(maxb);
+            size_t c = std::min<size_t>(left, 1 + rnd() % 5000);
+            if (direct && rnd() % 2) {
+                c = std::min<size_t>(c, maxb);
+                std::memcpy(direct, d, c);
+                imp.directCommit(uint32_t(c));
+            } else {
+                imp.feed(d, c);
+            }
+            d += c;
+            left -= c;
+        }
+        CHECK_EQ(imp.finish(), wavPlanImport(info, opt).outFrames);
+        ++cases;
+        if (got != want) ++bad;
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(cases, 120);
+}

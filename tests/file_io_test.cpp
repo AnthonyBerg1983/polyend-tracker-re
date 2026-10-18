@@ -71,10 +71,12 @@ TEST(project_pattern_names_recents_via_storage) {
     static Pattern a, b;
     a.setDefault();
     a.tracks[11].steps[127].note = 99;
+    a.tracks[15].steps[3].note = 77;
     CHECK(savePatternFile(fs, "Workspace/patterns/pattern_01.mtp", a) == FmtStatus::Ok);
-    CHECK_EQ(fs.files["Workspace/patterns/pattern_01.mtp"].size(), size_t(0x242C));
+    CHECK_EQ(fs.files["Workspace/patterns/pattern_01.mtp"].size(), size_t(0x3030));   // Tracker Mini layout
     CHECK(loadPatternFile(fs, "Workspace/patterns/pattern_01.mtp", b) == FmtStatus::Ok);
     CHECK_EQ(b.tracks[11].steps[127].note, 99);
+    CHECK_EQ(b.tracks[15].steps[3].note, 77);
 
     static PatternNames n, m;
     n.set(2, "Verse");

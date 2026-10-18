@@ -28,6 +28,9 @@
 //
 // Scene file (one directive per line, '#' starts a comment):
 //   stock Snapshot_001.png        reference image in --stock
+//   stock none                    no reference (2.x screens without a stock
+//                                 counterpart): self-consistency checks only;
+//                                 no REF self-test, 'diff' checks not allowed
 //   project NAME                  boot the stock project --projects/NAME
 //                                 (rest of the line; spaces allowed)
 //   script                        sim script lines until 'end'; a trailing
@@ -307,6 +310,12 @@ bool parseScene(const fs::path& path, Scene& sc) {
     }
     if (inScript) return err("script without end");
     if (sc.stock.empty()) return err("no 'stock' line");
+    if (sc.stock == "none")
+        for (const Check& c : sc.checks)
+            if (c.kind == kDiff) {
+                line = c.line;
+                return err("'diff' needs a stock image");
+            }
     return true;
 }
 
@@ -632,7 +641,8 @@ int main(int argc, char** argv) {
         }
         if (!onlySet.empty() && !onlySet.count(sc.name)) continue;
         Image ref, im;
-        if (!loadAny((fs::path(stockDir) / sc.stock).string(), ref) || !ref.ok()) {
+        const bool noRef = sc.stock == "none";
+        if (!noRef && (!loadAny((fs::path(stockDir) / sc.stock).string(), ref) || !ref.ok())) {
             std::printf("%-14s %-24s %-9s %s\n", sc.name.c_str(), "*", "SKIP", "no stock image");
             continue;
         }
@@ -716,13 +726,13 @@ int main(int argc, char** argv) {
             for (size_t i : it->second) {
                 const Check& c = sc.checks[i];
                 std::string d;
-                if (!evaluate(c, ref, &ref, d)) {
+                if (!noRef && !evaluate(c, ref, &ref, d)) {
                     refBad = true;
                     detail = "REF " + c.text + " -> " + d;
                     std::fprintf(stderr, "%s:%d: check fails on the stock image: %s (%s)\n", sc.file.c_str(),
                                  c.line, c.text.c_str(), d.c_str());
                 }
-                result[i] = evaluate(c, im, &ref, d);
+                result[i] = evaluate(c, im, noRef ? nullptr : &ref, d);
                 if (result[i]) ++pass;
                 else {
                     if (!c.tags.count("font")) font = false;
@@ -752,7 +762,7 @@ int main(int argc, char** argv) {
             std::printf("%-14s %-24s %-9s %-5s %s%s\n", sc.name.c_str(), reg.c_str(), status, cnt, tags.c_str(),
                         detail.c_str());
         }
-        writeDiff(out / (sc.name + "-diff.png"), im, ref, sc.checks, result);
+        writeDiff(out / (sc.name + "-diff.png"), im, noRef ? im : ref, sc.checks, result);
         failRegions += sceneFail;
         failFont += sceneFont;
         failContent += sceneContent;

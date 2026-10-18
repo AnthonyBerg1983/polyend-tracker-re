@@ -44,7 +44,19 @@ enum SmallSymbol : uint8_t {
 
 #include "ui/fonts/font_data.h"
 
+// OT_FONTS_COMPRESSED (the firmware, Makefile): flash holds the image
+// zlib-compressed (kBlobZ, uploaded with CMD_INFLATE) and the pen advances
+// (kAdvance) only; the simulator and the host tests use the raw kBlob.
+#ifndef OT_FONTS_COMPRESSED
+#define OT_FONTS_COMPRESSED 0
+#endif
+#if OT_FONTS_COMPRESSED
+extern const uint8_t kBlobZ[];             // fonts.cpp (font_data_z.inc)
+extern const uint32_t kBlobZSize;
+extern const uint8_t kAdvance[10][128];    // fonts.cpp (font_adv.inc), [set * 5 + role]
+#else
 extern const uint8_t kBlob[kBlobSize];   // fonts.cpp (font_data.inc)
+#endif
 
 constexpr uint32_t kRamGEnd = kRamGBase + kBlobSize;
 constexpr uint32_t kMetricBytes = 148;
@@ -54,12 +66,18 @@ inline const FontInfo& info(int set, int role) {
     return kFonts[(set == 1) ? 1 : 0][(role >= 0 && role < 5) ? role : 0];
 }
 // Pen advance of character `ch` (metric block width table, 0 if no glyph).
+#if OT_FONTS_COMPRESSED
+inline uint8_t advance(const FontInfo& f, uint8_t ch) {
+    return ch < 128 ? kAdvance[&f - &kFonts[0][0]][ch] : 0;
+}
+#else
 inline uint8_t advance(const FontInfo& f, uint8_t ch) { return ch < 128 ? kBlob[f.metric + ch] : 0; }
 // Pointer to the L4 cell of `ch`, or nullptr outside first..126.
 inline const uint8_t* cell(const FontInfo& f, uint8_t ch) {
     if (ch < f.first || ch > 126) return nullptr;
     return kBlob + f.glyphs + uint32_t(ch - f.first) * f.stride * f.h;
 }
+#endif
 // RAM_G address of the cell of character 0 (BITMAP_SOURCE of the handle).
 inline uint32_t sourceAddr(const FontInfo& f) {
     return kRamGBase + f.glyphs - uint32_t(f.first) * f.stride * f.h;

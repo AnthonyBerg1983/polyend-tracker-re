@@ -13,6 +13,7 @@ static_assert(int(kIconCount) == int(fontdata::kIcons.count) && kIconSize == fon
 namespace {
 uint8_t gFontSet = 0;
 bool gCustomFonts = false;
+RomTextMode gRomTextMode = kRomGlyphs;
 
 // FT81x ROM font advance widths (chars 32..126) and cell heights for the
 // handles the UI uses; the same values as the simulator's ROM look-alikes
@@ -71,6 +72,8 @@ bool applyFontSet(IDisplay* d, uint8_t set) {
     return gCustomFonts;
 }
 bool customFontsBound() { return gCustomFonts; }
+void setRomTextMode(RomTextMode m) { gRomTextMode = m; }
+RomTextMode romTextMode() { return gRomTextMode; }
 
 uint8_t romFontFor(uint8_t role, uint8_t set) {
     if (role >= kFont1 && role <= kFontIcons) {
@@ -92,35 +95,38 @@ uint8_t romFontFor(uint8_t role) { return romFontFor(role, gFontSet); }
 
 void Gfx::beginFrame(uint32_t bg) {
     words_ = 0;
+    appended_ = 0;
+    capturesThisFrame_ = 0;
     dropped_ = 0;
     alpha_ = sentAlpha_ = 255;
     alphaDepth_ = 0;
     rectsOpen_ = false;
-    cur_ = 0xFFFFFFFF;
+    cur_ = kNoColor;
     bitmapsOpen_ = false;
     translate_ = 0;
-    d_.dlStart();
-    d_.clearColorRGB(uint8_t(bg >> 16), uint8_t(bg >> 8), uint8_t(bg));
-    d_.clear(true, true, true);
+    d_ = base_;
+    d_->dlStart();
+    d_->clearColorRGB(uint8_t(bg >> 16), uint8_t(bg >> 8), uint8_t(bg));
+    d_->clear(true, true, true);
     words_ += 2;
 }
 
 void Gfx::endFrame() {
     closePrim();
     translate(0);   // no pending COLOR_A: nothing draws with it any more
-    d_.swap();
+    d_->swap();
 }
 
 void Gfx::openBitmaps() {
     if (bitmapsOpen_) return;
-    d_.begin(IDisplay::kBitmaps);
+    d_->begin(IDisplay::kBitmaps);
     ++words_;
     bitmapsOpen_ = true;
 }
 
 void Gfx::closePrim() {
     if (!bitmapsOpen_) return;
-    d_.end();
+    d_->end();
     ++words_;
     bitmapsOpen_ = false;
 }
@@ -128,7 +134,7 @@ void Gfx::closePrim() {
 void Gfx::translate(int px) {
     if (px == translate_) return;
     translate_ = px;
-    d_.vertexTranslateX(int32_t(px) * 16);
+    d_->vertexTranslateX(int32_t(px) * 16);
     ++words_;
 }
 
@@ -142,7 +148,8 @@ bool Gfx::admit(uint32_t n) {
     if (skipLowDetail()) return false;
     // Sticky: once something was dropped the rest of the frame is too, so
     // state (scissor, context) never gets out of step with its primitives.
-    if (limit_ && (dropped_ || words_ + n + 3 + kLimitReserve > limit_)) {
+    // dlTotalWords(): appended RAM_G fragments (CMD_APPEND) fill RAM_DL too.
+    if (limit_ && (dropped_ || words_ + appended_ + n + 3 + kLimitReserve > limit_)) {
         ++dropped_;
         return false;
     }
@@ -156,7 +163,7 @@ void Gfx::alpha(uint8_t a) { alpha_ = a; }
 
 void Gfx::applyAlpha() {
     if (alpha_ == sentAlpha_) return;
-    d_.colorA(alpha_);
+    d_->colorA(alpha_);
     sentAlpha_ = alpha_;
     ++words_;
 }
@@ -164,7 +171,7 @@ void Gfx::applyAlpha() {
 void Gfx::lineWidth(uint16_t w16) {
     if (limit_ && dropped_) return;
     sync();
-    d_.lineWidth(w16);
+    d_->lineWidth(w16);
     ++words_;
 }
 
@@ -172,7 +179,7 @@ bool Gfx::saveContext(uint32_t groupWords) {
     if (!admit(groupWords + 2)) return false;
     sync();
     pushAlpha();
-    d_.saveContext();
+    d_->saveContext();
     ++words_;
     return true;
 }
@@ -180,10 +187,10 @@ bool Gfx::saveContext(uint32_t groupWords) {
 void Gfx::restoreContext() {
     // Always sent after an admitted saveContext (inside the reserve).
     sync();
-    d_.restoreContext();
+    d_->restoreContext();
     popAlpha();
     ++words_;
-    cur_ = 0xFFFFFFFF;
+    cur_ = kNoColor;
 }
 
 void Gfx::pushAlpha() {
@@ -195,10 +202,121 @@ void Gfx::popAlpha() {
     if (alphaDepth_ > 0 && --alphaDepth_ < kAlphaStack) sentAlpha_ = alphaStack_[alphaDepth_];
 }
 
+// ---------------------------------------------------------------------------
+// Cached fragments (gfx.h FragmentCache). Every path starts and ends a block
+// synced (sync()) with no known colour, so the inline, captured and appended
+// forms all emit the same graphics state.
+
+bool Gfx::probeBegin(uint8_t slot) {
+    sync();
+    if (!cache_ || !cache_->enabled || slot >= FragmentCache::kSlots || d_ != base_ ||
+        !base_->fragmentsSupported())
+        return false;
+    FragmentCache::Slot& s = cache_->slot[slot];
+    if (s.skip) {          // hot slot: inline without hashing
+        // Afterwards the probes decide again: a capture once kStableProbes
+        // agree, another skip period after kHotChanges changes.
+        if (--s.skip == 0) s.changes = 0;
+        ++cache_->skips;
+        cur_ = kNoColor;
+        return false;
+    }
+    hasher_.reset();
+    // The probe runs from the current state (words_ keeps counting, so the
+    // RAM_DL guard admits exactly what the inline draw would); probeEnd puts
+    // it back unless the stored fragment is appended.
+    saved_ = snapshot();
+    cur_ = kNoColor;
+    d_ = &hasher_;
+    return true;
+}
+
+Gfx::State Gfx::snapshot() const {
+    State st;
+    st.words = words_;
+    st.dropped = dropped_;
+    st.alpha = alpha_;
+    st.sentAlpha = sentAlpha_;
+    st.alphaDepth = alphaDepth_;
+    for (int i = 0; i < kAlphaStack; ++i) st.alphaStack[i] = alphaStack_[i];
+    st.rectsOpen = rectsOpen_;
+    return st;
+}
+
+void Gfx::restore(const State& st) {
+    words_ = st.words;
+    dropped_ = st.dropped;
+    alpha_ = st.alpha;
+    sentAlpha_ = st.sentAlpha;
+    alphaDepth_ = st.alphaDepth;
+    for (int i = 0; i < kAlphaStack; ++i) alphaStack_[i] = st.alphaStack[i];
+    rectsOpen_ = st.rectsOpen;
+}
+
+bool Gfx::probeEnd(uint8_t slot) {
+    FragmentCache::Slot& s = cache_->slot[slot];
+    d_ = base_;
+    cur_ = kNoColor;
+    const uint64_t h = hasher_.h;
+    // fragmentWords() == 0: the display lost the slot (e.g. a reset).
+    const uint32_t fw = s.has && s.stored == h ? base_->fragmentWords(slot) : 0;
+    if (fw) {
+        // The fragment is the probed stream: keep the probe's end state
+        // (alpha, guard drops), count the append instead of the inline words.
+        base_->fragmentAppend(slot);
+        words_ = saved_.words + 4;     // CMD_APPEND, ptr, num (+ END on the FT81x)
+        appended_ += fw;
+        s.changes = 0;
+        ++cache_->hits;
+        return true;
+    }
+    ++cache_->misses;
+    restore(saved_);
+    return false;
+}
+
+bool Gfx::captureBegin(uint8_t slot) {
+    FragmentCache::Slot& s = cache_->slot[slot];
+    const uint64_t h = hasher_.h;
+    // Capture only a block drawn identically in the last kStableProbes
+    // probed frames (a frame redrawn for another reason does not count as
+    // stable content) and that the display did not refuse before.
+    if (s.seen == h) {
+        if (s.stable < 255) ++s.stable;
+        s.changes = 0;
+    } else {
+        s.seen = h;
+        s.stable = 1;
+        if (s.changes < 255) ++s.changes;
+    }
+    const bool cap = s.stable >= FragmentCache::kStableProbes && s.refused != h &&
+                     capturesThisFrame_ < FragmentCache::kMaxCapturesPerFrame;
+    if (!cap && s.changes >= FragmentCache::kHotChanges) s.skip = FragmentCache::kHotSkip;
+    if (cap) {
+        s.has = false;
+        ++capturesThisFrame_;
+        base_->fragmentBegin(slot);
+    }
+    return cap;
+}
+
+void Gfx::captureEnd(uint8_t slot, bool captured) {
+    cur_ = kNoColor;
+    if (!captured) return;
+    FragmentCache::Slot& s = cache_->slot[slot];
+    if (base_->fragmentEnd(slot)) {
+        s.has = true;
+        s.stored = hasher_.h;
+        ++cache_->captures;
+    } else {
+        s.refused = hasher_.h;
+    }
+}
+
 void Gfx::color(uint32_t c) {
     if (c == cur_) return;
     cur_ = c;
-    d_.colorRGB(uint8_t(c >> 16), uint8_t(c >> 8), uint8_t(c));
+    d_->colorRGB(uint8_t(c >> 16), uint8_t(c >> 8), uint8_t(c));
     ++words_;
 }
 
@@ -206,7 +324,7 @@ void Gfx::fill(int x, int y, int w, int h, uint32_t c) {
     if (w <= 0 || h <= 0 || x >= kScreenW || y >= kScreenH || x + w <= 0 || y + h <= 0 || !admit(4)) return;
     sync();
     color(c);
-    d_.rect(int16_t(x), int16_t(y), int16_t(x + w - 1), int16_t(y + h - 1));
+    d_->rect(int16_t(x), int16_t(y), int16_t(x + w - 1), int16_t(y + h - 1));
     words_ += 4;
 }
 
@@ -222,7 +340,7 @@ void Gfx::rectsBegin(uint32_t c) {
     if (!rectsOpen_) return;
     sync();
     color(c);
-    d_.begin(IDisplay::kRects);
+    d_->begin(IDisplay::kRects);
     ++words_;
 }
 
@@ -231,15 +349,15 @@ void Gfx::rectsAdd(int x, int y, int w, int h) {
     if (!rectsOpen_) return;
     if (w > 0 && h > 0 && (x >= kScreenW || y >= kScreenH || x + w <= 0 || y + h <= 0)) return;
     if (!admit(2)) return;
-    d_.vertex2f(int32_t(x) * 16, int32_t(y) * 16);
-    d_.vertex2f(int32_t(x + w - 1) * 16, int32_t(y + h - 1) * 16);
+    d_->vertex2f(int32_t(x) * 16, int32_t(y) * 16);
+    d_->vertex2f(int32_t(x + w - 1) * 16, int32_t(y + h - 1) * 16);
     words_ += 2;
 }
 
 void Gfx::rectsEnd() {
     if (!rectsOpen_) return;
     rectsOpen_ = false;
-    d_.end();
+    d_->end();
     ++words_;
 }
 
@@ -249,11 +367,11 @@ void Gfx::point(int cx, int cy, float r, uint32_t c) {
     if (!admit(5)) return;
     sync();
     color(c);
-    d_.pointSize(uint16_t(r * 16.0f + 0.5f));
-    d_.begin(IDisplay::kPoints);
-    d_.vertex2f(int32_t(cx) * 16 + 8, int32_t(cy) * 16 + 8);
-    d_.end();
-    d_.pointSize(16);
+    d_->pointSize(uint16_t(r * 16.0f + 0.5f));
+    d_->begin(IDisplay::kPoints);
+    d_->vertex2f(int32_t(cx) * 16 + 8, int32_t(cy) * 16 + 8);
+    d_->end();
+    d_->pointSize(16);
     words_ += 5;
 }
 void Gfx::vline(int x, int y, int h, uint32_t c) { fill(x, y, 1, h, c); }
@@ -262,7 +380,7 @@ void Gfx::line(int x0, int y0, int x1, int y1, uint32_t c) {
     if (!admit(4)) return;
     sync();
     color(c);
-    d_.line(int16_t(x0), int16_t(y0), int16_t(x1), int16_t(y1));
+    d_->line(int16_t(x0), int16_t(y0), int16_t(x1), int16_t(y1));
     words_ += 4;
 }
 
@@ -270,7 +388,7 @@ void Gfx::text(int x, int y, uint8_t font, uint32_t c, const char* s, uint16_t o
     if (!s || !*s || !admit(4 + uint32_t(std::strlen(s)))) return;
     sync();   // CMD_TEXT draws in the current context (translate included)
     color(c);
-    d_.text(int16_t(x), int16_t(y), romFontFor(font), opt, s);
+    d_->text(int16_t(x), int16_t(y), romFontFor(font), opt, s);
     words_ += 4 + uint32_t(std::strlen(s));
 }
 
@@ -300,7 +418,34 @@ int fontHeight(uint8_t font) {
 
 void Gfx::glyphRun(int x, int y, uint8_t font, const char* s, uint32_t c, int adv) {
     if (!s || !*s) return;
-    if (!gCustomFonts) {
+    const uint8_t handle = romFontFor(font);
+    const fontdata::FontInfo* cf = customFont(handle);
+    // Without the custom fonts the run is drawn with the FT81x ROM font
+    // bitmaps (handles 16-31, cell = character code) and the romMetrics
+    // advances (docs/OPTIMIZATION_2X.md OP-6): one VERTEX2II per glyph
+    // instead of a CMD_TEXT (4 + n words) per run or per cell.
+    const bool rom = !gCustomFonts;
+    const bool romText = rom && gRomTextMode != kRomGlyphs;
+    auto drawable = [cf, rom](uint8_t ch) {
+        return ch < 127 && (rom ? ch > ' ' : ch != ' ' && (!cf || ch >= cf->first));
+    };
+    // One VERTEX_TRANSLATE_X for the whole run when its glyphs fit one
+    // 512-px window (the one in effect first): a run across x 512 (Pattern
+    // Fx1 cells of the third track) no longer toggles it twice per cell.
+    int lo = 912, hi = -1, first = 912;
+    for (int i = 0, pen = x; s[i]; ++i) {
+        if (drawable(uint8_t(s[i]))) {
+            if (pen < first) first = pen;
+            if (pen >= 0 && pen < 912) {
+                if (pen < lo) lo = pen;
+                hi = pen;
+            }
+        }
+        pen += adv > 0 ? adv : ot::textWidth(font, s + i, 1);
+    }
+    if (romText || (rom && (handle < 16 || handle > 31 || y < 0 || y > 511 || first < 0))) {
+        // Not a ROM font handle, or a glyph clipped at the top / left edge
+        // (VERTEX2II takes unsigned coordinates): the coprocessor's CMD_TEXT.
         if (adv <= 0) {
             text(x, y, font, c, s);
             return;
@@ -314,25 +459,11 @@ void Gfx::glyphRun(int x, int y, uint8_t font, const char* s, uint32_t c, int ad
         return;
     }
     if (y < 0 || y > 511 || !admit(2)) return;   // VERTEX2II y is 9 bits
-    const uint8_t handle = romFontFor(font);
     color(c);
     applyAlpha();
     openBitmaps();                         // shared with the previous run (closePrim ends it)
-    const fontdata::FontInfo* cf = customFont(handle);
-    auto drawable = [cf](uint8_t ch) { return ch != ' ' && ch < 127 && (!cf || ch >= cf->first); };
-    // One VERTEX_TRANSLATE_X for the whole run when its glyphs fit one
-    // 512-px window (the one in effect first): a run across x 512 (Pattern
-    // Fx1 cells of the third track) no longer toggles it twice per cell.
-    int lo = 912, hi = -1;
-    for (int i = 0, pen = x; s[i]; ++i) {
-        if (drawable(uint8_t(s[i])) && pen >= 0 && pen < 912) {
-            if (pen < lo) lo = pen;
-            hi = pen;
-        }
-        pen += adv > 0 ? adv : ot::textWidth(font, s + i, 1);
-    }
-    int base = -1;
     if (hi < 0) return;
+    int base = -1;
     if (lo >= translate_ && hi - translate_ <= 511) base = translate_;
     else if (hi <= 511) base = 0;
     else if (lo >= 400) base = 400;
@@ -343,7 +474,7 @@ void Gfx::glyphRun(int x, int y, uint8_t font, const char* s, uint32_t c, int ad
         if (drawable(ch) && pen >= 0 && pen < 912) {
             if (!admit(2)) return;
             translate(base >= 0 ? base : (pen < 512 ? 0 : 400));   // pen - base in 0..511 up to x = 911
-            d_.vertex2ii(uint16_t(pen - translate_), uint16_t(y), handle, uint8_t(ch & 0x7F));
+            d_->vertex2ii(uint16_t(pen - translate_), uint16_t(y), handle, uint8_t(ch & 0x7F));
             ++words_;
         }
         pen += step;
@@ -378,10 +509,10 @@ void Gfx::textRotated(int x, int y, uint8_t font, uint32_t c, const char* s, int
     if (!admit(14 + 2 * uint32_t(std::strlen(s)))) return;
     sync();   // the saved context (and the restored one) has translate 0
     color(c);
-    d_.saveContext();
-    d_.bitmapSize(handle, uint16_t(side ? H : cw), uint16_t(side ? cw : H));
-    d_.bitmapTransform(A, B, C, D, E, F);
-    d_.begin(IDisplay::kBitmaps);
+    d_->saveContext();
+    d_->bitmapSize(handle, uint16_t(side ? H : cw), uint16_t(side ? cw : H));
+    d_->bitmapTransform(A, B, C, D, E, F);
+    d_->begin(IDisplay::kBitmaps);
     words_ += 10;
     int base = 0;
     int pen = 0;
@@ -397,48 +528,48 @@ void Gfx::textRotated(int x, int y, uint8_t font, uint32_t c, const char* s, int
                 const int want = vx < 512 ? 0 : 400;
                 if (want != base) {
                     base = want;
-                    d_.vertexTranslateX(int32_t(base) * 16);
+                    d_->vertexTranslateX(int32_t(base) * 16);
                     ++words_;
                 }
-                d_.vertex2ii(uint16_t(vx - base), uint16_t(vy), handle, ch);
+                d_->vertex2ii(uint16_t(vx - base), uint16_t(vy), handle, ch);
                 ++words_;
             }
         }
         pen += step;
     }
-    d_.end();
-    d_.restoreContext();   // transform and translate
-    d_.bitmapSize(handle, cw, uint16_t(H));
+    d_->end();
+    d_->restoreContext();   // transform and translate
+    d_->bitmapSize(handle, cw, uint16_t(H));
     words_ += 4;
-    cur_ = 0xFFFFFFFF;
+    cur_ = kNoColor;
 }
 
 void Gfx::gradient(int x0, int y0, int x1, int y1, uint32_t c0, uint32_t c1) {
     if (lowDetail_ || !admit(5)) return;
     sync();
-    d_.gradient(int16_t(x0), int16_t(y0), c0 & 0xFFFFFFu, int16_t(x1), int16_t(y1), c1 & 0xFFFFFFu);
-    cur_ = 0xFFFFFFFF;   // fallback displays change COLOR_RGB
+    d_->gradient(int16_t(x0), int16_t(y0), c0 & 0xFFFFFFu, int16_t(x1), int16_t(y1), c1 & 0xFFFFFFu);
+    cur_ = kNoColor;   // fallback displays change COLOR_RGB
     words_ += 5;
 }
 
 void Gfx::gradientRect(int x, int y, int w, int h, uint32_t c0, uint32_t c1, bool vertical) {
     if (w <= 0 || h <= 0 || lowDetail_ || !admit(9)) return;
     sync();
-    d_.saveContext();
+    d_->saveContext();
     ++words_;
     clip(x, y, w, h);
     if (vertical) gradient(x, y, x, y + h - 1, c0, c1);
     else gradient(x, y, x + w - 1, y, c0, c1);
-    d_.restoreContext();
+    d_->restoreContext();
     ++words_;
-    cur_ = 0xFFFFFFFF;
+    cur_ = kNoColor;
 }
 
 void Gfx::hairline(int x0, int y0, int x1, int y1, uint32_t c) {
     if (!admit(6)) return;
-    d_.lineWidth(8);
+    d_->lineWidth(8);
     line(x0, y0, x1, y1, c);
-    d_.lineWidth(16);
+    d_->lineWidth(16);
     words_ += 2;
 }
 
@@ -454,9 +585,9 @@ void Gfx::roundRect(int x, int y, int w, int h, int r, uint32_t c) {
     // RECTS extend LINE_WIDTH - 1 px beyond their vertices (pixel centres).
     sync();
     color(c);
-    d_.lineWidth(uint16_t(r * 16));
-    d_.rect(int16_t(x + r - 1), int16_t(y + r - 1), int16_t(x + w - r), int16_t(y + h - r));
-    d_.lineWidth(16);
+    d_->lineWidth(uint16_t(r * 16));
+    d_->rect(int16_t(x + r - 1), int16_t(y + r - 1), int16_t(x + w - r), int16_t(y + h - r));
+    d_->lineWidth(16);
     words_ += 6;
 }
 
@@ -469,7 +600,7 @@ void Gfx::icon(int x, int y, IconId id, uint32_t c) {
         applyAlpha();
         openBitmaps();
         if (x < translate_ || x - translate_ > 511) translate(x < 512 ? 0 : 400);
-        d_.vertex2ii(uint16_t(x - translate_), uint16_t(y), IDisplay::kIconHandle, uint8_t(id));
+        d_->vertex2ii(uint16_t(x - translate_), uint16_t(y), IDisplay::kIconHandle, uint8_t(id));
         ++words_;
         return;
     }
@@ -506,11 +637,11 @@ void Gfx::icon(int x, int y, IconId id, uint32_t c) {
             if (!admit(5)) break;
             sync();
             color(c);
-            d_.pointSize(uint16_t(5 * 16));
-            d_.begin(IDisplay::kPoints);
-            d_.vertex2f(int32_t(x) * 16 + S * 8, int32_t(y) * 16 + S * 8);
-            d_.end();
-            d_.pointSize(16);
+            d_->pointSize(uint16_t(5 * 16));
+            d_->begin(IDisplay::kPoints);
+            d_->vertex2f(int32_t(x) * 16 + S * 8, int32_t(y) * 16 + S * 8);
+            d_->end();
+            d_->pointSize(16);
             words_ += 5;
             break;
         case kIconLoop:
@@ -542,8 +673,8 @@ void Gfx::textf(int x, int y, uint8_t font, uint32_t c, uint16_t opt, const char
 void Gfx::clip(int x, int y, int w, int h) {
     if (limit_ && dropped_) return;   // nothing follows it any more
     closePrim();   // the scissor is state, but keep primitives inside one clip
-    d_.scissorXY(uint16_t(x < 0 ? 0 : x), uint16_t(y < 0 ? 0 : y));
-    d_.scissorSize(uint16_t(w), uint16_t(h));
+    d_->scissorXY(uint16_t(x < 0 ? 0 : x), uint16_t(y < 0 ? 0 : y));
+    d_->scissorSize(uint16_t(w), uint16_t(h));
     words_ += 2;
 }
 

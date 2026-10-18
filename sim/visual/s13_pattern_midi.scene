@@ -6,7 +6,8 @@ project Jude Frankum - Chill Out Room
 script
   wait 300
   tap REC
-  tap RIGHT x44        # 11 tracks x 4 columns -> Midi 12, note column
+  tap RIGHT x11        # track 12 (Midi 12), note column (Right moves the track;
+                       # 2.x: x44 would now clamp at Midi 16)
 end
 region grid.tabs.midi
   fill 28 30 90 33 575757 3

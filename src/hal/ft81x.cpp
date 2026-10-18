@@ -4,8 +4,10 @@
 #include "diag.h"
 
 #include <Arduino.h>
+#include <DMAChannel.h>
 #include <string.h>
 #include "board.h"
+#include "dma_mem.h"
 #include "formats/crc32.h"
 #include "hw_math.h"
 #include "k66.h"
@@ -27,7 +29,9 @@ constexpr uint32_t REG_ID = 0x302000, REG_CPURESET = 0x302020, REG_HCYCLE = 0x30
 
 constexpr uint32_t CMD_DLSTART = 0xFFFFFF00, CMD_SWAP = 0xFFFFFF01, CMD_TEXT = 0xFFFFFF0C,
     CMD_NUMBER = 0xFFFFFF2E, CMD_SNAPSHOT2 = 0xFFFFFF37, CMD_LOADIMAGE = 0xFFFFFF24,
-    CMD_GETPROPS = 0xFFFFFF25, CMD_GRADIENT = 0xFFFFFF0B, CMD_SETFONT = 0xFFFFFF2B;
+    CMD_GETPROPS = 0xFFFFFF25, CMD_MEMCPY = 0xFFFFFF1D, CMD_APPEND = 0xFFFFFF1E, CMD_GRADIENT = 0xFFFFFF0B,
+    CMD_SETFONT = 0xFFFFFF2B, CMD_INFLATE = 0xFFFFFF22;
+constexpr uint32_t DL_END = 0x21000000;
 constexpr uint32_t OPT_NODL = 2;     // CMD_LOADIMAGE: no BITMAP_* display-list output
 constexpr uint32_t kFmtL4 = 2;       // FT81x bitmap format L4 (custom fonts, icons)
 constexpr uint32_t kFmtRgb565 = 7;   // FT81x bitmap format RGB565 (programmer guide BITMAP_LAYOUT)
@@ -52,7 +56,47 @@ static_assert(hw::spiSckHz(board::kBusHz, board::kSpi2CtarFast) <= 30000000, "FT
 // Host commands (FT81x datasheet §4.1.5, table 4-11).
 constexpr uint8_t HC_ACTIVE = 0x00, HC_CLKEXT = 0x44;
 
-inline void csLow() { digitalWriteFast(board::kTeensyFtCs, LOW); }
+// ---- SPI2 TX DMA (2.x performance workstream "SPI2 DMA") --------------------
+// Same scheme as the stock driver's NES upload (spec 01 §4.3): DMAMUX source
+// SPI2_TX, 8-bit beats into SPI2_PUSHR, RSER TFFF_RE | TFFF_DIRS. The CPU
+// sends the 3 address bytes, the DMA all data bytes but the last, and the CPU
+// the last one with EOQ, whose EOQF marks the end of the transfer before CS
+// rises (RX overflow is ignored: MCR ROOE = 0, the RX FIFO is flushed after).
+// A transfer is left running when flush() returns; the next SPI2 access
+// (csLow) completes it first, then writes the pending REG_CMD_WRITE.
+#ifndef OT_FT81X_DMA
+#define OT_FT81X_DMA 1
+#endif
+#ifndef OT_DMA_BUF
+#ifdef OT_DMA_MEM
+#define OT_DMA_BUF OT_DMA_MEM
+#else
+#define OT_DMA_BUF __attribute__((aligned(32)))
+#endif
+#endif
+constexpr uint32_t kDmaMinBytes = 16;     // shorter runs: CPU burst
+constexpr uint32_t kMcrRun = 0x801F0000;  // spec 01 §4.1 running MCR (master, PCSIS, ROOE = 0)
+constexpr uint32_t kDmaPollMax = 400000;  // >> 512 B at 30 MHz; a stuck DMA turns DMA off
+OT_DMA_BUF uint8_t gStage[2][512];        // Ft81xDisplay::kStage x 2 (the .dma section, dma_mem.h)
+DMAChannel gDma(false);
+bool gDmaReady = false;                   // channel allocated
+bool gDmaOff = OT_FT81X_DMA == 0;
+bool gDmaBusy = false;                    // transfer running, CS low
+bool gDmaFaulted = false;                 // set by a timeout; the driver resets the coprocessor
+uint8_t gDmaLast = 0;
+bool gDmaVerified = false;                // first transfer read back and compared
+uint32_t gDmaAddr = 0;
+const uint8_t* gDmaSrc = nullptr;
+uint32_t gDmaLen = 0;
+bool gPendingWp = false;
+uint16_t gPendingWpVal = 0;
+uint32_t gDmaFaultCount = 0;
+void dmaFinish();
+
+inline void csLow() {
+    if (gDmaBusy) dmaFinish();
+    digitalWriteFast(board::kTeensyFtCs, LOW);
+}
 inline void csHigh() { digitalWriteFast(board::kTeensyFtCs, HIGH); }
 
 // SPI2 has a 1-entry FIFO on the K66, so transfers are strictly byte-by-byte
@@ -134,7 +178,122 @@ void spiSetup(uint32_t ctar) {
     SPI2_CTAR0 = ctar;
     SPI2_MCR = 0x801F0000 | SPI_MCR_CLR_TXF | SPI_MCR_CLR_RXF;  // master, running
 }
+
+bool dmaSetup() {
+    if (gDmaReady) return true;
+    if (gDmaOff) return false;
+    SIM_SCGC6 |= SIM_SCGC6_DMAMUX;
+    SIM_SCGC7 |= SIM_SCGC7_DMA;
+    gDma.begin(true);
+    gDma.disable();
+    gDma.TCD->CSR = 0;
+    gDma.triggerAtHardwareEvent(DMAMUX_SOURCE_SPI2_TX);   // spec 01 §4.3: DMAMUX 0xA7, source 39
+    gDmaReady = true;
+    diagLogf("ft81x: SPI2 TX DMA on channel %u", unsigned(gDma.channel));
+    return true;
+}
+
+// Starts the write of p[0..n) to FT81x address a (n >= kDmaMinBytes); CS
+// stays low until dmaFinish().
+void dmaStart(uint32_t a, const uint8_t* p, uint32_t n) {
+    csLow();
+    addrWrite(a);   // polled: leaves the RX FIFO empty and the flags clear
+    SPI2_SR = SPI_SR_RFDF | SPI_SR_RFOF | SPI_SR_TCF | SPI_SR_TFFF | SPI_SR_EOQF;
+    gDmaLast = p[n - 1];
+    gDmaAddr = a;
+    gDmaSrc = p;
+    gDmaLen = n;
+    gDma.TCD->SADDR = p;
+    gDma.TCD->SOFF = 1;
+    gDma.TCD->ATTR = DMA_TCD_ATTR_SSIZE(0) | DMA_TCD_ATTR_DSIZE(0);
+    gDma.TCD->NBYTES_MLNO = 1;
+    gDma.TCD->SLAST = 0;
+    gDma.TCD->DADDR = reinterpret_cast<volatile uint8_t*>(&SPI2_PUSHR);
+    gDma.TCD->DOFF = 0;
+    gDma.TCD->CITER_ELINKNO = uint16_t(n - 1);
+    gDma.TCD->BITER_ELINKNO = uint16_t(n - 1);
+    gDma.TCD->DLASTSGA = 0;
+    gDma.TCD->CSR = DMA_TCD_CSR_DREQ;      // ERQ off at the end of the major loop
+    __asm__ volatile("dsb" ::: "memory");  // staged bytes in SRAM before the DMA reads them
+    gDmaBusy = true;
+    SPI2_RSER = SPI_RSER_TFFF_RE | SPI_RSER_TFFF_DIRS;
+    gDma.enable();
+}
+
+void dmaAbort() {
+    gDma.disable();
+    SPI2_RSER = 0;
+    gDma.clearComplete();
+    if (DMA_ERR & (1u << gDma.channel)) DMA_CERR = gDma.channel;
+    spiSetup(board::kSpi2CtarFast);
+    csHigh();
+    gDmaBusy = false;
+    gPendingWp = false;
+    gDmaOff = true;
+    gDmaFaulted = true;
+    ++gDmaFaultCount;
+}
+
+void dmaFinish() {
+    if (!gDmaBusy) return;
+    uint32_t n = 0;
+    while (!(gDma.TCD->CSR & DMA_TCD_CSR_DONE) && n < kDmaPollMax) {
+        if (DMA_ERR & (1u << gDma.channel)) { n = kDmaPollMax; break; }
+        ++n;
+    }
+    if (n >= kDmaPollMax) {
+        dmaAbort();
+        diagLog("ft81x: SPI2 DMA timeout/error, DMA off");
+        return;
+    }
+    gDma.clearComplete();
+    SPI2_RSER = 0;
+    // Last DMA byte left the TX FIFO, then the last byte with EOQ.
+    for (n = 0; (SPI2_SR & 0xF000u) && n < 20000; n++) {}
+    SPI2_SR = SPI_SR_EOQF;
+    SPI2_PUSHR = gDmaLast | SPI_PUSHR_EOQ | SPI_PUSHR_CTAS(0);
+    for (n = 0; !(SPI2_SR & SPI_SR_EOQF) && n < 20000; n++) {}
+    const bool eoq = (SPI2_SR & SPI_SR_EOQF) != 0;
+    SPI2_MCR = kMcrRun | SPI_MCR_CLR_RXF;  // drop the RX bytes nobody read
+    SPI2_SR = SPI_SR_EOQF | SPI_SR_RFDF | SPI_SR_RFOF | SPI_SR_TCF | SPI_SR_TFFF;   // EOQF clear restarts
+    csHigh();
+    gDmaBusy = false;
+    if (!eoq) {
+        dmaAbort();
+        diagLog("ft81x: SPI2 DMA end of queue missing, DMA off");
+        return;
+    }
+    if (!gDmaVerified) {
+        // Once per boot, before the coprocessor sees the data: read the
+        // segment back from RAM_CMD (UNVERIFIED path, spec 01 §4.3 only
+        // documents the stock NES upload) and fall back on any mismatch.
+        gDmaVerified = true;
+        uint8_t back[64];
+        const uint32_t m = gDmaLen < sizeof(back) ? gDmaLen : uint32_t(sizeof(back));
+        memRead(gDmaAddr, back, m);
+        if (memcmp(back, gDmaSrc, m) != 0) {
+            dmaAbort();
+            diagLog("ft81x: SPI2 DMA read-back mismatch, DMA off");
+            return;
+        }
+        diagLog("ft81x: SPI2 DMA read-back ok");
+    }
+    if (gPendingWp) {   // spec 01 §4.3: REG_CMD_WRITE after the data
+        gPendingWp = false;
+        const uint8_t b[2] = {uint8_t(gPendingWpVal), uint8_t(gPendingWpVal >> 8)};
+        memWrite(REG_CMD_WRITE, b, 2);
+    }
+}
+
+// RAM_CMD segment write: DMA (left running) or the CPU burst.
+void sendSegment(uint32_t a, const uint8_t* p, uint32_t n) {
+    if (n >= kDmaMinBytes && dmaSetup()) dmaStart(a, p, n);
+    else memWriteBurst(a, p, n);
+}
 }  // namespace
+
+bool Ft81xDisplay::dmaActive() { return gDmaReady && !gDmaOff; }
+uint32_t Ft81xDisplay::dmaFaults() { return gDmaFaultCount; }
 
 void Ft81xDisplay::wr8(uint32_t a, uint8_t v) { memWrite(a, &v, 1); }
 void Ft81xDisplay::wr16(uint32_t a, uint16_t v) {
@@ -257,6 +416,8 @@ bool Ft81xDisplay::init() {
     diagLog("ft81x: scan-out started, SPI fast");
     spiSetup(board::kSpi2CtarFast);
     wp_ = uint16_t(rd16(REG_CMD_WRITE) & 0xFFF);
+    stage_ = gStage[0];
+    stageHalf_ = 0;
     staged_ = 0;
     ok_ = true;
     diagLogf("ft81x: REG_CMD_WRITE 0x%03X, REG_ID 0x%02X", unsigned(wp_), unsigned(rd8(REG_ID)));
@@ -267,7 +428,19 @@ bool Ft81xDisplay::init() {
 bool Ft81xDisplay::uploadFonts() {
     // Both font sets and the icon sheet go to RAM_G once (spec 20 §2.1);
     // RAM_G survives coprocessor resets, only the handles are set up again.
+#if OT_FONTS_COMPRESSED
+    // 2.x flash budget: the image is stored zlib-compressed and inflated by
+    // the coprocessor (programmer guide CMD_INFLATE(ptr) + zlib stream,
+    // padded to 4 bytes). UNVERIFIED on hardware: any failure shows as a CRC
+    // mismatch below and the UI keeps the ROM fonts.
+    cmd(CMD_INFLATE);
+    cmd(kFontRamG);
+    cmdBytes(fontdata::kBlobZ, fontdata::kBlobZSize);
+    flush();
+    if (!waitIdleMs(kImageTimeoutMs)) return false;
+#else
     if (!writeRamG(kFontRamG, fontdata::kBlob, fontdata::kBlobSize)) return false;
+#endif
     uint8_t buf[256];
     uint32_t crc = crc32Init();
     for (uint32_t off = 0; off < fontdata::kBlobSize; off += sizeof(buf)) {
@@ -333,13 +506,20 @@ void Ft81xDisplay::displayOff() {
 
 void Ft81xDisplay::recoverCoprocessor() {
     // spec 01 §4.3 fault recovery
+    gPendingWp = false;   // the pointers are reset below
     wr8(REG_CPURESET, 1);
     wr16(REG_CMD_READ, 0);
     wr16(REG_CMD_WRITE, 0);
     wr8(REG_CPURESET, 0);
     wp_ = 0;
     staged_ = 0;
+    capSlot_ = -1;
+    invalidateFragments();   // a MEMCPY may not have run
     ++faults_;
+}
+
+void Ft81xDisplay::invalidateFragments() {
+    for (uint16_t& b : fragBytes_) b = 0;
 }
 
 bool Ft81xDisplay::waitIdleMs(uint32_t timeoutMs) {
@@ -367,8 +547,10 @@ bool Ft81xDisplay::waitIdle() {
 
 void Ft81xDisplay::flush() {
     // spec 01 §4.3: chunks wait for FIFO space, data at RAM_CMD + wp, then
-    // REG_CMD_WRITE. Per chunk the register traffic is 6 B (REG_CMD_READ) +
-    // 5 B (REG_CMD_WRITE) on the wire, counted into frameBytes_.
+    // REG_CMD_WRITE. The last DMA segment is still running on return; its
+    // REG_CMD_WRITE follows when it completes (dmaFinish). Per chunk the
+    // register traffic is 6 B (REG_CMD_READ) + 5 B (REG_CMD_WRITE) on the
+    // wire, counted into frameBytes_.
     if (!staged_) return;
     const uint32_t t0 = micros();
     uint32_t off = 0;
@@ -386,15 +568,30 @@ void Ft81xDisplay::flush() {
         uint32_t n = want < freeBytes ? want : (freeBytes & ~3u);
         uint32_t first = 4096u - wp_;
         if (first > n) first = n;
-        memWriteBurst(RAM_CMD + wp_, stage_ + off, first);
-        if (n > first) memWriteBurst(RAM_CMD, stage_ + off + first, n - first);
+        sendSegment(RAM_CMD + wp_, stage_ + off, first);
+        if (n > first) sendSegment(RAM_CMD, stage_ + off + first, n - first);
         frameBytes_ += n + 3u + (n > first ? 3u : 0u);
         wp_ = uint16_t((wp_ + n) & 0xFFF);
-        wr16(REG_CMD_WRITE, wp_);
+        if (gDmaBusy) {
+            gPendingWp = true;
+            gPendingWpVal = wp_;
+        } else {
+            wr16(REG_CMD_WRITE, wp_);
+        }
         frameBytes_ += 5;
         off += n;
+        if (gDmaFaulted) {   // the FIFO holds a partial command: start over
+            gDmaFaulted = false;
+            recoverCoprocessor();
+            return;
+        }
     }
     staged_ = 0;
+    // The DMA may still read this half: stage the next commands in the other.
+    if (gDmaBusy) {
+        stageHalf_ ^= 1;
+        stage_ = gStage[stageHalf_];
+    }
     uploadUs_ += micros() - t0;
 }
 
@@ -519,6 +716,14 @@ void Ft81xDisplay::swap() {
     cmd(DL_DISPLAY);
     cmd(CMD_SWAP);
     flush();
+    // Submit the frame now: flush() leaves its last DMA segment running and
+    // REG_CMD_WRITE for it pending until the next SPI2 access (csLow ->
+    // dmaFinish). Nothing else touches the display while the UI is not
+    // dirty, so the coprocessor would never see this frame's CMD_SWAP and
+    // the screen would keep the previous one (2.0.0 field bug: "Loading
+    // projects list" / boot progress popups stayed up after their job).
+    // The tail is at most kStage bytes (< 0.2 ms at 30 MHz).
+    if (gDmaBusy) dmaFinish();
     lastFrameBytes_ = frameBytes_;
     lastUploadUs_ = uploadUs_;
     lastFifoWaits_ = fifoWaits_;
@@ -537,6 +742,11 @@ bool Ft81xDisplay::frameReady() {
     // scanned out. Polling that condition here instead of spinning in
     // dlStart() keeps the main loop (input, MIDI, jobs) running meanwhile.
     if (!ok_) return true;
+    static_assert(sizeof(gStage[0]) == kStage, "staging halves");
+    if (gDmaFaulted) {
+        gDmaFaulted = false;
+        recoverCoprocessor();
+    }
     flush();
     const uint16_t rp = rd16(REG_CMD_READ);
     if (rp == 0xFFF) {
@@ -564,6 +774,57 @@ bool Ft81xDisplay::frameReady() {
     }
     if (ready) busySince_ = 0;
     return ready;
+}
+
+bool Ft81xDisplay::waitCoproc() {
+    for (uint32_t polls = 0; polls < 100000; polls++) {
+        const uint16_t rp = rd16(REG_CMD_READ);
+        if (rp == 0xFFF) break;
+        if (rp == wp_) return true;
+    }
+    recoverCoprocessor();
+    return false;
+}
+
+void Ft81xDisplay::fragmentBegin(uint8_t slot) {
+    if (!ok_ || slot >= IDisplay::kFragmentSlots || capSlot_ >= 0) return;
+    flush();
+    if (!waitCoproc()) return;
+    capStart_ = uint16_t(rd16(REG_CMD_DL) & 0x1FFF);
+    capSlot_ = int8_t(slot);
+}
+
+bool Ft81xDisplay::fragmentEnd(uint8_t slot) {
+    if (!ok_ || capSlot_ != int8_t(slot)) return false;
+    capSlot_ = -1;
+    fragBytes_[slot] = 0;
+    flush();
+    if (!waitCoproc()) return false;
+    const uint16_t end = uint16_t(rd16(REG_CMD_DL) & 0x1FFF);
+    if (end <= capStart_ || uint32_t(end - capStart_) > kFragSlotBytes) return false;
+    const uint32_t bytes = uint32_t(end - capStart_);
+    // programmer guide CMD_MEMCPY(dest, src, num): runs in FIFO order, after
+    // the captured commands and before anything that follows.
+    cmd(CMD_MEMCPY);
+    cmd(kFragRamG + uint32_t(slot) * kFragSlotBytes);
+    cmd(RAM_DL + capStart_);
+    cmd(bytes);
+    fragBytes_[slot] = uint16_t(bytes);
+    return true;
+}
+
+void Ft81xDisplay::fragmentAppend(uint8_t slot) {
+    if (!ok_ || slot >= IDisplay::kFragmentSlots || !fragBytes_[slot]) return;
+    // programmer guide CMD_APPEND(ptr, num); END afterwards so the
+    // coprocessor never assumes a primitive the fragment may have ended.
+    cmd(CMD_APPEND);
+    cmd(kFragRamG + uint32_t(slot) * kFragSlotBytes);
+    cmd(fragBytes_[slot]);
+    cmd(DL_END);
+}
+
+uint32_t Ft81xDisplay::fragmentWords(uint8_t slot) const {
+    return slot < IDisplay::kFragmentSlots ? fragBytes_[slot] / 4u : 0;
 }
 
 bool Ft81xDisplay::loadJpeg(uint32_t dest, IStorage& fs, const char* path, uint16_t maxW, uint16_t maxH,

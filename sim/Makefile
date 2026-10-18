@@ -84,9 +84,26 @@ check: $(BIN) $(JPEG_CHECK) visual-diff
 	rm -rf $(OUT)/check-sd $(OUT)/check-sd.eeprom
 	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(BIN) --sd $(OUT)/check-sd \
 	    --script scripts/smoke.txt --screenshot $(OUT)/smoke.png
+	# Display-list budget per screen + fragments-on/off pixel identity.
+	rm -rf $(OUT)/check-dl $(OUT)/check-dl.eeprom
+	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(BIN) --sd $(OUT)/check-dl \
+	    --script scripts/display_budget.txt
+	# 2.x USB Storage mode: script commands and the Config row drive the mode page.
+	rm -rf $(OUT)/check-usb $(OUT)/check-usb.eeprom
+	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(BIN) --sd $(OUT)/check-usb \
+	    --script scripts/usb_storage.txt
+	# 2.x test songs (TESTSONGS.md): each opens without errors and plays.
+	$(MAKE) testsongs-check
+
+# Generates the test songs this build supports and opens / plays each one in
+# the headless sim on a card with only Projects/<name> (tools/make_testsongs).
+TESTSONGS_SD := $(abspath $(OUT)/testsongs)
+testsongs-check: $(BIN)
+	$(MAKE) -C $(ROOT)/tools/make_testsongs run SD=$(TESTSONGS_SD)
+	sh $(ROOT)/tools/make_testsongs/sim_check.sh $(abspath $(BIN)) $(TESTSONGS_SD) $(abspath $(OUT)/testsongs-check)
 
 clean:
 	rm -rf $(OUT)
 
 -include $(CORE_OBJS:.o=.d) $(SIM_OBJS:.o=.d) $(JPEG_CHECK_OBJS:.o=.d) $(VISUAL_DIFF_OBJS:.o=.d)
-.PHONY: all clean fonts check visual-diff
+.PHONY: all clean fonts check visual-diff testsongs-check

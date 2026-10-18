@@ -145,3 +145,30 @@ TEST(undo_ring_depth) {
     CHECK(redone == 19);
     CHECK(cur.tracks[0].steps[0].note == 24);
 }
+
+// 2.x (2x-01 §2.5): paste reaches tracks 13..16 and clamps at track 16;
+// a sample cell pasted onto a MIDI track (9..16) drops its note.
+TEST(paste_over_16_tracks_clamps) {
+    std::vector<Pattern> buf(2);
+    Pattern& p = buf[0];
+    Pattern& clip = buf[1];
+    p.setDefault();
+    clip.setDefault();
+    for (int t = 0; t < 4; ++t) {
+        clip.tracks[t].steps[0].note = int8_t(50 + t);
+        clip.tracks[t].steps[0].instrument = uint8_t(t < 2 ? kFirstMidiInstrument + t : 3);
+    }
+    pops::paste(p, clip, rect(0, 0, 0, 3), 0, 13, ColMode::All, 0);
+    CHECK_EQ(int(p.tracks[13].steps[0].note), 50);
+    CHECK_EQ(int(p.tracks[14].steps[0].note), 51);
+    CHECK(p.tracks[15].steps[0].note == kNoteEmpty);   // sample instrument dropped on a MIDI track
+    CHECK(p.tracks[12].steps[0].note == kNoteEmpty);
+    // Clear / invert / insert accept rectangles up to 16 tracks wide.
+    pops::clearRect(p, rect(0, 0, 0, kTrackCount - 1), ColMode::All);
+    CHECK(p.tracks[14].steps[0].note == kNoteEmpty);
+    p.tracks[15].steps[0].note = 70;
+    pops::insertRows(p, rect(0, 0, 0, kTrackCount - 1));
+    CHECK_EQ(int(p.tracks[15].steps[1].note), 70);
+    pops::setLength(p, 16);
+    CHECK_EQ(int(p.tracks[15].lastStep), 15);
+}

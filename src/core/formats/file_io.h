@@ -35,8 +35,14 @@ bool savedInstrumentPath(char* out, size_t cap, const char* base, int instrument
 // Storage-level wrappers around the codecs.
 FmtStatus loadProjectFile(IStorage& fs, const char* path, Project& p, ProjectLoadInfo* info = nullptr);
 FmtStatus saveProjectFile(IStorage& fs, const char* path, const Project& p);
+// Pattern files (2.x): saved as the Tracker Mini 16-track layout (0x3030,
+// spec 21 §4.1); any size loads through decodePattern16 (§4.2 upgrades).
+// The PatternStock overloads drop / default tracks 12..15.
+FmtStatus loadPatternFile(IStorage& fs, const char* path, PatternStock& p, const PatternUpgradeContext* ctx = nullptr,
+                          PatternLoadInfo* info = nullptr);
 FmtStatus loadPatternFile(IStorage& fs, const char* path, Pattern& p, const PatternUpgradeContext* ctx = nullptr,
                           PatternLoadInfo* info = nullptr);
+FmtStatus savePatternFile(IStorage& fs, const char* path, const PatternStock& p);
 FmtStatus savePatternFile(IStorage& fs, const char* path, const Pattern& p);
 // Missing file -> a zeroed (all names empty) result and NotFound; the caller
 // may create it (spec 02 §5).

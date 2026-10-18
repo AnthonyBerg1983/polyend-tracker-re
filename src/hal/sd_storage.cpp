@@ -7,6 +7,7 @@
 #include <string.h>
 #include "board.h"
 #include "sdhc.h"
+#include "sdram_bss.h"
 
 extern "C" {
 #include "ff.h"
@@ -18,12 +19,15 @@ extern "C" {
 
 DSTATUS disk_status(BYTE pdrv) {
     if (pdrv != 0) return STA_NOINIT;
+    // USB storage mode: the computer owns the card (sdhc::Owner).
+    if (ot::hal::sdhc::owner() != ot::hal::sdhc::Owner::kApp) return STA_NOINIT;
     if (!ot::hal::sdhc::cardPresent()) return STA_NOINIT | STA_NODISK;
     return ot::hal::sdhc::ready() ? 0 : STA_NOINIT;
 }
 
 DSTATUS disk_initialize(BYTE pdrv) {
     if (pdrv != 0) return STA_NOINIT;
+    if (ot::hal::sdhc::owner() != ot::hal::sdhc::Owner::kApp) return STA_NOINIT;
     if (!ot::hal::sdhc::ready()) ot::hal::sdhc::init();
     return disk_status(pdrv);
 }
@@ -60,8 +64,58 @@ namespace hal {
 namespace {
 FATFS gFs;
 constexpr int kMaxFiles = 14;   // stem export keeps 11 WAVs open (spec 04 §6.1)
+#if defined(OT_USB_MSC) && OT_USB_MSC
+// 2.0.1 (USB Storage ring, board.h kSdBounceBytes): slot 0 stays in the SRAM
+// for the boot code (restore trigger, firmware info: one file at a time,
+// before the SDRAM is up); slots 1..13 live in `.sdram_bss` (main-loop file
+// I/O only; sdhc.cpp handles SDRAM buffers: direct ADMA2 with cache
+// maintenance when verified at boot, else the bounce buffer). They are
+// handed out only after otAppMain() cleared `.sdram_bss`
+// (SdStorage::enableSdramFiles()).
+constexpr int kSramFiles = 1;
+FIL gFilesLo[kSramFiles];
+OT_SDRAM_BSS FIL gFilesHi[kMaxFiles - kSramFiles];
+FIL& fil(int i) { return i < kSramFiles ? gFilesLo[i] : gFilesHi[i - kSramFiles]; }
+int gSlots = kSramFiles;
+#else
 FIL gFiles[kMaxFiles];
+FIL& fil(int i) { return gFiles[i]; }
+constexpr int gSlots = kMaxFiles;
+#endif
 bool gUsed[kMaxFiles];
+// FF_USE_FASTSEEK cluster link maps for read-only handles: a small static pool
+// (kClmtSlots x kClmtWords DWORDs = 1 KB SRAM). A table holds (kClmtWords-1)/2
+// fragments; a more fragmented file (FR_NOT_ENOUGH_CORE) or a full pool just
+// reads without a map (normal FAT chain walking).
+constexpr int kClmtSlots = 4;
+constexpr UINT kClmtWords = 64;
+DWORD gClmt[kClmtSlots][kClmtWords];
+int8_t gClmtOf[kMaxFiles];   // pool slot of a file handle, -1 = none (set on open)
+bool gClmtUsed[kClmtSlots];
+uint32_t gClmtMaps = 0, gClmtFallbacks = 0;
+
+void attachLinkMap(int file) {
+    gClmtOf[file] = -1;
+    int t = -1;
+    for (int i = 0; i < kClmtSlots; i++) if (!gClmtUsed[i]) { t = i; break; }
+    if (t < 0) { gClmtFallbacks++; return; }
+    FIL& f = fil(file);
+    gClmt[t][0] = kClmtWords;
+    f.cltbl = gClmt[t];
+    if (f_lseek(&f, CREATE_LINKMAP) != FR_OK) {   // too fragmented (or empty file): no map
+        f.cltbl = nullptr;
+        f_lseek(&f, 0);
+        gClmtFallbacks++;
+        return;
+    }
+    gClmtUsed[t] = true;
+    gClmtOf[file] = int8_t(t);
+    gClmtMaps++;
+}
+void detachLinkMap(int file) {
+    if (gClmtOf[file] >= 0) gClmtUsed[gClmtOf[file]] = false;
+    gClmtOf[file] = -1;
+}
 char gPath[FF_MAX_LFN + 4];
 
 // IStorage paths are relative to the card root; FatFs wants "/..." (no drive prefix needed).
@@ -76,9 +130,15 @@ const char* fix(const char* p) {
 }
 FIL* fileFor(IStorage::Handle h) {
     if (h < 0 || h >= kMaxFiles || !gUsed[h]) return nullptr;
-    return &gFiles[h];
+    return &fil(h);
 }
 }  // namespace
+
+void SdStorage::enableSdramFiles() {
+#if defined(OT_USB_MSC) && OT_USB_MSC
+    gSlots = kMaxFiles;
+#endif
+}
 
 bool SdStorage::mount() {
     if (storageMode_) return false;
@@ -100,9 +160,74 @@ bool SdStorage::mount() {
     return mounted_;
 }
 
+bool SdStorage::checkDirectDma(uint8_t* scratch) {
+    if (!mounted_) return false;
+    const bool on = sdhc::checkSdramDirect(scratch, uint32_t(gFs.fatbase));
+    diagLogf("sd: ADMA2 direct to SDRAM: read check %s -> reads %s (writes bounce until the first-write check)",
+             sdhc::directCheckName(sdhc::directCheck()), sdhc::sdramDirectRead() ? "direct" : "bounced");
+    return on;
+}
+
+namespace {
+bool gWriteCheckDone = false;   // at most one direct-write trial per boot
+}
+
+// Lazy direct-write check, before the first write sourced from SDRAM: up to
+// 4 KB of the caller's own data go to a FatFs temp file over the direct path,
+// are read back in 64-byte pieces (FatFs reads each sector into the FIL's own
+// SRAM buffer: the proven path), compared and the file is deleted. Uses a free
+// file slot, no new buffers and only ~100 B of stack. Never touches sectors
+// outside FatFs.
+void SdStorage::maybeCheckDirectWrite(const void* src, uint32_t len) {
+    if (gWriteCheckDone || !mounted_) return;
+    const uint32_t a = reinterpret_cast<uint32_t>(src);
+    const bool inSdram = a >= board::kSdramBase && a - board::kSdramBase < board::kSdramSize;
+    if (!inSdram || len < 512 || (a & 3u)) return;   // would bounce anyway; wait for a real candidate
+    gWriteCheckDone = true;
+    if (!board::kSdDirectWriteCheck || !sdhc::sdramDirectRead()) { sdhc::skipDirectWriteCheck(); return; }
+    static const char kTmp[] = "/OpenTracker/dmacheck.tmp";
+    int slot = -1;
+    for (int i = 0; i < gSlots; i++) if (!gUsed[i]) { slot = i; break; }
+    if (slot < 0) { gWriteCheckDone = false; return; }   // all slots busy: try at a later write
+    uint32_t n = len & ~511u;
+    if (n > 4096) n = 4096;
+    if (a - board::kSdramBase + n > board::kSdramSize) n = (board::kSdramBase + board::kSdramSize - a) & ~511u;
+    f_mkdir("/OpenTracker");                         // FR_EXIST is fine
+    FIL& f = fil(slot);                              // not marked used: never visible to callers
+    bool ok = f_open(&f, kTmp, FA_WRITE | FA_CREATE_ALWAYS) == FR_OK;
+    bool used = false;
+    if (ok) {
+        const uint32_t before = sdhc::counters().direct;
+        sdhc::beginDirectWriteTrial();
+        UINT bw = 0;
+        ok = f_write(&f, src, n, &bw) == FR_OK && bw == n;
+        used = sdhc::counters().direct != before;
+        sdhc::endDirectWriteTrial(false);            // read back through the proven path first
+        ok = (f_close(&f) == FR_OK) && ok;
+    }
+    if (ok && f_open(&f, kTmp, FA_READ | FA_OPEN_EXISTING) == FR_OK) {
+        uint8_t piece[64];                           // < 512 B: FatFs goes through f.buf
+        const uint8_t* p = static_cast<const uint8_t*>(src);
+        for (uint32_t off = 0; ok && off < n; off += sizeof piece) {
+            UINT br = 0;
+            ok = f_read(&f, piece, sizeof piece, &br) == FR_OK && br == sizeof piece &&
+                 memcmp(piece, p + off, sizeof piece) == 0;
+        }
+        f_close(&f);
+    } else {
+        ok = false;
+    }
+    f_unlink(kTmp);
+    sdhc::endDirectWriteTrial(ok && used);
+    diagLogf("sd: ADMA2 direct from SDRAM: write check %s (%lu B via %s, temp file) -> writes %s",
+             sdhc::directCheckName(sdhc::directWriteCheck()), static_cast<unsigned long>(n),
+             used ? "direct path" : "bounce only", sdhc::sdramDirectWrite() ? "direct" : "bounced");
+}
+
 void SdStorage::unmount() {
     for (int i = 0; i < kMaxFiles; i++) {
-        if (gUsed[i] && mounted_) f_close(&gFiles[i]);
+        if (gUsed[i] && mounted_) f_close(&fil(i));
+        if (gUsed[i]) detachLinkMap(i);
         gUsed[i] = false;
     }
     if (mounted_) f_mount(nullptr, "", 0);
@@ -110,8 +235,30 @@ void SdStorage::unmount() {
     sdhc::release();
 }
 
+bool SdStorage::fatInfo(FatInfo* out) const {
+    *out = FatInfo{};
+    if (!mounted_ || !gFs.fs_type) return false;
+    switch (gFs.fs_type) {
+    case FS_FAT12: out->type = 12; break;
+    case FS_FAT16: out->type = 16; break;
+    case FS_FAT32: out->type = 32; break;
+    default: out->type = 64; break;
+    }
+    out->fats = gFs.n_fats;
+    out->fsinfo = gFs.fs_type == FS_FAT32 && !(gFs.fsi_flag & 0x80);
+    out->clusterBytes = uint32_t(gFs.csize) * 512u;
+    out->clusters = gFs.n_fatent - 2;
+    out->fatStart = uint32_t(gFs.fatbase);
+    out->fatSectors = gFs.fsize;
+    out->dataStart = uint32_t(gFs.database);
+    if (gFs.free_clst <= gFs.n_fatent - 2) out->freeClusters = gFs.free_clst;
+    return true;
+}
+
 void SdStorage::setStorageMode(bool on) {
-    // spec 01 §6.1: storage mode = release the card (physical hand-over unknown).
+    // spec 01 §6.1: storage mode = release the card. 2.x: usb_storage.cpp then
+    // gives it to the computer (sdhc::Owner::kHost); mount() is refused until
+    // the mode ends, and every IStorage call fails while unmounted.
     storageMode_ = on;
     if (on) unmount();
 }
@@ -130,7 +277,7 @@ void SdStorage::service() {
 IStorage::Handle SdStorage::open(const char* path, OpenMode mode) {
     if (!mounted_) return -1;
     int slot = -1;
-    for (int i = 0; i < kMaxFiles; i++) if (!gUsed[i]) { slot = i; break; }
+    for (int i = 0; i < gSlots; i++) if (!gUsed[i]) { slot = i; break; }
     if (slot < 0) return -1;
     BYTE m = 0;
     switch (mode) {
@@ -139,8 +286,9 @@ IStorage::Handle SdStorage::open(const char* path, OpenMode mode) {
     case kReadWrite: m = FA_READ | FA_WRITE | FA_OPEN_ALWAYS; break;
     default: return -1;
     }
-    if (f_open(&gFiles[slot], fix(path), m) != FR_OK) return -1;
+    if (f_open(&fil(slot), fix(path), m) != FR_OK) return -1;
     gUsed[slot] = true;
+    if (mode == kRead) attachLinkMap(slot); else gClmtOf[slot] = -1;
     return slot;
 }
 
@@ -154,6 +302,7 @@ int32_t SdStorage::read(Handle h, void* dst, uint32_t len) {
 int32_t SdStorage::write(Handle h, const void* src, uint32_t len) {
     FIL* f = fileFor(h);
     if (!f) return -1;
+    maybeCheckDirectWrite(src, len);
     UINT bw = 0;
     return f_write(f, src, len, &bw) == FR_OK ? int32_t(bw) : -1;
 }
@@ -172,6 +321,7 @@ void SdStorage::close(Handle h) {
     FIL* f = fileFor(h);
     if (!f) return;
     f_close(f);
+    detachLinkMap(h);
     gUsed[h] = false;
 }
 
@@ -206,6 +356,7 @@ bool SdStorage::benchmark(uint8_t* buf, uint32_t bufLen, uint32_t totalBytes, Be
     if (!mounted_ || !buf || bufLen < 512 || totalBytes < bufLen) return false;
     static const char kPath[] = "/OT_BENCH.TMP";
     FIL f;
+    maybeCheckDirectWrite(buf, bufLen);   // the selftest bench is the first SDRAM write there
     if (f_open(&f, kPath, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) return false;
     const uint32_t chunks = totalBytes / bufLen;
     bool ok = true;

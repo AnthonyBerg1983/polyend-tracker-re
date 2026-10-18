@@ -44,6 +44,9 @@
 //#include "HardwareSerial.h"
 #include "usb_mem.h"
 #include <string.h> // for memset
+#ifdef MSC_INTERFACE
+#include "usb_msc.h"   // OPENTRACKER PATCH (see PATCHES.txt)
+#endif
 
 // This code has a known bug with compiled with -O2 optimization on gcc 5.4.1
 // https://forum.pjrc.com/threads/53574-Teensyduino-1-43-Beta-2?p=186177&viewfull=1#post186177
@@ -174,6 +177,12 @@ static void endpoint0_transmit(const void *data, uint32_t len)
 
 static uint8_t reply_buffer[8];
 
+#ifdef MSC_INTERFACE
+// OPENTRACKER PATCH (see PATCHES.txt): bulk endpoint driver of the mass-storage
+// interface (usb_msc.h), kept in its own file for the host test.
+#include "usb_msc_impl.h"
+#endif // MSC_INTERFACE
+
 static void usb_setup(void)
 {
 	const uint8_t *data = NULL;
@@ -195,6 +204,10 @@ static void usb_setup(void)
 		cfg = usb_endpoint_config_table;
 		// clear all BDT entries, free any allocated memory...
 		for (i=4; i < (NUM_ENDPOINTS+1)*4; i++) {
+#ifdef MSC_INTERFACE
+			// OPENTRACKER PATCH: MSC BDTs point into caller buffers, not usb_malloc() packets.
+			if ((i >> 2) == MSC_TX_ENDPOINT || (i >> 2) == MSC_RX_ENDPOINT) continue;
+#endif
 			if (table[i].desc & BDT_OWN) {
 				usb_free((usb_packet_t *)((uint8_t *)(table[i].addr) - 8));
 			}
@@ -245,6 +258,11 @@ static void usb_setup(void)
 				table[index(i, RX, ODD)].desc = (AUDIO_RX_SIZE<<16) | BDT_OWN;
 			} else
 #endif
+#ifdef MSC_INTERFACE
+			if (i == MSC_RX_ENDPOINT) {
+				// OPENTRACKER PATCH: armed by usb_msc_configure() below.
+			} else
+#endif
 			if (epconf & USB_ENDPT_EPRXEN) {
 				usb_packet_t *p;
 				p = usb_malloc();
@@ -273,6 +291,9 @@ static void usb_setup(void)
 			}
 #endif
 		}
+#ifdef MSC_INTERFACE
+		usb_msc_configure();   // OPENTRACKER PATCH
+#endif
 		break;
 	  case 0x0880: // GET_CONFIGURATION
 		reply_buffer[0] = usb_configuration;
@@ -307,6 +328,11 @@ static void usb_setup(void)
 		}
 		(*(uint8_t *)(&USB0_ENDPT0 + i * 4)) &= ~0x02;
 		// TODO: do we need to clear the data toggle here?
+#ifdef MSC_INTERFACE
+		// OPENTRACKER PATCH: the MSC endpoints restart at DATA0 (USB 2.0 9.4.5).
+		if (i == MSC_TX_ENDPOINT && (setup.wIndex & 0x80)) usb_msc_clear_halt(1);
+		if (i == MSC_RX_ENDPOINT && !(setup.wIndex & 0x80)) usb_msc_clear_halt(0);
+#endif
 		break;
 	  case 0x0302: // SET_FEATURE (endpoint)
 		i = setup.wIndex & 0x7F;
@@ -499,6 +525,25 @@ static void usb_setup(void)
 			endpoint0_stall();
 			return;
 		}
+		break;
+#endif
+#ifdef MSC_INTERFACE
+	  // OPENTRACKER PATCH: Bulk-Only Transport class requests (BOT 3.1 / 3.2).
+	  case 0xFF21: // Bulk-Only Mass Storage Reset
+		if (setup.wIndex != MSC_INTERFACE || setup.wValue != 0 || setup.wLength != 0) {
+			endpoint0_stall();
+			return;
+		}
+		usb_msc_class_reset();
+		break;
+	  case 0xFEA1: // Get Max LUN
+		if (setup.wIndex != MSC_INTERFACE || setup.wValue != 0 || setup.wLength != 1) {
+			endpoint0_stall();
+			return;
+		}
+		reply_buffer[0] = 0;   // one logical unit
+		data = reply_buffer;
+		datalen = 1;
 		break;
 #endif
 	  default:
@@ -799,6 +844,9 @@ void usb_rx_memory(usb_packet_t *packet)
 #ifdef AUDIO_INTERFACE
 		if (i == AUDIO_RX_ENDPOINT) continue;
 #endif
+#ifdef MSC_INTERFACE
+		if (i == MSC_RX_ENDPOINT) { cfg++; continue; }   // OPENTRACKER PATCH
+#endif
 		if (*cfg++ & USB_ENDPT_EPRXEN) {
 			if (table[index(i, RX, EVEN)].desc == 0) {
 				table[index(i, RX, EVEN)].addr = packet->buf;
@@ -915,6 +963,12 @@ void usb_isr(void)
 	//status = USB0_ISTAT;
 	//serial_phex(status);
 	//serial_print("\n");
+#ifdef MSC_INTERFACE
+	if (msc_kicked) {   // OPENTRACKER PATCH: usb_msc_kick()
+		msc_kicked = 0;
+		if (usb_configuration) msc_event(USB_MSC_EVENT_POLL);
+	}
+#endif
 	restart:
 	status = USB0_ISTAT;
 
@@ -962,6 +1016,9 @@ void usb_isr(void)
 #ifdef MULTITOUCH_INTERFACE
 			usb_touchscreen_update_callback();
 #endif
+#ifdef MSC_INTERFACE
+			usb_msc_sof();   // OPENTRACKER PATCH
+#endif
 		}
 		USB0_ISTAT = USB_ISTAT_SOFTOK;
 	}
@@ -976,6 +1033,10 @@ void usb_isr(void)
 		endpoint = stat >> 4;
 		if (endpoint == 0) {
 			usb_control(stat);
+#ifdef MSC_INTERFACE
+		} else if (endpoint == MSC_TX_ENDPOINT || endpoint == MSC_RX_ENDPOINT) {
+			usb_msc_token(stat);   // OPENTRACKER PATCH
+#endif
 		} else {
 			bdt_t *b = stat2bufferdescriptor(stat);
 			usb_packet_t *packet = (usb_packet_t *)((uint8_t *)(b->addr) - 8);
@@ -1110,6 +1171,9 @@ void usb_isr(void)
 		// initialize BDT toggle bits
 		USB0_CTL = USB_CTL_ODDRST;
 		ep0_tx_bdt_bank = 0;
+#ifdef MSC_INTERFACE
+		usb_msc_bus_reset();   // OPENTRACKER PATCH
+#endif
 
 		// set up buffers to receive Setup and OUT packets
 		table[index(0, RX, EVEN)].desc = BDT_DESC(EP0_SIZE, 0);

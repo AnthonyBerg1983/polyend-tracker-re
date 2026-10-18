@@ -8,6 +8,7 @@
 // See sim/README.md for the key map and the script language.
 #include <SDL.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include "host_hal.h"
 #include "host_midi.h"
 #include "host_storage.h"
+#include "sim_usb_storage.h"
 #include "panel.h"
 #include "png.h"
 #include "sdl_audio.h"
@@ -40,6 +42,8 @@ struct Options {
     std::string sd;
     int scale = 1;
     bool lineIn = false, noAudio = false, noMidi = false, demo = false, panelShot = false;
+    bool romFonts = false, romText = false;   // OP-6 checks (also OT_SIM_ROM_FONTS / OT_SIM_ROM_TEXT = 1)
+    bool busyDisplay = true;                  // FT81x pacing model (off: --instant-display / OT_SIM_BUSY = 0)
     std::string script, screenshot, wav;
     float lineInTone = 0.0f;   // headless: synthetic line input (Hz), 0 = none
     long quitAfterMs = -1;
@@ -60,7 +64,11 @@ void usage() {
         "  --screenshot PNG  save the framebuffer at the end\n"
         "  --panel           screenshots include the whole front panel\n"
         "  --wav OUT.wav     record the rendered audio\n"
-        "  --line-in-tone HZ synthetic line input: tone bursts (recorder tests)\n");
+        "  --line-in-tone HZ synthetic line input: tone bursts (recorder tests)\n"
+        "  --rom-fonts       never bind the custom fonts (FT81x ROM font fallback)\n"
+        "  --rom-text        ROM fallback text as CMD_TEXT (per glyph at the grid pitch), not VERTEX2II\n"
+        "  --instant-display show every frame at once, frameReady() always true (default: the FT81x\n"
+        "                    frame pacing model -- upload time, shown at the 54 Hz vsync)\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& o) {
@@ -79,6 +87,9 @@ bool parseArgs(int argc, char** argv, Options& o) {
         if (a == "--no-midi") { o.noMidi = true; continue; }
         if (a == "--demo") { o.demo = true; continue; }
         if (a == "--panel") { o.panelShot = true; continue; }
+        if (a == "--rom-fonts") { o.romFonts = true; continue; }
+        if (a == "--rom-text") { o.romText = true; continue; }
+        if (a == "--instant-display") { o.busyDisplay = false; continue; }
         if (a == "--script" && next(o.script)) continue;
         if (a == "--screenshot" && next(o.screenshot)) continue;
         if (a == "--wav" && next(o.wav)) continue;
@@ -89,6 +100,11 @@ bool parseArgs(int argc, char** argv, Options& o) {
         usage();
         return false;
     }
+    // The visual-diff tool starts the simulator itself: the environment
+    // selects the ROM font modes for all its scenes.
+    if (const char* e = std::getenv("OT_SIM_ROM_FONTS")) o.romFonts = o.romFonts || std::atoi(e) == 1;
+    if (const char* e = std::getenv("OT_SIM_BUSY")) o.busyDisplay = o.busyDisplay && std::atoi(e) != 0;
+    if (const char* e = std::getenv("OT_SIM_ROM_TEXT")) o.romText = o.romText || std::atoi(e) == 1;
     if (o.sd.empty()) {
         const char* home = std::getenv("HOME");
         o.sd = std::string(home ? home : ".") + "/.opentracker-sd";
@@ -105,6 +121,7 @@ struct Machine {
     SimInput input{clock};
     SimLeds leds;
     HostStorage storage;
+    SimUsbStorage usbStorage{storage};
     HostMidi midi;
     SdlAudio sdlAudio;
     ManualAudio manualAudio;
@@ -130,7 +147,10 @@ struct Machine {
     // App and its large buffers (SDRAM on the device).
     std::unique_ptr<ot::App> app;
     std::vector<int16_t> sampleBank, fxMemory;
-    std::unique_ptr<ot::Pattern[]> patterns, undo, fileUndo, clipboard;
+    std::unique_ptr<ot::PatternStock[]> patterns;
+    std::unique_ptr<ot::Pattern[]> undo, fileUndo, clipboard, seqBuffers;
+    std::vector<ot::Track> extTracks;
+    std::vector<uint8_t> extMeta;
     uint8_t undoNums[20] = {}, fileUndoNums[10] = {};
     std::vector<uint8_t> scratch;
     std::unique_ptr<ot::PerfPatternMemory> perfPatterns;
@@ -161,7 +181,10 @@ struct Machine {
 
         sampleBank.assign(ot::kSampleBankBytes / 2, 0);
         fxMemory.assign(ot::audio::AudioEngine::kFxMemorySamples, 0);
-        patterns.reset(new ot::Pattern[ot::kPatternCount]);
+        patterns.reset(new ot::PatternStock[ot::kPatternCount]);
+        seqBuffers.reset(new ot::Pattern[3]);   // current, preload, switch stage
+        extTracks.assign(ot::ExtTrackPool::kDefaultBlocks + 1, ot::Track{});
+        extMeta.assign(ot::ExtTrackPool::metaBytes(ot::ExtTrackPool::kDefaultBlocks), 0);
         undo.reset(new ot::Pattern[20]);
         fileUndo.reset(new ot::Pattern[10]);
         clipboard.reset(new ot::Pattern[1]);
@@ -180,6 +203,7 @@ struct Machine {
         h.leds = &leds;
         h.clock = &clock;
         h.nvstore = &nvstore;
+        h.usbStorage = &usbStorage;   // 2.x USB Storage mode (no real USB in the sim)
         if (audio == &sdlAudio) {
             // Line-in goes through the engine (spec 04 §1.3 IG/CHMODE).
             h.lineIn = [](void* c) { return static_cast<SdlAudio*>(c)->lineIn(); };
@@ -199,6 +223,11 @@ struct Machine {
         m.fxMemory = fxMemory.data();
         m.fxSamples = uint32_t(fxMemory.size());
         m.patterns = patterns.get();
+        m.seqBuffers = seqBuffers.get();
+        m.seqStage = seqBuffers.get() + 2;
+        m.extTracks = extTracks.data();
+        m.extTrackBlocks = int(extTracks.size());
+        m.extMeta = extMeta.data();
         m.undo = undo.get();
         m.undoNums = undoNums;
         m.undoSlots = 20;      // spec 05 §5.1
@@ -359,10 +388,123 @@ void saveShot(Machine& m, const std::string& path, bool panel) {
 // ---------------------------------------------------------------------------
 // Headless script runner (virtual time; audio blocks pulled every 128 frames).
 
+// Every Ui::notify() text since the last check (expect-open-ok).
+std::vector<std::string> gNotices;
+void recordNotice(const char* text) { gNotices.push_back(text); }
+
 struct Headless {
     Machine& m;
     bool panel;
     uint64_t frameAcc = 0;   // frames * 1000
+    // Display budget (2.x performance workstream): the largest per-frame
+    // command-FIFO upload since the last "budget" / "budget-reset".
+    uint32_t seenFrames = 0, maxUpload = 0, maxDl = 0, budgetFrames = 0;
+
+    void sampleFrame() {
+        if (!m.app || m.app->ui.frames() == seenFrames) return;
+        seenFrames = m.app->ui.frames();
+        ++budgetFrames;
+        maxUpload = std::max(maxUpload, m.app->ui.lastUploadWords());
+        maxDl = std::max(maxDl, m.app->ui.lastDlWords());
+    }
+
+    // budget NAME MAXWORDS: fail when a frame since the last reset uploaded
+    // more than MAXWORDS display-list words (or the RAM_DL total passed 2000).
+    bool budget(const std::string& name, long maxWords, int line) {
+        // A screen at rest draws nothing: redraw it until its cached blocks
+        // are captured, then measure one more redraw (the steady state of a
+        // change that does not touch the static blocks).
+        if (m.app && budgetFrames < 4) {
+            for (int i = 0; i < 4; ++i) {
+                m.app->ui.dirty();
+                advance(20);
+            }
+            maxUpload = maxDl = budgetFrames = 0;
+            m.app->ui.dirty();
+            advance(20);
+        }
+        const bool ok = budgetFrames > 0 && long(maxUpload) <= maxWords && maxDl <= 2000;
+        std::fprintf(stderr, "budget %-18s %4u words max (budget %4ld), RAM_DL %4u, %u frames%s\n", name.c_str(),
+                     unsigned(maxUpload), maxWords, unsigned(maxDl), unsigned(budgetFrames),
+                     ok ? "" : "  <-- OVER BUDGET");
+        if (!ok) std::fprintf(stderr, "script:%d: display budget exceeded for %s\n", line, name.c_str());
+        maxUpload = maxDl = budgetFrames = 0;
+        return ok;
+    }
+
+    // fragcheck NAME: the current screen drawn inline and through cached
+    // fragments (probe, capture, append) must give identical pixels.
+    bool fragCheck(const std::string& name, int line) {
+        if (!m.app) return true;
+        ot::Ui& ui = m.app->ui;
+        std::vector<uint32_t> a(800 * 480), b(800 * 480);
+        m.display.setFragments(false);
+        ui.render();
+        m.display.frontCopy(a.data());
+        const uint32_t inlineWords = ui.lastUploadWords();
+        m.display.setFragments(true);
+        ui.fragments.reset();
+        for (int i = 0; i < 4; ++i) ui.render();   // probes until stable, capture, append
+        m.display.frontCopy(b.data());
+        size_t bad = 0;
+        for (size_t i = 0; i < a.size(); ++i) bad += a[i] != b[i];
+        std::fprintf(stderr, "fragcheck %-15s inline %4u words, cached %4u words (%u appends)%s\n", name.c_str(),
+                     unsigned(inlineWords), unsigned(ui.lastUploadWords()), unsigned(m.display.lastFrameAppends()),
+                     bad ? "  <-- PIXELS DIFFER" : "");
+        if (bad) {
+            int x0 = 800, y0 = 480, x1 = -1, y1 = -1;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i] != b[i]) {
+                    const int x = int(i % 800), y = int(i / 800);
+                    x0 = std::min(x0, x); y0 = std::min(y0, y);
+                    x1 = std::max(x1, x); y1 = std::max(y1, y);
+                }
+            std::fprintf(stderr, "script:%d: %zu pixels differ with fragments on %s (box %d,%d..%d,%d)\n", line, bad,
+                         name.c_str(), x0, y0, x1, y1);
+        }
+        seenFrames = ui.frames();
+        return bad == 0;
+    }
+
+    // romcheck NAME (ROM fonts active): the current screen with the ROM-font
+    // runs as CMD_TEXT and as VERTEX2II glyphs (OP-6) must give identical
+    // pixels; prints both upload sizes.
+    bool romCheck(const std::string& name, int line) {
+        if (!m.app) return true;
+        ot::Ui& ui = m.app->ui;
+        if (ot::customFontsBound()) {
+            std::fprintf(stderr, "script:%d: romcheck needs 'romfonts on'\n", line);
+            return false;
+        }
+        std::vector<uint32_t> a(800 * 480), b(800 * 480);
+        m.display.setFragments(false);
+        ot::setRomTextMode(ot::kRomText);
+        ui.render();
+        m.display.frontCopy(a.data());
+        const uint32_t textWords = ui.lastUploadWords();
+        ot::setRomTextMode(ot::kRomGlyphs);
+        ui.render();
+        m.display.frontCopy(b.data());
+        const uint32_t glyphWords = ui.lastUploadWords();
+        m.display.setFragments(true);
+        size_t bad = 0;
+        for (size_t i = 0; i < a.size(); ++i) bad += a[i] != b[i];
+        std::fprintf(stderr, "romcheck %-16s CMD_TEXT %4u words, VERTEX2II %4u words%s\n", name.c_str(),
+                     unsigned(textWords), unsigned(glyphWords), bad ? "  <-- PIXELS DIFFER" : "");
+        if (bad) {
+            int x0 = 800, y0 = 480, x1 = -1, y1 = -1;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (a[i] != b[i]) {
+                    const int x = int(i % 800), y = int(i / 800);
+                    x0 = std::min(x0, x); y0 = std::min(y0, y);
+                    x1 = std::max(x1, x); y1 = std::max(y1, y);
+                }
+            std::fprintf(stderr, "script:%d: %zu pixels differ between ROM CMD_TEXT and VERTEX2II on %s (box %d,%d..%d,%d)\n",
+                         line, bad, name.c_str(), x0, y0, x1, y1);
+        }
+        seenFrames = ui.frames();
+        return bad == 0;
+    }
 
     void advance(long ms) {
         for (long i = 0; i < ms; ++i) {
@@ -373,6 +515,7 @@ struct Headless {
                 m.manualAudio.pull();
             }
             m.step();
+            sampleFrame();
         }
     }
 
@@ -387,6 +530,7 @@ struct Headless {
     }
 
     bool run(const std::string& path) {
+        if (m.app) m.app->ui.platform.notified = &recordNotice;
         std::ifstream f(path);
         if (!f) {
             std::fprintf(stderr, "cannot read script %s\n", path.c_str());
@@ -431,10 +575,54 @@ struct Headless {
                 saveShot(m, a1, panel);
             } else if (cmd == "panelshot") {
                 saveShot(m, a1, true);
+            } else if (cmd == "budget") {
+                if (!budget(a1, std::atol(a2.c_str()), line)) return false;
+            } else if (cmd == "budget-reset") {
+                maxUpload = maxDl = budgetFrames = 0;
+            } else if (cmd == "fragcheck") {
+                if (!fragCheck(a1, line)) return false;
+            } else if (cmd == "romfonts") {
+                // romfonts on|off: ROM font fallback (custom fonts unbound) or not.
+                if (m.app) {
+                    m.display.setRomFontsOnly(a1 != "off");
+                    m.app->applySequencerSettings();   // applyFontSet()
+                    m.app->ui.dirty();
+                }
+                advance(1);
+            } else if (cmd == "romcheck") {
+                if (!romCheck(a1, line)) return false;
             } else if (cmd == "usbstorage") {
-                // Interface event 10 (spec 01 §6.1): no stock trigger is known.
+                // Interface event 10 (spec 01 §6.1); 2.x: the USB Storage mode
+                // (Config > USB > USB Storage), the card locked while it is on.
                 if (m.app) m.app->ui.setUsbStorageMode(a1 != "off");
                 advance(1);
+            } else if (cmd == "usbhost") {
+                // usbhost none|waiting|inuse|ejected: what the "computer" does.
+                using H = ot::IUsbStorage::Host;
+                m.usbStorage.setHost(a1 == "waiting" ? H::kWaiting
+                                     : a1 == "inuse" ? H::kInUse
+                                     : a1 == "ejected" ? H::kEjected
+                                                       : H::kNoUsb);
+                advance(1);
+            } else if (cmd == "expect-usbstorage") {
+                // expect-usbstorage on|off: mode, page and card lock agree; no
+                // app access reached the card while it was locked.
+                const bool want = a1 != "off";
+                const bool mode = m.app && m.app->usbStorageActive();
+                const bool page = m.app && m.app->ui.usbStorageMode();
+                if (mode != want || page != want || m.storage.locked() != want || m.storage.lockedAccess() != 0) {
+                    std::fprintf(stderr, "script:%d: usb storage mode %d page %d card locked %d (%d refused accesses), want %d\n",
+                                 line, int(mode), int(page), int(m.storage.locked()), m.storage.lockedAccess(), int(want));
+                    return false;
+                }
+            } else if (cmd == "expect-usbwarn") {
+                // expect-usbwarn on|off: the mode page shows the eject reminder.
+                const bool want = a1 != "off";
+                const bool got = m.app && m.app->ui.usb.ejectWarningShown();
+                if (got != want) {
+                    std::fprintf(stderr, "script:%d: eject reminder %d, want %d\n", line, int(got), int(want));
+                    return false;
+                }
             } else if (cmd == "theme" || cmd == "font") {
                 // Display theme 0..2 / font set 0..1 (config "Display theme" /
                 // "Display font") without the Config key flow; visual scenes.
@@ -445,6 +633,47 @@ struct Headless {
                     m.app->ui.dirty();
                 }
                 advance(1);
+            } else if (cmd == "expect-open-ok") {
+                // The last project job finished without errors, no popup is
+                // open, and no notice other than "Project opened" was shown
+                // since the script start / the last expect-open-ok (load
+                // notices: unreadable files, damaged or too large synth patches,
+                // track memory full). Test songs, TESTSONGS.md.
+                std::string extra;
+                for (const std::string& n : gNotices)
+                    if (n != "Project opened") extra += (extra.empty() ? "" : "; ") + n;
+                gNotices.clear();
+                if (!m.app || m.app->jobBusy() || !m.app->lastJobOk() || m.app->lastJobErrors() ||
+                    m.app->ui.askOpen() || m.app->extPoolFullEvents() || !extra.empty()) {
+                    std::fprintf(stderr, "script:%d: project job failed or left a notice (ok %d, errors %d) %s\n", line,
+                                 m.app ? int(m.app->lastJobOk()) : 0, m.app ? m.app->lastJobErrors() : -1,
+                                 extra.c_str());
+                    return false;
+                }
+            } else if (cmd == "expect-project") {
+                const std::string want = lineStr.substr(lineStr.find(a1));
+                std::string w = want;
+                while (!w.empty() && (w.back() == ' ' || w.back() == '\r')) w.pop_back();
+                if (!m.app || w != m.app->project.name) {
+                    std::fprintf(stderr, "script:%d: project is \"%s\", want \"%s\"\n", line,
+                                 m.app ? m.app->project.name : "", w.c_str());
+                    return false;
+                }
+            } else if (cmd == "expect-playing") {
+                if (!m.app || !m.app->seq.isPlaying()) {
+                    std::fprintf(stderr, "script:%d: not playing\n", line);
+                    return false;
+                }
+            } else if (cmd == "expect-sound") {
+                // Peak output since the last expect-sound / sound-reset >= N.
+                const int got = m.manualAudio.peak;
+                m.manualAudio.peak = 0;
+                if (got < n1) {
+                    std::fprintf(stderr, "script:%d: output peak %d < %ld\n", line, got, n1);
+                    return false;
+                }
+            } else if (cmd == "sound-reset") {
+                m.manualAudio.peak = 0;
             } else if (cmd == "echo") {
                 std::fprintf(stderr, "script: %s\n", lineStr.c_str() + lineStr.find(a1));
             } else {
@@ -671,6 +900,9 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, o)) return 2;
     const bool headless = !o.script.empty() || !o.screenshot.empty();
     Machine m;
+    m.display.setRomFontsOnly(o.romFonts);
+    if (o.busyDisplay) m.display.setBusyClock(&m.clock);
+    ot::setRomTextMode(o.romText ? ot::kRomText : ot::kRomGlyphs);
     if (!m.start(o, headless)) return 1;
     if (!headless) {
         if (m.audio) m.audio->start();   // App::init already started it; harmless

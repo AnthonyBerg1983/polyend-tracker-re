@@ -1,5 +1,6 @@
 // Pattern undo/redo ring (spec 05 §5.1 (a)) and pattern-file undo (§5.1 (b)).
-// Snapshot storage is caller-provided (SDRAM on the device).
+// Snapshot storage is caller-provided (SDRAM on the device). 2.x: snapshots
+// are whole 16-track working patterns (docs/M1_PLAN.md §1).
 #pragma once
 
 #include <cstdint>
@@ -47,6 +48,12 @@ public:
     }
     void push(uint8_t num, const Pattern& p);
     bool pop(uint8_t* num, Pattern* out);
+    // In-place variants (no 12 KB pattern copy on the stack): pushSlot()
+    // reserves the next entry for pattern num and returns it for the caller
+    // to fill; popSlot() removes the top entry and returns it (valid until
+    // the next push). nullptr when not attached / empty.
+    Pattern* pushSlot(uint8_t num);
+    const Pattern* popSlot(uint8_t* num);
     int count() const { return count_; }
     int topNumber() const { return count_ ? nums_[(top_ + n_ - 1) % n_] : -1; }
 

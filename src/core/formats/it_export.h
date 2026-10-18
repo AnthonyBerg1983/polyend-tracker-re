@@ -21,7 +21,7 @@ struct ItExportSource {
     // stereo); nullptr / 0 frames when empty.
     const int16_t* (*samples)(void* ctx, int slot, uint32_t* frames, bool* stereo) = nullptr;
     // Pattern 1..255, nullptr when it does not exist.
-    const Pattern* (*pattern)(void* ctx, int number) = nullptr;
+    const PatternStock* (*pattern)(void* ctx, int number) = nullptr;
     void* ctx = nullptr;
 };
 
@@ -40,7 +40,7 @@ uint8_t itVolume(int v);
 // Packed IT pattern data (without the 8-byte header) of `p`; returns bytes.
 // restoreTempo != 0: a T<restoreTempo> on channel 13 of row 0 unless row 0
 // sets a tempo itself.
-uint32_t encodePattern(const Pattern& p, const Instrument* ins, uint8_t speed, uint8_t restoreTempo, uint8_t* out);
+uint32_t encodePattern(const PatternStock& p, const Instrument* ins, uint8_t speed, uint8_t restoreTempo, uint8_t* out);
 // The 554-byte IMPI and 80-byte IMPS records (spec 11 §2.3, §2.4).
 void buildInstrument(uint8_t* out, int index, const Instrument& in, uint8_t speed, uint8_t itTempo);
 void buildSampleHeader(uint8_t* out, int index, const Instrument& in, uint32_t frames, bool stereo,

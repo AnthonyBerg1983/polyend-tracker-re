@@ -54,10 +54,22 @@ struct PatternUpgradeParams {
 // Steps a..d of spec 10 §2.2 on the decoded pattern, given the file's
 // structure byte (only runs when < 5). Does not do the separate size-field
 // reset (decodePattern does). Returns true if anything ran.
-bool upgradePattern(Pattern& p, uint8_t fromVersion, const PatternUpgradeParams& prm);
-void patternStepVolume(Pattern& p, uint8_t (*curve)(uint8_t));                  // a / c
-void patternStepBeatSlice(Pattern& p, const uint8_t* modes, uint8_t ref117);    // b
-void patternStepExpandTracks(Pattern& p);                                       // d
+// `tracks` = the first `trackCount` tracks of the pattern: kStockTrackCount
+// (12) for the stock 1.9.x layout (step d clears tracks 8..11), or
+// kMiniTrackCount (16) for the Tracker Mini layout (spec 21 §4.2 step 2:
+// step d clears tracks 8..15). Steps a..c only touch tracks 0..7.
+bool upgradePattern(Track* tracks, uint8_t fromVersion, const PatternUpgradeParams& prm,
+                    int trackCount = kStockTrackCount);
+void patternStepVolume(Track* tracks, uint8_t (*curve)(uint8_t));                  // a / c
+void patternStepBeatSlice(Track* tracks, const uint8_t* modes, uint8_t ref117);    // b
+// d: tracks 8..trackCount-1 become empty with track 0's length.
+void patternStepExpandTracks(Track* tracks, int trackCount = kStockTrackCount);
+inline bool upgradePattern(PatternStock& p, uint8_t v, const PatternUpgradeParams& prm) {
+    return upgradePattern(p.tracks, v, prm);
+}
+inline bool upgradePattern(Pattern& p, uint8_t v, const PatternUpgradeParams& prm) {
+    return upgradePattern(p.tracks, v, prm);
+}
 
 // --- instrument .mti / .pti header (spec 10 §3) ---------------------------
 constexpr uint32_t kPtiHeaderImageSize = 0x188;

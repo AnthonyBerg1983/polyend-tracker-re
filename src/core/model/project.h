@@ -62,9 +62,63 @@ constexpr uint32_t kSel601 = 0x601;
 constexpr uint32_t kFlag602 = 0x602;
 constexpr uint32_t kTrackNames9to16 = 0x603;   // char[8] x 8
 constexpr uint32_t kTrackNameLen9to16 = 8;
+constexpr uint32_t kTrackNames13to16 = 0x623;  // = 0x603 slots 4..7 (spec 21 §3.2)
 constexpr uint32_t kTrackFlags8 = 0x742;       // u8[8]
+constexpr uint32_t kTrackMutes9to16 = 0x742;   // u8[8]: mute of tracks 9..16 (index t-8); 4..7 = U13
+constexpr uint32_t kTrackMutes1to8 = 0x12C;    // u8[8] (= kTrackBool8)
 constexpr uint32_t kPercent80C = 0x80C;
+
+// Tracker Mini synth-slot records (spec 21 §3.3): slot s = 0..2 at
+// 0x74C + 0x40*s, offsets below relative to the record.
+constexpr uint32_t kSynthSlots = 0x74C;
+constexpr uint32_t kSynthSlotSize = 0x40;
+constexpr uint32_t kSynthGain = 0x00;          // f32 dB, -96..12
+constexpr uint32_t kSynthPolyphony = 0x04;     // u32 0..8
+constexpr uint32_t kSynthModel = 0x08;         // u32 0..4 (SynthModel)
+constexpr uint32_t kSynthPan = 0x0C;           // f32 -100..100
+constexpr uint32_t kSynthPatchName = 0x10;     // char[32], NUL-terminated
+constexpr uint32_t kSynthPatchNameSize = 32;
+constexpr uint32_t kSynthReverbSend = 0x30;    // f32 0..100
+constexpr uint32_t kSynthDelaySend = 0x34;     // f32 0..100
+constexpr uint32_t kSynthMacros = 0x38;        // u8[6] 0..127
+constexpr uint32_t kSynthMacroCount = 6;
+constexpr uint32_t kSynthPad = 0x3E;           // 2 bytes
+constexpr uint32_t synthSlotOff(int s) { return kSynthSlots + kSynthSlotSize * uint32_t(s); }
 }  // namespace mt
+
+// Slot model index (spec 21 §3.3 +0x08) and its patch engine id (§7, §8).
+enum class SynthModel : uint8_t { ACD = 0, FAT = 1, VAP = 2, WTFM = 3, PERC = 4 };
+constexpr int kSynthModelCount = 5;
+inline uint8_t synthEngineId(SynthModel m) {
+    static const uint8_t kIds[kSynthModelCount] = {1, 2, 4, 5, 6};
+    return uint8_t(m) < kSynthModelCount ? kIds[uint8_t(m)] : 0;
+}
+// Folder name under Patches/ (spec 21 §2); "" for an invalid model.
+const char* synthModelName(SynthModel m);
+
+// Decoded synth-slot record (spec 21 §3.3). The bytes stay in
+// Project::values; this is a value copy.
+struct SynthSlotRecord {
+    float gainDb = -9.0f;
+    uint32_t polyphony = 1;
+    uint32_t model = 0;                       // SynthModel index (raw u32)
+    float pan = 0.0f;
+    char patchName[mt::kSynthPatchNameSize + 1] = {};
+    float reverbSend = 0.0f;
+    float delaySend = 0.0f;
+    uint8_t macros[mt::kSynthMacroCount] = {};
+    uint8_t pad[2] = {};
+
+    // The load check of spec 21 §3.3 (every field in range; NaN fails).
+    bool valid() const;
+    // Slot default (spec 21 §3.3): -9 dB, polyphony 1, WTFM / ACD / VAP for
+    // slots 0 / 1 / 2, pan 0, sends 0, "Init", macros 0 (63 where bit m of
+    // `bipolarMask` marks macro m+1 bipolar in the loaded patch).
+    static SynthSlotRecord defaults(int slot, uint8_t bipolarMask = 0);
+
+    void decode(const uint8_t rec[mt::kSynthSlotSize]);
+    void encode(uint8_t rec[mt::kSynthSlotSize]) const;   // writes all 0x40 bytes
+};
 
 struct Project {
     // Song block (spec 02 §3.2).
@@ -79,7 +133,8 @@ struct Project {
 
     Project() { setDefault(); }
 
-    // New Project values (spec 07 Q6 table; FW:0x234DC).
+    // New Project values (spec 07 Q6 table; FW:0x234DC), plus the Tracker
+    // Mini additions (spec 21 §3.2): synth-slot defaults, names "Midi 9".."Midi 16".
     void setDefault();
     // Load pre-fill (spec 02 §3.3 "Default" column, FW:0x73404 / 0x260A4):
     // only survives in a truncated project.mt (threshold 0x4000, levels 100).
@@ -107,6 +162,18 @@ struct Project {
     // into dst (NUL-terminated, cap >= 1). Returns false for bad index.
     bool trackName(int track, char* dst, uint32_t cap) const;
     bool setTrackName(int track, const char* s);
+
+    // Track mutes 0..15: tracks 0..7 at 0x12C, tracks 8..15 at 0x742[0..7]
+    // (tracks 13..16 use 0x742[4..7], MINI_PLAN U13). Out of range: false.
+    bool trackMuted(int track) const;
+    bool setTrackMuted(int track, bool muted);
+
+    // Synth slots 0..2 (spec 21 §3.3). Out-of-range slots read as the slot-0
+    // default and are not written.
+    SynthSlotRecord synthSlot(int slot) const;
+    void setSynthSlot(int slot, const SynthSlotRecord& r);
+    void resetSynthSlot(int slot, uint8_t bipolarMask = 0) { setSynthSlot(slot, SynthSlotRecord::defaults(slot, bipolarMask)); }
+    bool synthSlotValid(int slot) const { return synthSlot(slot).valid(); }
 
     MidiInstrument midiInstrument(int idx) const;      // idx 0..15
     void setMidiInstrument(int idx, const MidiInstrument& m);
