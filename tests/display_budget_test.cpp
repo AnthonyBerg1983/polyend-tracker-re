@@ -176,6 +176,31 @@ TEST(pattern_playing_frame_budget) {
     r.h.tap(btn::Play);
 }
 
+// Performance screen: 12 FX panels with values on every stored row, edit
+// mode (focus frame) and playing. On hardware the column-by-column drawing
+// (~1730 words) expanded past the FT81x RAM_DL (8 KB) and every frame
+// faulted (the screen froze); drawn in layers it needs ~1400. RAM_DL grows
+// ~1.1-1.4 x the uploaded words on the device (Song 1.12, Master 1.40), so
+// text-heavy screens need more headroom than the 1750 of the Pattern page.
+TEST(performance_frame_budget) {
+    Rig r;
+    r.h.tap(btn::Performance);
+    r.h.run(50);
+    PerformanceScreen& p = *static_cast<PerformanceScreen*>(r.h.app->ui.screen(kModPerformance));
+    for (int c = 0; c < perf::kSlots; ++c)
+        for (int row = 1; row < perf::kRows; ++row) p.src.setValue(c, row, int16_t(row * 7 - 11));
+    r.h.tap(btn::Rec);   // edit mode: focus frame on column 0
+    r.h.tap(btn::Right);
+    r.h.tap(btn::Play);
+    r.play(100);
+    r.m.resetMax();
+    r.play(1500);
+    const uint32_t words = r.m.maxWords;
+    std::printf("performance (values, edit, playing): max %u DL words\n", unsigned(words));
+    CHECK(words <= 1500);
+    r.h.tap(btn::Play);
+}
+
 // 2.x M1: the same dense page with the window on tracks 13..16 (MIDI
 // channel tags in the Instr column) stays inside the same budget.
 TEST(pattern_playing_frame_budget_tracks_13_16) {
