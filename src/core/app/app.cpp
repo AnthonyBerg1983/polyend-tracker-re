@@ -41,9 +41,11 @@ bool App::init(const HalRefs& hal, const AppMemory& mem) {
     // The SDRAM members (app.h OT_APP_SDRAM_MEMBER): constructed now, after
     // otAppMain() zeroed `.sdram_bss`.
     new (&names) PatternNames();
-    std::memset(extKeep_, 0, sizeof(extKeep_));
     new (&pj_) ProjectJob();
 #endif
+    // Every build: on the host extKeep_ is a plain member with no initialiser
+    // (on the device `.sdram_bss` is already zero).
+    std::memset(extKeep_, 0, sizeof(extKeep_));
     hal_ = hal;
     mem_ = mem;
     if (!hal_.storage || !hal_.clock || !mem_.patterns || !mem_.clipboard || !mem_.seqBuffers) return false;
