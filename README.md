@@ -19,7 +19,7 @@ the whole 2.x line
 ## New in 2.0
 
 ### Tracker Mini project compatibility
-- Projects are saved in the **Tracker Mini 2.2.1 format**: 16-track patterns, the three
+- Projects are saved in the **Tracker 2.2.1 format**: 16-track patterns, the three
   synth slots, track names and mutes for tracks 13–16.
 - **Synth patches** use the Mini's `.patch` files. They are stored with the project and in a
   library at `Patches/<ENGINE>/`. All 299 Mini factory patches load and save back unchanged.
