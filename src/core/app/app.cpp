@@ -24,13 +24,14 @@ namespace {
 struct AppSdram {
     alignas(PatternNames) unsigned char names[sizeof(PatternNames)];
     alignas(ProjectJob) unsigned char pj[sizeof(ProjectJob)];
+    unsigned char extKeep[kPatternCount + 1];
 };
 OT_SDRAM_BSS AppSdram gAppSdram;
 }  // namespace
 
 App::App()
     : names(*reinterpret_cast<PatternNames*>(gAppSdram.names)), bank(engine.bank()), ui(*this),
-      pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
+      extKeep_(*reinterpret_cast<ExtKeep*>(gAppSdram.extKeep)), pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
 #else
 App::App() : bank(engine.bank()), ui(*this) {}
 #endif
@@ -42,6 +43,9 @@ bool App::init(const HalRefs& hal, const AppMemory& mem) {
     new (&names) PatternNames();
     new (&pj_) ProjectJob();
 #endif
+    // Every build: on the host extKeep_ is a plain member with no initialiser
+    // (on the device `.sdram_bss` is already zero).
+    std::memset(extKeep_, 0, sizeof(extKeep_));
     hal_ = hal;
     mem_ = mem;
     if (!hal_.storage || !hal_.clock || !mem_.patterns || !mem_.clipboard || !mem_.seqBuffers) return false;
