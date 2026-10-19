@@ -340,6 +340,18 @@ void WavImporter::directCommit(uint32_t bytes) {
     }
 }
 
+uint32_t WavImporter::availableFrames() const {
+    uint32_t a;
+    if (direct_) {   // 44.1 kHz: output frame i == source frame i, written as fed
+        const uint64_t got = frameIdx_ > plan_.srcStart ? frameIdx_ - plan_.srcStart : 0;
+        a = got > plan_.outFrames ? plan_.outFrames : uint32_t(got);
+    } else {
+        a = rs_[0].produced();
+        if (plan_.outChannels == 2 && rs_[1].produced() < a) a = rs_[1].produced();
+    }
+    return a < plan_.outFrames ? a : plan_.outFrames;
+}
+
 uint32_t WavImporter::finish() {
     if (direct_) {
         // Source frames that never arrived read as zero (resampler rule).

@@ -245,6 +245,24 @@ int App::previewOn(uint16_t voiceId, uint8_t instrument, uint8_t note, uint8_t v
     if (voiceId < kAuditionMidiIn || voiceId >= kAuditionMidiIn + 128) previewOff(voiceId);
     const bool midi = isMidiInstrument(instrument);
     if (isSynthInstrument(instrument)) {
+        if (voiceId >= kAuditionMidiIn && voiceId < kAuditionMidiIn + 128) {
+            // MIDI input: one live track per held note (polyphonic, up to the
+            // slot polyphony and the voice cap); all held: the tracks are
+            // reused in turn.
+            // Velocity as for samples (spec 17 §1.4 step 1: 127 unless
+            // Recording options = velocity).
+            static_assert(sizeof(synthLive_) / sizeof(synthLive_[0]) == audio::kSynthLiveTracks, "live tracks");
+            int k = -1;
+            for (int i = 0; i < audio::kSynthLiveTracks && k < 0; ++i)
+                if (!synthLive_[i]) k = i;
+            if (k < 0) k = synthLiveNext_;
+            synthLiveNext_ = uint8_t((k + 1) % audio::kSynthLiveTracks);
+            synthLive_[k] = voiceId;
+            const uint8_t vel = liveVelocity(uint8_t(velocity & 127));
+            engine.synth().liveOn(k, synthSlotOf(instrument), uint8_t(note & 127),
+                                  vel >= 127 ? int8_t(-1) : int8_t((vel * 100 + 63) / 127));
+            return -1;
+        }
         // 2.x synth slots: the framework's audition track (one note at a time).
         engine.synth().auditionOn(synthSlotOf(instrument), uint8_t(note & 127));
         synthAudVoice_ = voiceId;
@@ -305,6 +323,13 @@ void App::previewOff(uint16_t voiceId, int startTrack) {
         engine.synth().auditionOff();
         synthAudVoice_ = kNoSynthAudition;
     }
+    // A MIDI input note on a synth live track: one note-off releases one.
+    for (int k = 0; k < audio::kSynthLiveTracks; ++k)
+        if (synthLive_[k] && synthLive_[k] == voiceId) {
+            engine.synth().liveOff(k);
+            synthLive_[k] = 0;
+            return;
+        }
     const int t = auditionTrack(voiceId, startTrack);
     if (t >= 0) releaseAudition(t);
 }
@@ -313,6 +338,11 @@ void App::previewAllOff() {
     for (int t = 0; t < kTrackCount; ++t) releaseAudition(t);
     if (synthAudVoice_ != kNoSynthAudition) engine.synth().auditionOff();
     synthAudVoice_ = kNoSynthAudition;
+    for (int k = 0; k < audio::kSynthLiveTracks; ++k)
+        if (synthLive_[k]) {
+            engine.synth().liveOff(k);
+            synthLive_[k] = 0;
+        }
     engine.previewStop();   // SD file preview
 }
 

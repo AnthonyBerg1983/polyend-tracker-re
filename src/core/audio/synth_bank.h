@@ -74,6 +74,12 @@ namespace audio {
 
 constexpr int kSynthTracks = 16;                  // sequencer tracks
 constexpr int kSynthAuditionTrack = kSynthTracks; // UI pads / preview (WP-G)
+// MIDI input notes on a synth instrument (spec 17 §1.4 for synths [OT]): one
+// track per held note, so external notes play polyphonically up to the
+// slot's polyphony and the voice cap.
+constexpr int kSynthLiveTracks = 4;
+constexpr int kSynthLiveTrack0 = kSynthAuditionTrack + 1;
+constexpr int kSynthAllTracks = kSynthLiveTrack0 + kSynthLiveTracks;
 
 // What the synth UI shows for one slot (SynthBank::slotView).
 struct SynthSlotView {
@@ -132,6 +138,10 @@ public:
     // Pads / preview (WP-G): play slot s on the audition track.
     void auditionOn(int s, uint8_t note, int8_t volume = -1);
     void auditionOff();
+    // MIDI input note k (0..kSynthLiveTracks-1) on slot s; volume -1 = full
+    // velocity, else 0..100. Main loop; the audio block starts it.
+    void liveOn(int k, int s, uint8_t note, int8_t volume);
+    void liveOff(int k);
 
     // --- audio context (sequencer sink, AudioEngine) -------------------------
     void noteOn(int track, const SynthNoteOn& n);
@@ -144,7 +154,9 @@ public:
     // True when a voice sounds or a slot ramp is still moving, a UI
     // audition request waits (it is taken in render's sync) or note-ons are
     // queued / counted for the block (note-on spreading).
-    bool active() const { return activeVoices_ != 0 || aud_.req != 0 || nDefer_ != 0 || starts_ != 0; }
+    bool active() const {
+        return activeVoices_ != 0 || aud_.req != 0 || nDefer_ != 0 || starts_ != 0 || livePending();
+    }
     // Render one block: adds into mL/mR and the send buses. stems[s] (may be
     // nullptr) receives slot s's post-gain/pan bus as interleaved int16.
     // Returns true when anything was added.
@@ -260,15 +272,15 @@ private:
 
     Voice voices_[kSynthMaxVoices];
     Pending pend_[kPending];
-    Deferred defer_[kSynthTracks + 1];
+    Deferred defer_[kSynthTracks + 1];   // MIDI input tracks never wait
     int nDefer_ = 0;
     int startCap_ = kStartsPerBlock;
     int starts_ = 0;              // voice starts in the current block
     bool flushDue_ = false;       // a render ended since the queue was filled
     bool recApplied_[kSynthSlots] = {};   // slots_[s].rec has been applied (sync)
     Slot slots_[kSynthSlots];
-    int8_t trackVoice_[kSynthTracks + 1];     // record held by each track, -1 none
-    float trackPitch_[kSynthTracks + 1];      // last note pitch (Glide FX source)
+    int8_t trackVoice_[kSynthAllTracks];      // record held by each track, -1 none
+    float trackPitch_[kSynthAllTracks];       // last note pitch (Glide FX source)
     uint32_t serial_ = 0;
     uint32_t steals_ = 0;
     int activeVoices_ = 0;                    // records not free
@@ -285,6 +297,20 @@ private:
         uint8_t slot = 0, note = 60;
         int8_t vol = -1;
     } aud_;
+    // MIDI input mailbox per live track, main loop -> audio block: one
+    // 32-bit word (a single store / load, never torn) holding the latest
+    // request: bits 0-7 serial, 8 on, 9-10 slot, 11-17 note, 24-31 volume.
+    // Only the final state of a track counts, so no note-off can be lost;
+    // render() alone reads it (never the main-loop noteOn path).
+    volatile uint32_t live_[kSynthLiveTracks] = {};
+    uint8_t liveSeen_[kSynthLiveTracks] = {};   // audio side: last serial
+    uint8_t liveSerial_[kSynthLiveTracks] = {}; // main loop: last serial
+    void liveDrain();
+    bool livePending() const {
+        for (int k = 0; k < kSynthLiveTracks; ++k)
+            if (uint8_t(live_[k]) != liveSeen_[k]) return true;
+        return false;
+    }
     float busL_[kBlock] = {}, busR_[kBlock] = {};   // slot bus, zero between slots
     volatile float peak_[kSynthSlots] = {};          // bus peaks for slotPeak()
     float tempo_ = 130.0f;

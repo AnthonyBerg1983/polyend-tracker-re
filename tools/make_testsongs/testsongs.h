@@ -29,8 +29,17 @@ enum class SongId : uint8_t {
     BgBattleFm = 10,
     BgBoss = 11,
     BgFinalBoss = 12,
+    // PERC engine only, three kits (percsong.inc): M3 + M1.
+    PercOnly = 13,
+    // VAP engine only, three patches (vapsong.inc): M3 + M1.
+    VapOnly = 14,
+    // Track Mixer meter calibration, stock-compatible (metersong.inc).
+    MeterCheck = 15,
 };
-constexpr int kSongCount = 12;
+constexpr int kSongCount = 15;
+
+// Songs 6-12 (the BLAST GRID remixes).
+inline bool isBgSong(SongId id) { return int(id) >= int(SongId::BgTitle) && int(id) <= int(SongId::BgFinalBoss); }
 
 struct SongInfo {
     SongId id;

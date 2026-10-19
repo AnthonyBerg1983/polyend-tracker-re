@@ -1326,10 +1326,18 @@ void PatternScreen::fillButton(uint8_t id) {
         fillOpen = false;
     } else if (id == btn::F8) {
         fillApply();
-    } else if (id == btn::Right) {
-        fillDelta(1);
-    } else if (id == btn::Left) {
-        fillDelta(-1);
+    } else if (id == btn::Right || id == btn::Left) {
+        // Left / Right move between the fields (columns), skipping blank
+        // ones, like the Master pages [S owner test on 1.9.2]; Up / Down
+        // and the encoder change the selected field.
+        const pops::FillParams& f = fill[col];
+        auto blank = [&](int k) { return (k == 1 && f.where < 4) || (k == 2 && col == 1) || (k == 5 && f.type == 0); };
+        const int d = id == btn::Right ? 1 : -1;
+        for (int k = fillField + d; k >= 0 && k <= 5; k += d)
+            if (!blank(k)) {
+                fillField = k;
+                break;
+            }
     } else if (id == btn::Up || id == btn::Down) {
         // The list fields (Where?, Scale / Fx Type, Fill Type) step down
         // their list with Down; value fields count up with Up.
@@ -1522,7 +1530,8 @@ void PatternScreen::padLeds(uint8_t* lv) {
     if (edit()) {
         if (col == 0) {
             const uint8_t ci = a.currentInstrument();
-            if (ci < kSampleInstrumentCount && a.instruments[ci].playMode == uint8_t(PlayMode::Slice)) {
+            if (ci < kSampleInstrumentCount && (a.instruments[ci].playMode == uint8_t(PlayMode::Slice) ||
+                                                a.instruments[ci].playMode == uint8_t(PlayMode::BeatSlice))) {
                 for (int p = 0; p < a.instruments[ci].sliceCount && p < 48; ++p) lv[p] = dim;
                 if (st.note >= 24 && st.note < 72) lv[st.note - 24] = full;
             } else if (st.note >= 0) {

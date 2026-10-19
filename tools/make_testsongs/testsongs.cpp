@@ -1,6 +1,8 @@
 // OpenTracker 2.x test songs (testsongs.h). Songs 1-5: A minor,
 // Am - F - C - G, one chord per bar, 16 steps per bar, 124 BPM. Songs 6-12:
-// BLAST GRID remixes (bgsongs.inc, bg_data.h).
+// BLAST GRID remixes (bgsongs.inc, bg_data.h). Song 13 "OT Test 06": the
+// PERC engine alone (percsong.inc). Song 14 "OT Test 07": the VAP engine
+// alone (vapsong.inc).
 #include "testsongs.h"
 
 #include <cmath>
@@ -12,6 +14,7 @@
 #include "app/app.h"
 #include "app/perf_presets.h"
 #include "app/project_fields.h"
+#include "audio/audio_tables.h"
 #include "audio/engines/acd.h"
 #include "audio/engines/perc.h"
 #include "audio/engines/vap.h"
@@ -38,6 +41,9 @@ const SongInfo kSongs[kSongCount] = {
     {SongId::LoadStress, "OT Test 03 - Load Stress", "M0 / M1", true},
     {SongId::Stereo, "OT Test 04 - Stereo", "M2 (stereo playback)", kHasStereo},
     {SongId::Synths, "OT Test 05 - Synths", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
+    {SongId::PercOnly, "OT Test 06 - PERC Only", "M3 (PERC engine) + M1", kHasSynths && kHas16Tracks},
+    {SongId::VapOnly, "OT Test 07 - VAP Only", "M3 (VAP engine) + M1", kHasSynths && kHas16Tracks},
+    {SongId::MeterCheck, "OT Test 08 - Meter Check", "stock 1.9.2 / 1.9.3", true},
     {SongId::BgTitle, "BG Title", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
     {SongId::BgWorld1, "BG World 1", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
     {SongId::BgWorld4, "BG World 4", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
@@ -99,12 +105,13 @@ public:
         ok = false;
     }
 
-    bool begin() {
+    // samples = false: a song without sample instruments (no source folder).
+    bool begin(bool samples = true) {
         if (!app.newProject()) {
             fail("newProject");
             return false;
         }
-        mkdirs(dir);
+        if (samples) mkdirs(dir);
         return ok;
     }
 
@@ -1022,6 +1029,9 @@ bool synthSong(Gen& g) {
 }
 
 #include "bgsongs.inc"
+#include "percsong.inc"
+#include "vapsong.inc"
+#include "metersong.inc"
 
 }  // namespace
 
@@ -1063,6 +1073,9 @@ bool generateSong(App& app, IStorage& fs, SongId id, const GenOptions& opt, std:
         case SongId::BgBattleFm:
         case SongId::BgBoss:
         case SongId::BgFinalBoss: built = bgr::bgSong(g, id); break;
+        case SongId::PercOnly: built = perconly::percOnlySong(g); break;
+        case SongId::VapOnly: built = vaponly::vapOnlySong(g); break;
+        case SongId::MeterCheck: built = metercheck::meterSong(g); break;
     }
     if (built) built = g.finish(info->name);
     if (!built) err = g.err.empty() ? "generation failed" : g.err;

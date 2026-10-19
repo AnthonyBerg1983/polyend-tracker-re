@@ -151,6 +151,8 @@ public:
     // Returns frames per channel written.
     uint32_t finish();
     const WavImportPlan& plan() const { return plan_; }
+    // Output frames per channel complete so far (both channels), <= outFrames.
+    uint32_t availableFrames() const;
 
 private:
     void frames(const uint8_t* f, uint64_t count);

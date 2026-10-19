@@ -621,3 +621,52 @@ TEST(testsongs_bg_arpeggios_are_sustained_samples) {
         if (info.id != ts::SongId::BgWorld4) CHECK(arpNotes > 0);   // World 4 has no arpeggio
     }
 }
+
+// 2.x: MIDI input notes on a synth instrument play polyphonically while the
+// song plays (one live track per held note, not the one-note audition
+// track); every note-off releases its note.
+TEST(midi_input_synth_polyphonic_while_playing) {
+    std::unique_ptr<Harness> hp = deviceHarness();
+    Harness& h = *hp;
+    ot::App& a = *h.app;
+    ts::GenOptions opt;
+    std::string err;
+    CHECK(ts::generateSong(a, h.fs, ts::SongId::TwelveTracks, opt, err));   // samples only
+    a.setSynthModel(0, int(ot::SynthModel::VAP));
+    a.initSynthPatch(0);
+    ot::SynthSlotRecord r = a.synthSlot(0);
+    r.polyphony = 4;
+    a.setSynthSlotRecord(0, r);
+    a.cfg.notesIn = 3;
+    a.setCurrentInstrument(ts::kSynthBase + 0);
+    a.seq.playSong(0);
+    uint32_t acc = 0;
+    auto pump = [&](uint32_t ms) {
+        int mv = 0;
+        for (uint32_t t = 0; t < ms; t += 10) {
+            acc += 10u * 44100u;
+            int blocks = 0;
+            while (acc >= 128000u) {
+                acc -= 128000u;
+                ++blocks;
+            }
+            h.audio.pump(blocks);
+            h.run(10);
+            mv = std::max(mv, a.engine.synth().voicesOf(0));
+        }
+        return mv;
+    };
+    auto midi = [&](uint8_t st, uint8_t n, uint8_t v) { h.midi.in.insert(h.midi.in.end(), {st, n, v}); };
+    pump(300);
+    midi(0x90, 60, 100);
+    midi(0x90, 64, 100);
+    midi(0x90, 67, 100);
+    CHECK_EQ(pump(300), 3);   // a three-note chord, with eight sample tracks playing
+    midi(0x90, 71, 100);
+    midi(0x90, 74, 100);      // a fifth held note takes the oldest live track
+    CHECK_EQ(pump(300), 4);
+    for (uint8_t n : {60, 64, 67, 71, 74}) midi(0x80, n, 0);
+    pump(3000);               // past the Init release
+    CHECK_EQ(a.engine.synth().voicesOf(0), 0);
+    CHECK(a.seq.isPlaying());
+}

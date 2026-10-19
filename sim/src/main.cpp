@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "app/app.h"
+#include "formats/wav.h"
 #include "canvas.h"
 #include "host_hal.h"
 #include "host_midi.h"
@@ -32,6 +33,7 @@
 #include "sim_nvstore.h"
 #include "sw_display.h"
 #include "ui/buttons.h"
+#include "ui/screens.h"
 
 namespace b = ot::btn;
 using namespace sim;
@@ -676,6 +678,85 @@ struct Headless {
                 m.manualAudio.peak = 0;
             } else if (cmd == "echo") {
                 std::fprintf(stderr, "script: %s\n", lineStr.c_str() + lineStr.find(a1));
+            } else if (cmd == "expect-screen") {
+                // expect-screen NAME: the active screen's name() (e.g. "Performance",
+                // "Sample Recorder"); key-flow regression scripts.
+                std::string want = lineStr.substr(lineStr.find(a1));
+                while (!want.empty() && (want.back() == ' ' || want.back() == '\r')) want.pop_back();
+                const ot::Screen* s = m.app ? m.app->ui.current() : nullptr;
+                if (!s || want != s->name()) {
+                    std::fprintf(stderr, "script:%d: screen is \"%s\", want \"%s\"\n", line, s ? s->name() : "",
+                                 want.c_str());
+                    return false;
+                }
+            } else if (cmd == "tone-sample") {
+                // tone-sample SLOT FRAMES: write a 220 Hz decaying-saw WAV to the
+                // SD card and import it into instrument SLOT (1-based), which
+                // becomes the current instrument; playhead / slice scripts.
+                bool ok = false;
+                if (m.app && n1 >= 1 && n1 <= ot::kSampleInstrumentCount) {
+                    const uint32_t frames = uint32_t(std::atol(a2.c_str()) > 0 ? std::atol(a2.c_str()) : 44100);
+                    std::vector<int16_t> pcm(frames);
+                    for (uint32_t i = 0; i < frames; ++i)
+                        pcm[i] = int16_t(20000.0f * (1.0f - float(i) / float(frames)) * (float(i % 200) / 100.0f - 1.0f));
+                    std::vector<uint8_t> wav(frames * 2 + 64);
+                    wav.resize(ot::wavEncode(pcm.data(), frames, 1, wav.data(), wav.size()));
+                    const ot::IStorage::Handle h = m.storage.open("simtone.wav", ot::IStorage::kWrite);
+                    if (h >= 0) {
+                        ok = m.storage.write(h, wav.data(), uint32_t(wav.size())) == int32_t(wav.size());
+                        m.storage.close(h);
+                    }
+                    ok = ok && m.app->importSample("simtone.wav", int(n1 - 1));
+                    if (ok) m.app->setCurrentInstrument(uint8_t(n1 - 1));
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "script:%d: tone-sample failed\n", line);
+                    return false;
+                }
+                advance(1);
+            } else if (cmd == "expect-playhead") {
+                // expect-playhead on|off: Sample Playback shows (or not) the
+                // play-position line (USER_REPORTS_R2 §1c).
+                const auto* pb = m.app && m.app->ui.active() == ot::kModPlayback
+                                     ? static_cast<const ot::PlaybackScreen*>(m.app->ui.current())
+                                     : nullptr;
+                const int x = pb ? pb->drawnHeadX() : -1;
+                std::fprintf(stderr, "playhead x %d\n", x);
+                if (!pb || (a1 == "on") != (x >= 0)) {
+                    std::fprintf(stderr, "script:%d: playhead x %d, want %s\n", line, x, a1.c_str());
+                    return false;
+                }
+            } else if (cmd == "expect-master") {
+                // expect-master PAGE SUB: Master screen page (0 Master, 1 Track
+                // Mixer, 2 Global Mixer) and Master sub-page (0 main, 1 Reverb,
+                // 2 Delay, 3 Limiter, 4 EQ); it must be the active screen.
+                const auto* mx = m.app && m.app->ui.active() == ot::kModMaster
+                                     ? static_cast<const ot::MixerScreen*>(m.app->ui.current())
+                                     : nullptr;
+                const long sub = std::atol(a2.c_str());
+                if (!mx || mx->page != n1 || mx->sub != sub) {
+                    std::fprintf(stderr, "script:%d: master page %d sub %d (active %d), want %ld %ld\n", line,
+                                 mx ? mx->page : -1, mx ? mx->sub : -1, m.app ? m.app->ui.active() : -1, n1, sub);
+                    return false;
+                }
+            } else if (cmd == "fps-reset" || cmd == "expect-fps") {
+                // fps-reset, then expect-fps N: at least N rendered frames per
+                // second (virtual time) since the reset. A screen at rest renders
+                // nothing; a live meter must keep drawing.
+                static uint32_t frames0 = 0, ms0 = 0;
+                const uint32_t frames = m.app ? m.app->ui.frames() : 0, ms = m.clock.millis();
+                if (cmd == "fps-reset") {
+                    frames0 = frames;
+                    ms0 = ms;
+                } else {
+                    const double fps = ms != ms0 ? double(frames - frames0) * 1000.0 / double(ms - ms0) : 0.0;
+                    std::fprintf(stderr, "fps %.1f (%u frames in %u ms)\n", fps, unsigned(frames - frames0),
+                                 unsigned(ms - ms0));
+                    if (fps < double(n1)) {
+                        std::fprintf(stderr, "script:%d: %.1f frames/s < %ld\n", line, fps, n1);
+                        return false;
+                    }
+                }
             } else {
                 std::fprintf(stderr, "script:%d: unknown command '%s'\n", line, cmd.c_str());
                 return false;

@@ -29,7 +29,7 @@ void SynthBank::reset() {
     nDefer_ = 0;
     starts_ = 0;
     flushDue_ = false;
-    for (int t = 0; t <= kSynthTracks; ++t) {
+    for (int t = 0; t < kSynthAllTracks; ++t) {
         trackVoice_[t] = -1;
         trackPitch_[t] = -1.0f;
     }
@@ -44,6 +44,7 @@ void SynthBank::reset() {
     }
     activeVoices_ = 0;
     aud_.req = 0;
+    for (int k = 0; k < kSynthLiveTracks; ++k) liveSeen_[k] = uint8_t(live_[k]);
 }
 
 // --- main loop -----------------------------------------------------------------
@@ -103,6 +104,38 @@ void SynthBank::auditionOn(int s, uint8_t note, int8_t volume) {
 }
 
 void SynthBank::auditionOff() { aud_.req = 2; }
+
+void SynthBank::liveOn(int k, int s, uint8_t note, int8_t volume) {
+    if (k < 0 || k >= kSynthLiveTracks || s < 0 || s >= kSynthSlots) return;
+    const uint8_t ser = ++liveSerial_[k];
+    live_[k] = uint32_t(ser) | 1u << 8 | uint32_t(s & 3) << 9 | uint32_t(note & 127) << 11 |
+               uint32_t(uint8_t(volume)) << 24;
+}
+
+void SynthBank::liveOff(int k) {
+    if (k < 0 || k >= kSynthLiveTracks) return;
+    const uint8_t ser = ++liveSerial_[k];
+    live_[k] = uint32_t(ser);
+}
+
+// Audio block (render): start / release what the main loop asked for.
+void SynthBank::liveDrain() {
+    for (int k = 0; k < kSynthLiveTracks; ++k) {
+        const uint32_t w = live_[k];
+        if (uint8_t(w) == liveSeen_[k]) continue;
+        liveSeen_[k] = uint8_t(w);
+        const int track = kSynthLiveTrack0 + k;
+        if (w & (1u << 8)) {
+            SynthNoteOn n;
+            n.slot = uint8_t((w >> 9) & 3);
+            n.note = uint8_t((w >> 11) & 127);
+            n.volume = int8_t(uint8_t(w >> 24));
+            noteOnNow(track, n);
+        } else {
+            noteOff(track, NoteOffMode::Off);
+        }
+    }
+}
 
 // --- internal state ---------------------------------------------------------------
 
@@ -636,7 +669,7 @@ void SynthBank::noteOnNow(int track, const SynthNoteOn& n, bool forced) {
 }
 
 void SynthBank::noteOff(int track, NoteOffMode mode) {
-    if (track < 0 || track > kSynthTracks) return;
+    if (track < 0 || track >= kSynthAllTracks) return;
     if (Deferred* d = deferredOf(track)) {   // after the queued note starts
         d->off = int8_t(mode);
         return;
@@ -654,7 +687,7 @@ void SynthBank::noteOff(int track, NoteOffMode mode) {
 }
 
 void SynthBank::applyFx(int track, uint8_t type, uint8_t value) {
-    if (track < 0 || track > kSynthTracks) return;
+    if (track < 0 || track >= kSynthAllTracks) return;
     if (Deferred* d = deferredOf(track)) {   // after the queued note starts
         if (d->nfx < 2) {
             d->fx[d->nfx][0] = type;
@@ -714,7 +747,7 @@ void SynthBank::transportStop() {
 }
 
 void SynthBank::resetFx() {
-    for (int t = 0; t <= kSynthTracks; ++t) trackPitch_[t] = -1.0f;
+    for (int t = 0; t < kSynthAllTracks; ++t) trackPitch_[t] = -1.0f;
 }
 
 void SynthBank::stopAll() {
@@ -730,7 +763,7 @@ void SynthBank::stopAll() {
     for (auto& d : defer_) d = Deferred{};
     nDefer_ = 0;
     flushDue_ = false;
-    for (int t = 0; t <= kSynthTracks; ++t) trackVoice_[t] = -1;
+    for (int t = 0; t < kSynthAllTracks; ++t) trackVoice_[t] = -1;
     activeVoices_ = 0;
 }
 
@@ -739,6 +772,7 @@ void SynthBank::stopAll() {
 OT_FASTRUN_FN bool SynthBank::render(const SynthMixInputs& in, float* mL, float* mR, float* dsend, float* rsend,
                        int16_t* const stems[kSynthSlots]) {
     sync();
+    liveDrain();   // MIDI input (audio side only)
     if (flushDue_) flushDeferred();   // no note-on came first in this block
     // Records per slot (one pass).
     uint8_t busy[kSynthSlots] = {};

@@ -540,6 +540,10 @@ private:
     // previewOn voice holding the synth audition track (kNoSynthAudition: none).
     static constexpr uint16_t kNoSynthAudition = 0xFFFF;
     uint16_t synthAudVoice_ = kNoSynthAudition;
+    // MIDI input notes held on the synth live tracks (audio::kSynthLiveTracks;
+    // 0 = free) and the next one to take when all are held.
+    uint16_t synthLive_[4] = {};
+    uint8_t synthLiveNext_ = 0;
     char loadNotice_[64] = {};      // first problem of the last load (one notice)
     uint8_t patDirty_[32] = {};
     bool projectDirty_ = false, namesDirty_ = false, configDirty_ = false, configForce_ = false;
