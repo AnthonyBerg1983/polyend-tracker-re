@@ -3,6 +3,7 @@
 // and for drawing the front panel around it.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
