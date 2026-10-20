@@ -32,7 +32,7 @@ OT_SDRAM_BSS AppSdram gAppSdram;
 
 App::App()
     : names(*reinterpret_cast<PatternNames*>(gAppSdram.names)), bank(engine.bank()), ui(*this),
-      extKeep_(*reinterpret_cast<ExtKeep*>(gAppSdram.extKeep)), pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
+      extKeep_(*reinterpret_cast<ExtKeep*>(gAppSdram.extKeep)),
       patches_(*reinterpret_cast<SynthPatches*>(gAppSdram.patches)), pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
 #else
 App::App() : bank(engine.bank()), ui(*this) {}
