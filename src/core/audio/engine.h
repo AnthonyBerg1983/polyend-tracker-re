@@ -192,9 +192,17 @@ public:
     // (spec 07 Q1); nullptr stops it. The buffer must stay valid while
     // playing (stopAll() also stops it).
     // `avail`: frames already decoded (streamed preview), default all.
-    void previewBuffer(const int16_t* data, uint32_t frames, bool stereo, uint32_t avail = 0xFFFFFFFFu);
+    // `step`: 16.16 playback rate (65536 = own pitch; 2.x pitched pads,
+    // linear interpolation per channel).
+    void previewBuffer(const int16_t* data, uint32_t frames, bool stereo, uint32_t avail = 0xFFFFFFFFu,
+                       uint32_t step = 65536u);
+    // Same with separate lanes: `right` nullptr = mono (2.x stereo recorder).
+    void previewBufferLR(const int16_t* left, const int16_t* right, uint32_t frames, uint32_t step = 65536u);
     bool previewBufferActive() const { return raw_.active; }
     uint32_t previewBufferAvail() const { return raw_.avail; }
+    uint32_t previewBufferStep() const { return raw_.step; }
+    const int16_t* previewBufferLeft() const { return raw_.data; }
+    const int16_t* previewBufferRight() const { return raw_.right; }   // nullptr = mono
     void previewStop();   // file preview, immediately
     // Streamed file preview: previewBuffer(data, total, stereo) with only
     // `frames` decoded so far; the player waits (silence) at that point and
@@ -207,6 +215,10 @@ public:
     void setTransportSource(TransportFn fn, void* ctx) { transport_ = fn; transportCtx_ = ctx; }
     // Peak |post-pan| level of track t (0..1) since the previous call (UI meters).
     float trackPeak(int t);
+    // Global Mixer 3/3 meters: peak of channel ch (0 Delay return, 1 Reverb
+    // return, 2 Dry mix, 3 Line in after its level), side 0 L / 1 R, since the
+    // last call (read and reset; main loop).
+    float busPeak(int ch, int side);
 
     // Play position (sample frame) of track t's voice as of the last rendered
     // block, -1 when its player is stopped. A per-block snapshot, safe to read
@@ -317,11 +329,13 @@ private:
     struct RawPreview {
         volatile bool active = false;
         const int16_t* data = nullptr;
+        const int16_t* right = nullptr;   // right lane, nullptr = mono
         uint32_t frames = 0, pos = 0;
+        uint32_t step = 65536, frac = 0;  // 16.16 rate and position fraction
         volatile uint32_t avail = 0;   // frames decoded so far (streamed preview)
-        bool stereo = false;
     } raw_;
     volatile float peak_[kVoices] = {};
+    volatile float busPeak_[4][2] = {};
     volatile int32_t head_[kVoices] = {};   // voicePlayhead() snapshot (init() sets -1)
 
     // metronome click instruments (normal / accent finetune, spec 07 Q10)

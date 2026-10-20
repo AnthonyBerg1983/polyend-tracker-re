@@ -755,7 +755,10 @@ void nameField(Gfx& g, const Theme& th, int x, int y, int w, int h, const char* 
     const uint32_t outer = th.slot(slot::kEmptyPanel + 1);
     const uint32_t inner = th.slot(slot::kTitle + 1);
     const uint32_t red = th.slot(slot::kFocusFrame);
-    const uint32_t tc = th.slot(slot::kList + 4);
+    // List text on a dark box; on Monochrome's light title-band box the
+    // light list grey vanishes, so the name takes the title text (black).
+    const uint32_t lum = ((inner >> 16 & 0xFF) * 3 + (inner >> 8 & 0xFF) * 6 + (inner & 0xFF)) / 10;
+    const uint32_t tc = lum > 128 ? th.slot(slot::kTitle) : th.slot(slot::kList + 4);
     g.fill(x, y, w, h, outer);
     // Inner box inset 10 px; its RECTS edge blends with the outer fill
     // (090909 between 0a0a0a and 080808).

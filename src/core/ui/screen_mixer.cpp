@@ -648,7 +648,9 @@ void MixerScreen::update(uint32_t now) {
         }
         return;
     }
-    if (page == 2) {   // synth slot meters (2.x)
+    if (page == 2) {
+        // Global Mixer meters: the four channels (the Track Mixer meter law and
+        // averaging, spec 06 §4.4, per side) and the 2.x synth slot meters.
         if (now - lastMeter_ < 10) return;
         lastMeter_ = now;
         histPos_ = (histPos_ + 1) % 10;
@@ -661,6 +663,15 @@ void MixerScreen::update(uint32_t now) {
             if (bar != synthMeter[s]) changed = true;
             synthMeter[s] = bar;
         }
+        for (int ch = 0; ch < 4; ++ch)
+            for (int sd = 0; sd < 2; ++sd) {
+                ghist_[ch][sd][histPos_] = app_.engine.busPeak(ch, sd) * 0.70710678f;
+                float sum = 0;
+                for (float v : ghist_[ch][sd]) sum += v;
+                const int bar = meterBar(sum / 10.0f);
+                if (bar != globalMeter[ch][sd]) changed = true;
+                globalMeter[ch][sd] = bar;
+            }
         if (changed) ui_.dirty();
         return;
     }
@@ -809,7 +820,7 @@ void MixerScreen::draw(Gfx& g) {
     }
     // spec 06 §4.5 / VISUAL_DIFF §8.13: four channels, each a 32-px fader and
     // two 32-px meters on one panel; the rest one empty panel. The engine
-    // has no per-channel meters here: they rest at level 0 [I].
+    // meters show each channel's level, L and R (AudioEngine::busPeak) [I].
     ui_.drawTitle(g, "Global Mixer 3/3");
     for (int i = 0; i < 4; ++i) {
         const int x = colX(i);
@@ -819,8 +830,8 @@ void MixerScreen::draw(Gfx& g) {
         bar(g, th, x, 64, 32, 359, p.u8(kGlobalLevel[i]) / 100.0f, muted ? off : wg::kThemeColour);
         // A muted channel's meters rest in the muted colour too [S round 3,
         // snap 010 Line In].
-        bar(g, th, x + 32, 64, 32, 359, 0.0f, muted ? off : green);
-        bar(g, th, x + 64, 64, 32, 359, 0.0f, muted ? off : green);
+        bar(g, th, x + 32, 64, 32, 359, globalMeter[i][0] / 100.0f, muted ? off : green);
+        bar(g, th, x + 64, 64, 32, 359, globalMeter[i][1] / 100.0f, muted ? off : green);
     }
     // 2.x synth slots (manual p.220): the level setting (left) and the
     // actual level (right: the live slot-bus meter), Track Mixer geometry;

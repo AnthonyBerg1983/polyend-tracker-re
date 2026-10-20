@@ -24,6 +24,7 @@ namespace {
 struct AppSdram {
     alignas(PatternNames) unsigned char names[sizeof(PatternNames)];
     alignas(ProjectJob) unsigned char pj[sizeof(ProjectJob)];
+    alignas(SynthPatch) unsigned char patches[sizeof(SynthPatch) * kSynthSlotCount];
     unsigned char extKeep[kPatternCount + 1];
 };
 OT_SDRAM_BSS AppSdram gAppSdram;
@@ -32,6 +33,7 @@ OT_SDRAM_BSS AppSdram gAppSdram;
 App::App()
     : names(*reinterpret_cast<PatternNames*>(gAppSdram.names)), bank(engine.bank()), ui(*this),
       extKeep_(*reinterpret_cast<ExtKeep*>(gAppSdram.extKeep)), pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
+      patches_(*reinterpret_cast<SynthPatches*>(gAppSdram.patches)), pj_(*reinterpret_cast<ProjectJob*>(gAppSdram.pj)) {}
 #else
 App::App() : bank(engine.bank()), ui(*this) {}
 #endif
@@ -42,6 +44,9 @@ bool App::init(const HalRefs& hal, const AppMemory& mem) {
     // otAppMain() zeroed `.sdram_bss`.
     new (&names) PatternNames();
     new (&pj_) ProjectJob();
+    for (SynthPatch& p : patches_) new (&p) SynthPatch();
+#else
+    for (SynthPatch& p : patches_) p = SynthPatch{};   // plain member without an initialiser
 #endif
     // Every build: on the host extKeep_ is a plain member with no initialiser
     // (on the device `.sdram_bss` is already zero).
@@ -840,7 +845,7 @@ bool App::undoEdit() {
     uint8_t num = 0;
     Pattern& cur = pattern();
     if (!undo.undo(cur, patternNumber(), &num)) {
-        ui.notify("Nothing to undo");
+        ui.notify("No undo data.");
         return false;
     }
     if (num != patternNumber() && !seq.isPlaying()) {
@@ -856,7 +861,7 @@ bool App::undoEdit() {
 bool App::redoEdit() {
     uint8_t num = 0;
     if (!undo.redo(pattern(), patternNumber(), &num)) {
-        ui.notify("Nothing to redo");
+        ui.notify("No redo data.");
         return false;
     }
     patternEdited();

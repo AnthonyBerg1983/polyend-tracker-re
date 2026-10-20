@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "app/app.h"
+#include "fmath.h"
 #include "formats/wav.h"
 
 namespace ot {
@@ -72,6 +73,34 @@ bool App::writeWav(const char* path, const int16_t* mono, uint32_t frames) {
         ok = w.write(mono + i, n);
     }
     return w.close() && ok;
+}
+
+bool App::writeWav(const char* path, const int16_t* l, const int16_t* r, uint32_t frames) {
+    if (!r) return writeWav(path, l, frames);
+    IStorage& f = fs();
+    if (f.exists(path)) f.remove(path);
+    WavWriter w;
+    if (!w.open(f, path, 2)) return false;
+    // 2.x stereo recording: the planar lanes interleaved (L, R) through a
+    // small transient chunk (2 KB of stack, no sample-memory use).
+    constexpr uint32_t kChunk = 512;
+    int16_t buf[2 * kChunk];
+    bool ok = true;
+    for (uint32_t i = 0; i < frames && ok; i += kChunk) {
+        const uint32_t n = frames - i < kChunk ? frames - i : kChunk;
+        for (uint32_t k = 0; k < n; ++k) {
+            buf[2 * k] = l[i + k];
+            buf[2 * k + 1] = r[i + k];
+        }
+        ok = w.write(buf, n);
+    }
+    return w.close() && ok;
+}
+
+uint32_t App::previewStep(int note) {
+    // 2^((note - 60) / 12) as 16.16: 2048 (note 0) .. ~3.1e6 (note 127).
+    const int n = note < 0 ? 0 : (note > 127 ? 127 : note);
+    return uint32_t(fm::kNoteRatio[n] * 65536.0 + 0.5);
 }
 
 }  // namespace ot

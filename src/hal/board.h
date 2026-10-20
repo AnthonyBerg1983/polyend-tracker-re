@@ -163,9 +163,10 @@ constexpr uint32_t kSdramSdScratch    = kSdramBase + 0x00060000;   // SD direct 
 // `.sdram_bss` (core/sdram_bss.h, docs/OPTIMIZATION_2X.md OP-5): the linker
 // region SDRAM_BSS of src/hal/opentracker.ld, below the selftest's buffer in
 // the top 64 KB (selftest.cpp). The app's SDRAM layout (app_main.cpp) ends
-// below it. 2.0.1: 80 KB (was 64 KB) for the FatFs file objects.
-constexpr uint32_t kSdramBssBase      = kSdramBase + 0x00FDC000;
-constexpr uint32_t kSdramBssSize      = 0x00014000;
+// below it. 2.0.1: 80 KB (was 64 KB) for the FatFs file objects; 2.0.7:
+// 92 KB (the synth patches and the 200-entry file lists), same top end.
+constexpr uint32_t kSdramBssBase      = kSdramBase + 0x00FD9000;
+constexpr uint32_t kSdramBssSize      = 0x00017000;
 
 // ---- input (spec 01 §7) ---------------------------------------------------------
 constexpr uint8_t kTeensyButtonsInt = 14;    // spec 01 §7.1: PTD1

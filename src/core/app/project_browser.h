@@ -10,7 +10,9 @@ class App;
 
 class ProjectBrowser {
 public:
-    static constexpr int kMaxEntries = 80;    // spec 05 appendix E1.2: 0x50 entries
+    // Stock lists 0x50 entries (spec 05 appendix E1.2); 2.x lists 200 [OT]
+    // (user report: large libraries were cut off). Storage is SDRAM.
+    static constexpr int kMaxEntries = 200;
     static constexpr int kNameCap = 40;       // bound to FileScreen::entries[][40]
     static constexpr int kPathMax = 253;      // spec 05 appendix E1.2 New Folder limit
     static constexpr int kFolderNameMax = 32; // keyboard max length

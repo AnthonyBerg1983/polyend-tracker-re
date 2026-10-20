@@ -353,3 +353,33 @@ TEST(render_and_load_opens_sample_loader) {
     LoaderScreen& l = *static_cast<LoaderScreen*>(a.ui.screen(kModLoader));
     CHECK_EQ(l.insCursor, int(a.currentInstrument()));
 }
+
+// File > Open Project and Import Mod list up to ProjectBrowser::kMaxEntries
+// (80 like stock, spec 05 appendix E1.2; 2.x: 200). User report: the list
+// stopped at 64.
+TEST(file_lists_hold_80_entries) {
+    Harness h;
+    h.fs.dirs.insert("Projects");
+    h.fs.dirs.insert("Mod");
+    for (int i = 0; i < 210; ++i) {
+        char p[64];
+        std::snprintf(p, sizeof p, "Projects/Song %03d", i);
+        h.fs.dirs.insert(p);
+        std::snprintf(p, sizeof p, "Projects/Song %03d/project.mt", i);
+        h.fs.files[p] = std::vector<uint8_t>(64, 0);
+        std::snprintf(p, sizeof p, "Mod/tune%03d.mod", i);
+        h.fs.files[p] = std::vector<uint8_t>(2048, 0);
+    }
+    auto& f = *static_cast<FileScreen*>(h.app->ui.screen(kModFile));
+    h.tap(btn::File);
+    h.tap(btn::F2);   // Open Project
+    CHECK_EQ(f.state, 1);
+    std::printf("  open list %d entries\n", f.count);
+    CHECK_EQ(f.count, ProjectBrowser::kMaxEntries);
+    f.state = 0;      // back to the File page
+    f.count = 0;
+    h.tap(btn::F3);   // Import Mod
+    CHECK_EQ(f.state, 2);
+    std::printf("  mod list %d entries (state %d)\n", f.count, f.state);
+    CHECK_EQ(f.count, ProjectBrowser::kMaxEntries);
+}

@@ -157,6 +157,13 @@ public:
     uint8_t editorTrack = 0;
     // Sample loader file preview (spec 04 §1.3 WAVPREVIEW); null stops it.
     void previewFile(const int16_t* data, uint32_t frames, bool stereo) { engine.previewBuffer(data, frames, stereo); }
+    // Pitched preview (2.x): planar lanes (right nullptr = mono) at note
+    // `note` (60 = own pitch) through the same player.
+    void previewPitched(const int16_t* left, const int16_t* right, uint32_t frames, int note) {
+        engine.previewBufferLR(left, right, frames, previewStep(note));
+    }
+    // 16.16 player step for `note` relative to 60 (fm::kNoteRatio).
+    static uint32_t previewStep(int note);
     // Stop every voice (also before any sample-bank move: voices point into it).
     void allVoicesOff();
 
@@ -473,6 +480,9 @@ public:
     int firstFreeSampleSlot() const;
     // Write mono frames as a 16-bit 44.1 kHz WAV (spec 02 §8.3).
     bool writeWav(const char* path, const int16_t* mono, uint32_t frames);
+    // 2.x stereo recording: planar lanes l / r written interleaved as a
+    // 2-channel 16-bit 44.1 kHz WAV (r nullptr = the mono file).
+    bool writeWav(const char* path, const int16_t* l, const int16_t* r, uint32_t frames);
 
     // ---- screenshot (screenshot.cpp; spec 05 §3.4) -------------------------
     // Writes the first free Snapshots/Snapshot_NNN.bmp; false if the display
@@ -530,7 +540,12 @@ private:
     using ExtKeep = uint8_t[kPatternCount + 1];
     OT_APP_SDRAM_MEMBER(ExtKeep, extKeep_);   // cleared in init()
     // Synth slots: patch model, where it came from, dirty bits.
-    SynthPatch patches_[kSynthSlotCount] = {};
+    // Synth slot patches (7.9 KB): edited in the main loop; the audio block
+    // reads them through SynthBank::bindPatch on a patch change and for
+    // macros at note starts (like the sample bank, SDRAM reads are fine
+    // there). SDRAM on the device (stack headroom); constructed in init().
+    using SynthPatches = SynthPatch[kSynthSlotCount];
+    OT_APP_SDRAM_MEMBER(SynthPatches, patches_);
     PatchSource patchSrc_[kSynthSlotCount] = {};
     bool patchDirty_[kSynthSlotCount] = {};
     // Load Patch preview (synth_slots.cpp): slot (-1 none), its saved source

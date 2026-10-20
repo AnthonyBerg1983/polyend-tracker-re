@@ -1127,7 +1127,11 @@ void PatternScreen::onPad(uint8_t pad, uint8_t state) {
             a.setCurrentInstrument(isMidiTrack(track) ? synthui::midiTrackPadInstrument(pad) : pad);
             refreshBar();
         }
-        a.previewOn(voice, a.currentInstrument(), note, 127);
+        // Instr column: the pad picks an instrument and auditions it at note
+        // 60, like the Instr-column record and edit paths (spec 16 §A.6),
+        // not at the pad's own note (user report: every instrument one
+        // semitone higher than the previous one).
+        a.previewOn(voice, a.currentInstrument(), col == 1 ? uint8_t(60) : note, 127);
         padVoice_[pad] = int8_t(pad);
         return;
     }
