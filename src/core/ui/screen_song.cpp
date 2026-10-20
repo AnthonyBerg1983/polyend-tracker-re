@@ -362,7 +362,7 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
                 const int top = a.fileUndo.topNumber();
                 uint8_t num = 0;
                 if (top < 1 || !a.popFileUndo(&num)) {
-                    ui_.notify("Nothing to undo");
+                    ui_.notify("No undo data :(");
                     break;
                 }
                 s.stop();

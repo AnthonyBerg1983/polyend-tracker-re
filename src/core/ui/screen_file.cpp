@@ -57,12 +57,13 @@ bool recentPath(App& a, int index, char* folder, int fcap, char* name, int ncap)
 
 // ---- Import Mod browser (state 2; spec 05 appendix E1.2, spec 11 §1.1) ----
 constexpr const char* kModDir = "Mod";
-constexpr int kModEntries = 64;
+OT_SDRAM_BSS char g_fileListNames[ProjectBrowser::kMaxEntries][40];   // FileScreen::entries
+constexpr int kModEntries = ProjectBrowser::kMaxEntries;   // the same limit as Open (2.x: 200)
 constexpr int kModNameCap = 56;
 enum : uint8_t { kMbUp = 0, kMbFolder = 1, kMbFile = 2 };
 char g_modPath[ProjectBrowser::kPathMax + 1] = "Mod";
 OT_SDRAM_BSS char g_modNames[kModEntries][kModNameCap];   // SDRAM on the device (OP-5)
-uint8_t g_modKinds[kModEntries];
+OT_SDRAM_BSS uint8_t g_modKinds[kModEntries];
 int g_modCount = 0;
 OT_SDRAM_BSS char g_importPath[ProjectBrowser::kPathMax + kModNameCap + 2];
 char g_importName[kModNameCap];
@@ -244,7 +245,7 @@ static void exportIt(App& a) {
 void FileScreen::start(int opt) {
     (void)opt;
     g_app = &app_;
-    projBrowser().bind(entries, int(sizeof(entries) / sizeof(entries[0])));
+    projBrowser().bind(entries, ProjectBrowser::kMaxEntries);
     state = 0;
     refreshBar();
 }
@@ -286,7 +287,7 @@ void FileScreen::update(uint32_t now) {
 void FileScreen::list() {
     App& a = app_;
     g_app = &a;
-    projBrowser().bind(entries, int(sizeof(entries) / sizeof(entries[0])));
+    projBrowser().bind(entries, ProjectBrowser::kMaxEntries);
     // spec 05 §1.3 progress popup while the list loads ("Loading projects list").
     ui_.progress(kLoadingProjects, 0);
     projBrowser().list(a);
@@ -347,7 +348,7 @@ static void enterBrowser(FileScreen& s, int mode) {
     s.state = mode;
     s.focus = 0;
     s.cursor = 0;
-    projBrowser().bind(s.entries, int(sizeof(s.entries) / sizeof(s.entries[0])));
+    projBrowser().bind(s.entries, ProjectBrowser::kMaxEntries);
     g_app->ui.progress(kLoadingProjects, 0);   // closed by list()
     projBrowser().reset(*g_app, kProjectsDir);
     s.list();
@@ -965,5 +966,7 @@ void FileScreen::draw(Gfx& g) {
         g.display().drawImage(int16_t(x), int16_t(y), IDisplay::kRamGCover, coverW, coverH);
     }
 }
+
+char (*fileListNames())[40] { return g_fileListNames; }
 
 }  // namespace ot

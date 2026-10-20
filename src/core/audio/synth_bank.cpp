@@ -152,6 +152,13 @@ int SynthBank::playable(int s) const {
     return poly < c ? poly : c;
 }
 
+float SynthBank::trackPeak(int t) {
+    if (t < 0 || t >= kSynthTracks) return 0.0f;
+    const float p = trackPeak_[t];
+    trackPeak_[t] = 0.0f;
+    return p;
+}
+
 float SynthBank::slotPeak(int s) {
     if (s < 0 || s >= kSynthSlots) return 0.0f;
     const float p = peak_[s];
@@ -835,7 +842,10 @@ OT_FASTRUN_FN bool SynthBank::render(const SynthMixInputs& in, float* mL, float*
             }
             V.v.fading = V.state == kFading;
             V.fresh = 0;
-            const float target = voiceGain(sl, V);   // 0 while fading
+            // Voice gain x the Track Mixer fader of the voice's track (user
+            // report: synth tracks ignored the Track Mixer volume).
+            const float tg = V.track >= 0 && V.track < kSynthTracks ? in.trackGain[V.track] : 1.0f;
+            const float target = voiceGain(sl, V) * tg;   // 0 while fading
             const float g0 = V.g;
             const float gInc = (target - g0) * (1.0f / float(kBlock));
             V.g = target;
@@ -881,7 +891,20 @@ OT_FASTRUN_FN bool SynthBank::render(const SynthMixInputs& in, float* mL, float*
         }
         if (tapped) sl.eng->setSendTap(s, nullptr, nullptr, 0.0f, 0.0f);
         if (prof) prof_->slot[s] += engCyc;
-        mixSlot(sl, mL, mR, dsend, rsend, stem);
+        const float pk = mixSlot(sl, mL, mR, dsend, rsend, stem);
+        // Track Mixer meters: the slot's block peak shared by its sounding
+        // voices by envelope level x gain (exact for one voice).
+        if (pk > 0.0f) {
+            float wsum = 0.0f;
+            for (const Voice& V : voices_)
+                if (V.state != kFree && V.v.slot == s) wsum += V.v.level * V.g;
+            if (wsum > 0.0f)
+                for (const Voice& V : voices_) {
+                    if (V.state == kFree || V.v.slot != s || V.track < 0 || V.track >= kSynthTracks) continue;
+                    const float share = pk * (V.v.level * V.g) / wsum;
+                    if (share > trackPeak_[V.track]) trackPeak_[V.track] = share;
+                }
+        }
         any = true;
     }
     // The next block begins: its voice starts count from 0 and the notes
@@ -928,13 +951,14 @@ const MixFn kMix[2][2][2] = {{{mixLoop<false, false, false, false>, mixLoop<fals
                               {mixLoop<true, true, false, false>, mixLoop<true, true, true, false>}}};
 }  // namespace
 
-OT_FASTRUN_FN void SynthBank::mixSlot(Slot& sl, float* mL, float* mR, float* dsend, float* rsend, int16_t* stem) {
+OT_FASTRUN_FN float SynthBank::mixSlot(Slot& sl, float* mL, float* mR, float* dsend, float* rsend, int16_t* stem) {
     float l0, r0, d0, e0;
     const float li = sl.gl.begin(l0), ri = sl.gr.begin(r0), di = sl.sd.begin(d0), ei = sl.sr.begin(e0);
     const bool dl = d0 != 0.0f || di != 0.0f, rv = e0 != 0.0f || ei != 0.0f;
     const bool ramp = li != 0.0f || ri != 0.0f || di != 0.0f || ei != 0.0f;
     float* bl = busL_;
     float* br = busR_;
+    float blockPk = 0.0f;
     // Meter peak (Global Mixer 3/3, a UI reading): every 8th frame of the
     // bus at the block-end gains is enough and keeps the mix loops as they were.
     {
@@ -949,10 +973,11 @@ OT_FASTRUN_FN void SynthBank::mixSlot(Slot& sl, float* mL, float* mR, float* dse
         const float pk = pl * (gL < 0.0f ? -gL : gL) > pr * (gR < 0.0f ? -gR : gR) ? pl * (gL < 0.0f ? -gL : gL)
                                                                                     : pr * (gR < 0.0f ? -gR : gR);
         if (pk > peak_[s]) peak_[s] = pk;
+        blockPk = pk;
     }
     if (!stem) {
         kMix[ramp][dl][rv](bl, br, mL, mR, dsend, rsend, l0, r0, d0, e0, li, ri, di, ei);
-        return;
+        return blockPk;
     }
     mixLoop<true, true, true, true>(bl, br, mL, mR, dsend, rsend, l0, r0, d0, e0, li, ri, di, ei);
     for (uint32_t i = 0; i < kBlock; ++i) {
@@ -960,6 +985,7 @@ OT_FASTRUN_FN void SynthBank::mixSlot(Slot& sl, float* mL, float* mR, float* dse
         stem[2 * i + 1] = toS16(br[i]);
         bl[i] = br[i] = 0.0f;
     }
+    return blockPk;
 }
 
 }  // namespace audio

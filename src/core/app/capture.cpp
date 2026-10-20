@@ -6,19 +6,31 @@
 
 namespace ot {
 
-void Capture::setBuffer(int16_t* buf, uint32_t capacityFrames) {
+void Capture::setBuffer(int16_t* buf, uint32_t capacitySamples) {
     buf_ = buf;
-    cap_ = buf ? capacityFrames : 0;
+    cap_ = buf ? capacitySamples : 0;
 }
 
-float Capture::takePeak() {
-    const float p = peak_;
-    peak_ = 0.0f;
+float Capture::takePeak(int side) {
+    float p;
+    if (side == 0) {
+        p = peakL_;
+        peakL_ = 0.0f;
+    } else {
+        p = peakR_;
+        peakR_ = 0.0f;
+    }
     return p;
 }
 
+float Capture::takePeak() {
+    const float l = takePeak(0), r = takePeak(1);
+    return l > r ? l : r;
+}
+
 void Capture::start(uint32_t steps, float stepSeconds, uint32_t beatSteps, uint32_t barSteps,
-                    bool clickWhileRecording) {
+                    bool clickWhileRecording, bool stereo) {
+    stereo_ = stereo;
     len_ = 0;
     full_ = false;
     countPos_ = 0;
@@ -43,18 +55,31 @@ void Capture::stop() {
 void Capture::process(const int16_t* in, uint32_t frames, audio::AudioEngine* eng) {
     const uint8_t st = state_;
     if (!metering_ && st == kIdle) return;
-    float peak = peak_;
+    // Stereo lanes (2.x): latched by start(); the meters show L and R while
+    // the recorder sits in the setup page with a stereo line input too.
+    const bool st2 = stereo_;
+    const uint32_t capF = st2 ? cap_ / 2 : cap_;
+    int16_t* const bufR = buf_ ? buf_ + capF : nullptr;
+    float peakL = peakL_, peakR = peakR_;
     uint32_t len = len_;
     for (uint32_t i = 0; i < frames; ++i) {
-        float x = 0.0f;
+        float x = 0.0f, l = 0.0f, r = 0.0f;
         if (in) {
-            const float l = float(in[2 * i]), r = float(in[2 * i + 1]);
+            l = float(in[2 * i]);
+            r = float(in[2 * i + 1]);
             x = chMode_ == 1 ? l : (chMode_ == 2 ? r : 0.5f * (l + r));
         }
         if (x > 32767.0f) x = 32767.0f;
         if (x < -32768.0f) x = -32768.0f;
-        const float a = std::fabs(x) / 32768.0f;
-        if (a > peak) peak = a;
+        if (st2) {
+            const float al = std::fabs(l) / 32768.0f, ar = std::fabs(r) / 32768.0f;
+            if (al > peakL) peakL = al;
+            if (ar > peakR) peakR = ar;
+        } else {
+            const float a = std::fabs(x) / 32768.0f;
+            if (a > peakL) peakL = a;
+            if (a > peakR) peakR = a;
+        }
         // Metronome on every step boundary (spec 07 Q10 case 3; accent 100 /
         // normal 45 cents as the sequencer clicks, spec 03 §2.5).
         if ((st == kCountIn || (st == kRecording && clickRec_)) && stepFrames_) {
@@ -68,20 +93,29 @@ void Capture::process(const int16_t* in, uint32_t frames, audio::AudioEngine* en
         if (st == kCountIn) {
             if (countLeft_ > 0) --countLeft_;
         } else if (st == kRecording) {
-            if (len < cap_) buf_[len++] = int16_t(std::lrint(x));
-            else full_ = true;
+            if (len >= capF) {
+                full_ = true;
+            } else if (st2) {   // the codec samples are already int16: no clamp
+                buf_[len] = int16_t(l);
+                bufR[len++] = int16_t(r);
+            } else {
+                buf_[len++] = int16_t(std::lrint(x));
+            }
         }
     }
     len_ = len;
-    peak_ = peak;
+    peakL_ = peakL;
+    peakR_ = peakR;
     if (st == kCountIn && countLeft_ == 0) state_ = kRecording;
     if (st == kRecording && full_) state_ = kIdle;   // memory full: recording stopped
 }
 
-void autoTrim(const int16_t* d, uint32_t len, uint32_t* start, uint32_t* end) {
+namespace {
+// One lane; false when no frame crosses the threshold (full range kept).
+bool trimLane(const int16_t* d, uint32_t len, uint32_t* start, uint32_t* end) {
     *start = 0;
     *end = len;
-    if (!d || len == 0) return;
+    if (!d || len == 0) return false;
     // Envelope: attack coefficient exp(-0.0499), release one-pole 0.99/0.01.
     const float att = std::exp(-0.0499f);
     const float thr = 32767.0f * std::pow(10.0f, -3.5f);
@@ -95,7 +129,7 @@ void autoTrim(const int16_t* d, uint32_t len, uint32_t* start, uint32_t* end) {
             last = i;
         }
     }
-    if (first < 0) return;
+    if (first < 0) return false;
     int64_t s = first - 44, e = last + 1 + 44;
     if (s < 0) s = 0;
     if (e > int64_t(len)) e = len;
@@ -103,6 +137,26 @@ void autoTrim(const int16_t* d, uint32_t len, uint32_t* start, uint32_t* end) {
     if (s > e - 1) s = e - 1;
     *start = uint32_t(s);
     *end = uint32_t(e);
+    return true;
+}
+}  // namespace
+
+void autoTrim(const int16_t* d, uint32_t len, uint32_t* start, uint32_t* end) { trimLane(d, len, start, end); }
+
+void autoTrimLR(const int16_t* l, const int16_t* r, uint32_t len, uint32_t* start, uint32_t* end) {
+    uint32_t s0, e0, s1, e1;
+    const bool hl = trimLane(l, len, &s0, &e0);
+    const bool hr = r && trimLane(r, len, &s1, &e1);
+    if (hl && hr) {
+        *start = s0 < s1 ? s0 : s1;
+        *end = e0 > e1 ? e0 : e1;
+    } else if (hr) {
+        *start = s1;
+        *end = e1;
+    } else {
+        *start = s0;   // left only, or the full range
+        *end = e0;
+    }
 }
 
 int meterUnits(float peak) {

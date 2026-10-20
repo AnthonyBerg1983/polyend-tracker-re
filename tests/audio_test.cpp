@@ -959,3 +959,46 @@ TEST(cpu_budget_estimate) {
     std::printf("  host time per block (8 voices + fx, this build's flags): %.1f us (budget 2901 us)\n", us);
     CHECK(us > 0.0);
 }
+
+// 2.x pitched raw preview: planar lane pointers (previewBuffer stereo = R
+// after L; previewBufferLR separate lanes) and the 16.16 step with linear
+// interpolation per channel.
+TEST(preview_lr_pointers_and_pitched_step) {
+    Rig r;
+    std::vector<int16_t> st(2 * 1000, 0);
+    r.eng->previewBuffer(st.data(), 1000, true);
+    CHECK(r.eng->previewBufferLeft() == st.data());
+    CHECK(r.eng->previewBufferRight() == st.data() + 1000);
+    CHECK_EQ(r.eng->previewBufferStep(), 65536u);
+    r.eng->previewBuffer(st.data(), 1000, false);
+    CHECK(r.eng->previewBufferRight() == nullptr);
+    // Separate lanes at twice the rate: 1000 frames play in 500 output frames.
+    std::vector<int16_t> L(1000, 8000), R(1000, -8000);
+    r.eng->previewBufferLR(L.data(), R.data(), 1000, 131072u);
+    CHECK(r.eng->previewBufferLeft() == L.data());
+    CHECK(r.eng->previewBufferRight() == R.data());
+    CHECK_EQ(r.eng->previewBufferStep(), 131072u);
+    int16_t out[kBlock * 2];
+    r.eng->renderLive(out);
+    CHECK(out[2 * 10] > 7000);
+    CHECK(out[2 * 10 + 1] < -7000);
+    r.eng->renderLive(out);
+    r.eng->renderLive(out);
+    CHECK(r.eng->previewBufferActive());   // 384 output frames < 500
+    r.eng->renderLive(out);
+    CHECK(!r.eng->previewBufferActive());  // 512 >= 500
+    CHECK(out[2 * 115] > 7000);            // frame 499 still plays
+    CHECK_EQ(out[2 * 117], 0);             // past the end: silence
+    // Half rate on a ramp: the odd output frames are the interpolated midpoints.
+    std::vector<int16_t> ramp(1000);
+    for (int i = 0; i < 1000; ++i) ramp[size_t(i)] = int16_t(i * 20);
+    r.eng->previewBufferLR(ramp.data(), nullptr, 1000, 32768u);
+    r.eng->renderLive(out);
+    CHECK(r.eng->previewBufferRight() == nullptr);
+    for (int k = 10; k < 60; k += 7) {
+        const int a0 = out[2 * (2 * k)], m = out[2 * (2 * k + 1)], a1 = out[2 * (2 * k + 2)];
+        CHECK(a1 > a0);
+        CHECK(std::abs(2 * m - a0 - a1) <= 2);
+        CHECK_EQ(out[2 * (2 * k + 1)], out[2 * (2 * k + 1) + 1]);   // mono on both sides
+    }
+}

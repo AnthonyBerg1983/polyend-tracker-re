@@ -7,6 +7,7 @@
 #include "app/midi_cc.h"
 #include "app/pattern_ops.h"
 #include "app/perf_presets.h"
+#include "app/project_browser.h"
 #include "model/synth_patch.h"
 #include "ui/ui.h"
 #include "ui/wave.h"
@@ -340,6 +341,7 @@ public:
     static int meterBar(float meanLevel);
     int meter[8] = {};      // current bar 0..100
     int meterHold[8] = {};  // peak hold 0..100
+    int globalMeter[4][2] = {};   // Global Mixer 3/3: Delay, Reverb, Dry, Line In x L/R, 0..100
     // Master Limiter gain-reduction meter (spec 06 §4.3): dB of reduction
     // from the engine's mean limiter gain, read every 50 ms; the bar spans
     // 0..kGrRangeDb (OpenTracker's scale).
@@ -377,6 +379,7 @@ private:
     uint32_t lastDecay_ = 0;
     uint32_t lastGr_ = 0;
     float hist_[8][10] = {};
+    float ghist_[4][2][10] = {};
     int histPos_ = 0;
     // Bank B activity (update()): last step seen and the dot's end time.
     int16_t actStep_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
@@ -385,6 +388,10 @@ private:
 
 // ---------------------------------------------------------------------------
 // File (spec 05 §2.12 + appendix E)
+// SDRAM storage of FileScreen::entries (screen_file.cpp); only the pointer
+// is set at construction, the names are written in the main loop.
+char (*fileListNames())[40];
+
 class FileScreen final : public Screen {
 public:
     using Screen::Screen;
@@ -397,7 +404,9 @@ public:
 
     int state = 0;          // 0 main, 1 open, 2 import mod, 3 save, 4 export
     int count = 0;
-    char entries[64][40];
+    // Open / Save list names (ProjectBrowser::kMaxEntries x 40). 2.x: 200
+    // entries (stock 80, spec 05 appendix E1.2) in SDRAM (screen_file.cpp).
+    char (*entries)[40] = fileListNames();
     int cursor = 0;
     int focus = 0;          // open: 0 SD list, 1 recent
     int pending = 0;        // action after a save prompt: 1 new, 2 open, 3 recent, 4 import, 5 .it
@@ -638,6 +647,7 @@ public:
     bool encoderFast() const override { return true; }
     bool ownsModuleKey(uint8_t id) const override { return id == btn::SampleEditor; }
     bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
+    void onPad(uint8_t pad, uint8_t state) override;
 
     uint16_t startM = 0, endM = 65535;
     int focus = 0;          // page 1: 0 start, 1 end, 2 zoom, 3 effect list (spec 06 §6.3)
@@ -648,6 +658,10 @@ public:
     float params[17][9] = {};
     bool undoAvail = false;
     int previewState = 0;   // 0 dirty, 1 processed (spec 06 §6.4 F7)
+    // What the processed preview was made from: a different selection or
+    // effect makes it dirty again (preview()).
+    uint32_t prevS0_ = 0, prevS1_ = 0;
+    int prevEffect_ = -1;
     bool previewPlaying = false;
     bool inert = false;     // MIDI / empty slot, too long, or waiting for the stop prompt
     WaveZoom view;
@@ -655,7 +669,7 @@ public:
     // Run the selected effect on Start..End and commit it (keeps one undo).
     bool apply();
     bool undo();
-    bool preview();         // process the selection and play it
+    bool preview(int note = 60);   // process the selection and play it at `note` (60 = own pitch)
 
 private:
     void enter();
@@ -669,6 +683,7 @@ private:
     bool undoStereo_ = false;
     uint8_t slot_ = 0;
     uint8_t lastInstr_ = 0xFF;
+    int padPreview_ = -1;   // pad that started the running preview
     int midiNote_ = -1;     // MIDI note that started the running preview (spec 17 §1.3 owner 3)
 };
 
@@ -694,7 +709,8 @@ public:
     uint16_t startM = 0, endM = 65535;
     uint32_t off = 0, len = 0;               // current (cropped) view into the capture buffer
     int undoDepth = 0;
-    int meter = 0;          // 0..100 meter units
+    int meter = 0;          // 0..100 meter units (left / mono)
+    int meterR = 0;         // right meter (2.x stereo line in; = meter in mono)
     // Level meter ballistics (appendix C §2.6): read every display frame,
     // instant rise, fall 1 unit per ms down to the current reading.
     static constexpr uint32_t kMeterMs = 16;
@@ -731,6 +747,9 @@ private:
     void openNaming(const char* initial);
     void selection(uint32_t* s0, uint32_t* s1) const;
     const int16_t* data() const;
+    const int16_t* dataR() const;          // right lane (stereo take), else nullptr
+    bool stereoInput() const;              // Line In source with Config Line in channel = Stereo
+    const char* sourceName(int src) const; // "Line in ST" / "Line in L" / "Line in R" for Line In
     struct View {
         uint32_t off, len;
     } undo_[kUndoLevels] = {};

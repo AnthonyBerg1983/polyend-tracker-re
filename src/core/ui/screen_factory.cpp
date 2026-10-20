@@ -90,7 +90,7 @@ void FactoryTest::enter(int s) {
             audioPhase_ = -1;
             audioOk_[0] = audioOk_[1] = false;
             savedBuf_ = app_.capture.buffer();
-            savedCap_ = app_.capture.capacity();
+            savedCap_ = app_.capture.bufferSamples();
             if (app_.capture.active() || !app_.bank.tail() || app_.bank.freeSamples() < kRecordFrames) {
                 std::snprintf(detail_, sizeof(detail_), "no free sample memory to record");
                 finish(kSkip);

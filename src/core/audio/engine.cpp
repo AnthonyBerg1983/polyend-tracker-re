@@ -381,13 +381,28 @@ void AudioEngine::midiSend(uint8_t portMask, const uint8_t* bytes, uint8_t len) 
     routeMidi(*midi_, portMask, bytes, len);
 }
 
-void AudioEngine::previewBuffer(const int16_t* data, uint32_t frames, bool stereo, uint32_t avail) {
+void AudioEngine::previewBuffer(const int16_t* data, uint32_t frames, bool stereo, uint32_t avail, uint32_t step) {
     raw_.active = false;
     if (!data || !frames) return;
     raw_.data = data;
+    raw_.right = stereo ? data + frames : nullptr;   // planar: R follows L
     raw_.frames = frames;
     raw_.avail = avail < frames ? avail : frames;   // set before active
-    raw_.stereo = stereo;
+    raw_.step = step ? step : 65536u;
+    raw_.frac = 0;
+    raw_.pos = 0;
+    raw_.active = true;
+}
+
+void AudioEngine::previewBufferLR(const int16_t* left, const int16_t* right, uint32_t frames, uint32_t step) {
+    raw_.active = false;
+    if (!left || !frames) return;
+    raw_.data = left;
+    raw_.right = right;
+    raw_.frames = frames;
+    raw_.avail = frames;
+    raw_.step = step ? step : 65536u;
+    raw_.frac = 0;
     raw_.pos = 0;
     raw_.active = true;
 }
@@ -396,11 +411,20 @@ void AudioEngine::previewAvail(uint32_t frames) { raw_.avail = frames < raw_.fra
 
 void AudioEngine::previewStop() { raw_.active = false; }
 
+float AudioEngine::busPeak(int ch, int side) {
+    if (ch < 0 || ch > 3 || side < 0 || side > 1) return 0.0f;
+    const float p = busPeak_[ch][side];
+    busPeak_[ch][side] = 0.0f;
+    return p;
+}
+
 float AudioEngine::trackPeak(int t) {
     if (t < 0 || t >= kVoices) return 0.0f;
     const float p = peak_[t];
     peak_[t] = 0.0f;
-    return p;
+    // A track playing a synth meters its synth notes too (2.x).
+    const float s = synth_.trackPeak(t);
+    return s > p ? s : p;
 }
 
 // --- per-block control ---------------------------------------------------------
@@ -498,6 +522,11 @@ void AudioEngine::controlBlock(float blockUs) {
     }
     synthIn_.delayLevel = dl;   // synth sends scale with the Global Mixer like track sends
     synthIn_.reverbLevel = rl;
+    // Synth notes follow their track's Track Mixer fader and mute / solo,
+    // like the sample voice of that track (tracks 1-8; 9-16 have no fader).
+    for (int t = 0; t < 16; ++t)
+        synthIn_.trackGain[t] =
+            t < kVoices ? ((m.trackMute[t] || (anySolo && !m.trackSolo[t])) ? 0.0f : trkGain(m.trackLevel[t])) : 1.0f;
     synth_.setTempo(tempo_);
     if (m.sidechain >= 1 && m.sidechain <= kVoices) vc_[m.sidechain - 1].ampTap = true;   // §5.3 source
 }
@@ -650,6 +679,22 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
         float l0;
         const float li = lineLvl_.begin(l0);
         if (anyVoice || dly || rev || line) {
+            // Global Mixer meters: the four MSUM inputs before the sum (every
+            // 8th frame, a UI reading like the synth slot meters; delay / reverb returns, the dry bus, line in x level).
+            auto peak = [](const float* a, float g) {
+                float p = 0.0f;
+                for (uint32_t i = 0; i < kBlock; i += 8) {
+                    const float v = a[i] < 0.0f ? -a[i] : a[i];
+                    p = v > p ? v : p;
+                }
+                return p * g;
+            };
+            const float* bus[4][2] = {{dL_, dR_}, {rL_, rR_}, {mL_, mR_}, {lineL_, lineR_}};
+            for (int ch = 0; ch < 4; ++ch)
+                for (int sd = 0; sd < 2; ++sd) {
+                    const float p = peak(bus[ch][sd], ch == 3 ? (l0 < 0.0f ? -l0 : l0) : 1.0f);
+                    if (p > busPeak_[ch][sd]) busPeak_[ch][sd] = p;
+                }
             switch (m.saturationMode) {
                 case 1: masterSum<1>(l0, li); break;
                 case 2: masterSum<2>(l0, li); break;
@@ -685,19 +730,49 @@ void AudioEngine::renderBlock(bool offline, int16_t* master, StemBlock* stems) {
     if (raw_.active && !offline) {
         const float g = trkGain(m.previewVolume) * (1.0f / 32768.0f);
         const int16_t* d = raw_.data;
+        const int16_t* dr = raw_.right;
         const uint32_t len = raw_.frames;
         uint32_t pos = raw_.pos;
         const uint32_t lim = raw_.avail;   // streamed: wait (silence) at the decoded end
-        OT_SDRAM_ACCESS(raw_.stereo ? 2 * kBlock : kBlock);
-        for (uint32_t i = 0; i < kBlock; ++i) {
-            if (pos < lim) {
-                rawL[i] = float(d[pos]) * g;
-                rawR[i] = raw_.stereo ? float(d[len + pos]) * g : rawL[i];
-                ++pos;
-            } else {
-                rawL[i] = rawR[i] = 0.0f;
-                if (lim >= len) ++pos;
+        const uint32_t step = raw_.step;
+        OT_SDRAM_ACCESS(dr ? 2 * kBlock : kBlock);
+        if (step == 65536u) {   // own pitch: plain copy (file preview, Preview buttons)
+            for (uint32_t i = 0; i < kBlock; ++i) {
+                if (pos < lim) {
+                    rawL[i] = float(d[pos]) * g;
+                    rawR[i] = dr ? float(dr[pos]) * g : rawL[i];
+                    ++pos;
+                } else {
+                    rawL[i] = rawR[i] = 0.0f;
+                    if (lim >= len) ++pos;
+                }
             }
+        } else {
+            // 2.x pitched pads: 16.16 step, linear interpolation per channel.
+            // The fraction is used as 15 bits so (x1 - x0) * f stays in int32
+            // (|x1 - x0| <= 65535, f <= 32767); no 64-bit math in the block.
+            uint32_t frac = raw_.frac;
+            for (uint32_t i = 0; i < kBlock; ++i) {
+                if (pos < lim) {
+                    const uint32_t nx = pos + 1 < lim ? pos + 1 : pos;   // last frame: hold
+                    const int32_t f = int32_t(frac >> 1);
+                    const int32_t l = d[pos] + (((int32_t(d[nx]) - d[pos]) * f) >> 15);
+                    rawL[i] = float(l) * g;
+                    if (dr) {
+                        const int32_t r = dr[pos] + (((int32_t(dr[nx]) - dr[pos]) * f) >> 15);
+                        rawR[i] = float(r) * g;
+                    } else {
+                        rawR[i] = rawL[i];
+                    }
+                    frac += step;
+                    pos += frac >> 16;
+                    frac &= 0xFFFFu;
+                } else {
+                    rawL[i] = rawR[i] = 0.0f;
+                    if (lim >= len) ++pos;
+                }
+            }
+            raw_.frac = frac;
         }
         raw_.pos = pos;
         if (pos >= len) raw_.active = false;
