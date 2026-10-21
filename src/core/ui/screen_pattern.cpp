@@ -769,9 +769,12 @@ void PatternScreen::pageButton(int f, uint8_t state) {
                 }
                 return;
             case 4:
+                // Preview plays the cursor / selection once and stops, as on
+                // stock 1.9.2 (user report: a looping one-row preview held
+                // the cursor and looked like a hang until Play).
                 if (state == kPress && !a.seq.isPlaying()) {
                     const SelRect r = target();
-                    a.seq.playSelection(r.s0, r.s1, r.t0, r.t1, true);
+                    a.seq.playSelection(r.s0, r.s1, r.t0, r.t1, false);
                 }
                 return;
             case 5:
