@@ -70,7 +70,7 @@ Always:
 | Insert | Insert |
 | Delete, Backspace | Delete |
 | Enter | encoder push |
-| Page Down / Page Up, mouse wheel down / up | encoder +1 / -1 (clockwise / counter-clockwise: down / up a list) |
+| Page Up / Page Down, mouse wheel | encoder +1 / -1 |
 | Ctrl+Q | quit |
 
 COMMAND mode (default):

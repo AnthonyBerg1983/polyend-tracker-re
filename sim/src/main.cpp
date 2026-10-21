@@ -396,6 +396,19 @@ void saveShot(Machine& m, const std::string& path, bool panel) {
 std::vector<std::string> gNotices;
 void recordNotice(const char* text) { gNotices.push_back(text); }
 
+// The synth screen's Edit view with a list (enum) row selected.
+bool wheelOnSynthList(const Machine& m) {
+    if (!m.app || m.app->ui.active() != ot::kModSynth) return false;
+    const auto* s = static_cast<const ot::SynthScreen*>(m.app->ui.screen(ot::kModSynth));
+    if (!s || s->view != ot::SynthScreen::View::Edit) return false;
+    const ot::synthui::Section* sec = nullptr;
+    const int n = ot::synthui::sections(s->engine(), &sec);
+    if (s->section < 0 || s->section >= n || sec[s->section].macro >= 0) return false;
+    if (s->row < 0 || s->row >= sec[s->section].count) return false;
+    const ot::synthui::ParamUi* u = ot::synthui::paramUi(s->engine(), sec[s->section].params[s->row]);
+    return u && u->fmt == ot::synthui::kFmtEnum;
+}
+
 struct Headless {
     Machine& m;
     bool panel;
@@ -886,7 +899,7 @@ int runInteractive(Machine& m, const Options& o) {
                         break;
                     }
                     if (sc == SDL_SCANCODE_PAGEUP || sc == SDL_SCANCODE_PAGEDOWN) {
-                        if (down) m.input.encoder(sc == SDL_SCANCODE_PAGEDOWN ? 1 : -1);
+                        if (down) m.input.encoder(sc == SDL_SCANCODE_PAGEUP ? 1 : -1);
                         break;
                     }
                     if (!padMode && (sc == SDL_SCANCODE_LEFTBRACKET || sc == SDL_SCANCODE_RIGHTBRACKET)) {
@@ -905,10 +918,13 @@ int runInteractive(Machine& m, const Options& o) {
                     break;
                 }
                 case SDL_MOUSEWHEEL: {
-                    // Wheel down = clockwise: lists then scroll with the wheel
-                    // (a clockwise turn moves down a list on the Tracker).
-                    int d = -ev.wheel.y;
+                    int d = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) d = -d;
+                    // Wheel up = clockwise (raises values). On a synth Edit
+                    // Patch list (Filter Type, LFO Waveform, ...) clockwise
+                    // moves down the list, so there the wheel is flipped to
+                    // scroll with the list (simulator only; user report).
+                    if (wheelOnSynthList(m)) d = -d;
                     if (d) m.input.encoder(d);
                     break;
                 }
