@@ -37,6 +37,12 @@
 //   vapworst  VAP, one voice of the costliest settings: hard sync (both
 //             oscillators on the general morph), noise, LP OB 24 with its
 //             soft clip, six mod slots incl. Filter Env Decay (<= 18k)
+//   fatinit   FAT engine, one voice of the Init patch (prepare + render), per
+//             block (docs/specs/2x-07-fat-engine.md: <= 12k)
+//   fatworst  FAT, one voice of the costliest settings: seven saws with
+//             Timbre's second saw, Brightness, noise, LP OB 24 with its soft
+//             clip, filter envelope + S&H LFO, glide 108 -> 96 (measured
+//             at pitch ~108, where the polyBLEP events cost most; <= 22k)
 //   mix       2.0.0 worst mix (docs/MINI_PLAN.md §5 hardware checklist): the
 //             stereo8 set (8 stereo sample voices, delay + reverb) plus 4
 //             ACD voices of the worst-case patch in Synth 1 and the costly
@@ -44,7 +50,9 @@
 //             sends on), through renderLive with the real engines, at the
 //             default synth voice budget 4 (the governor steals the fifth
 //             voice); mix5 / mix6 at budgets 5 and 6 (all of them play).
-//             Reported as % of the block budget (the plan's 70 % alarm)
+//             Reported as % of the block budget (the plan's 70 % alarm).
+//             mixfat: the mix set with 4 worst-case FAT voices (fatworst's
+//             patch) in Synth 1 instead of ACD, budget 4
 //   pswitch   immediate pattern switch while playing (OPTIMIZATION_2X item 2,
 //             OP-1): the play8 set with the sequencer driving the engine
 //             (pre-block hook, as on the device) and a pattern switch
@@ -68,6 +76,7 @@
 #include "audio/engines/perc.h"
 #include "audio/synth_params.h"
 #include "audio/engines/acd.h"
+#include "audio/engines/fat.h"
 #include "audio/engines/vap.h"
 #include "formats/patch_pb.h"
 #include "peak_trace.h"
@@ -284,6 +293,63 @@ double vapVoice(bool worst) {
     return (nowUnits() - t0) / blocks;
 }
 
+// FAT bench patch: Init, or the costliest settings (every pair, Timbre's
+// second saw, Brightness and Noise, LP OB 24 with resonance, the filter's
+// envelope and a 30 Hz S&H LFO retriggered per note, 3 s glide).
+void fatWorst(float* vals) {
+    using namespace fat;
+    const float w[][2] = {{kFatness, 1.0f}, {kTimbre, 1.0f}, {kNoise, 0.3f}, {kBrightness, -0.5f},
+                          {kFilterType, kLpOb24}, {kResonance, 1.2f}, {kFilterLfo, 0.3f}, {kFilterEnv, 0.5f},
+                          {kEnvS, 0.5f}, {kLfoHz, 30.0f}, {kLfoWave, kSampleHold}, {kLfoRetrig, kNote},
+                          {kGlideTime, 3.0f}};
+    for (auto& x : w) vals[int(x[0])] = x[1];
+}
+
+// One FAT voice per block (prepare + render), sustained note (worst: gliding
+// down from pitch 108 to 96 on a reused voice: the polyBLEP event cost grows
+// with pitch, so the figure is taken at the top of the range; the 3 s glide
+// moves ~1.2 semitones over the emulated run, so it is measured at ~108).
+double fatVoice(bool worst) {
+    static float vals[kSynthParamMax];
+    int count = 0;
+    const PatchParamRange* t = patchEngineParams(kSynthEngineFat, &count);
+    for (int i = 0; i < count; ++i) vals[i] = t[i].def;
+    vals[fat::kAmpS] = 1.0f;   // keep the voice sounding for the whole run
+    if (worst) fatWorst(vals);
+    static SynthParams p;
+    p.engine = kSynthEngineFat;
+    p.count = count;
+    for (int i = 0; i < count; ++i) p.start[i] = p.end[i] = vals[i];
+    p.serial = 1;
+    ISynthEngine* e = fat::engine();
+    static SynthSlotScratch sc;
+    static SynthVoice v;
+    e->slotReset(sc);
+    v = SynthVoice{};
+    v.slotScratch = &sc;
+    v.gate = true;
+    SynthNote n;
+    n.pitch = worst ? 108.0f : 48.0f;
+    e->noteOn(v, p, n);
+    static float l[kBlock], r[kBlock];
+    const int blocks = 800 / kScale;
+    for (int b = 0; b < 20; ++b) {   // past the attack
+        e->prepare(sc, p);
+        e->render(v, p, 0.5f, 0.0f, l, r);
+    }
+    if (worst) {
+        n.pitch = 96.0f;
+        n.reused = true;
+        e->noteOn(v, p, n);
+    }
+    const double t0 = nowUnits();
+    for (int b = 0; b < blocks; ++b) {
+        e->prepare(sc, p);
+        e->render(v, p, 0.5f, 0.0f, l, r);
+    }
+    return (nowUnits() - t0) / blocks;
+}
+
 void reportVoice(const char* name, double v, int limit) {
 #ifdef OT_BENCH_M4
     std::printf("  %-8s %7.0f insn per voice per block (limit %d)\n", name, v, limit);
@@ -293,9 +359,9 @@ void reportVoice(const char* name, double v, int limit) {
 #endif
 }
 
-// mix: stereo8 + 4 worst ACD voices + the costly PERC kit (see the header),
-// at synth voice budget `budget` (Governor; the default is 4).
-void mixBench(int budget, const char* name) {
+// mix: stereo8 + 4 worst ACD voices (fat: FAT voices) + the costly PERC kit
+// (see the header), at synth voice budget `budget` (Governor; the default is 4).
+void mixBench(int budget, const char* name, bool fat = false) {
     Rig r;
     for (int i = 0; i < 4; ++i) {
         r.loadSt(i, tone(44100, 110.0f * float(i + 1)), tone(44100, 165.0f * float(i + 1)), PlayMode::ForwardLoop);
@@ -309,8 +375,19 @@ void mixBench(int budget, const char* name) {
     r.eng->settings().delayTimeMs = 375;
     r.eng->settings().delayFeedback = 45;
     for (int t = 0; t < 8; ++t) r.note(uint8_t(t), uint8_t(t & 3), uint8_t(48 + 3 * t));
-    // Synth 1: ACD, worst-case patch (every oscillator, RD3, all modulation).
-    {
+    // Synth 1: ACD, worst-case patch (every oscillator, RD3, all modulation),
+    // or FAT's worst case (fatWorst).
+    if (fat) {
+        patchInit(kSynthEngineFat, &gSynthPatch);
+        float vals[kSynthParamMax];
+        int count = 0;
+        const PatchParamRange* t = patchEngineParams(kSynthEngineFat, &count);
+        for (int i = 0; i < count; ++i) vals[i] = t[i].def;
+        fatWorst(vals);
+        vals[fat::kAmpS] = 1.0f;
+        for (int i = 0; i < count; ++i)
+            if (vals[i] != t[i].def) synthParamSet(gSynthPatch, i, vals[i]);
+    } else {
         using namespace acd;
         patchInit(kSynthEngineAcd, &gSynthPatch);
         const float w[][2] = {{kSquareMix, 1}, {kSubMix, 1}, {kSubMode, 1}, {kNoiseMix, 0.5f}, {kPwLfo, 0.3f},
@@ -335,7 +412,7 @@ void mixBench(int budget, const char* name) {
     b.bindPatch(1, &gPercPatch);
     b.bindPatch(2, nullptr);
     SynthSlotRecord a = SynthSlotRecord::defaults(0);
-    a.model = uint32_t(SynthModel::ACD);
+    a.model = uint32_t(fat ? SynthModel::FAT : SynthModel::ACD);
     a.polyphony = 4;
     a.delaySend = 30.0f;
     a.reverbSend = 30.0f;
@@ -489,6 +566,7 @@ void printProfile(const PeakBlock& b) {
     auto eng = [](int32_t id) -> const char* {
         switch (id) {
             case kSynthEngineAcd: return "ACD";
+            case kSynthEngineFat: return "FAT";
             case kSynthEngineVap: return "VAP";
             case kSynthEnginePerc: return "PERC";
             case 0: return "-";
@@ -1004,6 +1082,7 @@ int main(int argc, char** argv) {
     mixBench(4, "mix");   // Governor::kDefaultBudget
     mixBench(5, "mix5");
     mixBench(6, "mix6");
+    mixBench(4, "mixfat", true);
     switchBench();
 #ifdef OT_BENCH_M4
     peakBench("../build/bench/song5.trace", 8100);   // song positions 0-2 (intro, groove, sixteen-track chords)
@@ -1012,6 +1091,8 @@ int main(int argc, char** argv) {
 #endif
     reportVoice("vapinit", vapVoice(false), 12000);
     reportVoice("vapworst", vapVoice(true), 18000);
+    reportVoice("fatinit", fatVoice(false), 12000);
+    reportVoice("fatworst", fatVoice(true), 22000);
     components();
     return 0;
 }

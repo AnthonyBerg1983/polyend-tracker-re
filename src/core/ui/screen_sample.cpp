@@ -696,6 +696,12 @@ void PlaybackScreen::padLeds(uint8_t* lv) {
     for (int p = 0; p < in.sliceCount && p < kPadCount; ++p) lv[p] = app_.cfg.padDim();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool PlaybackScreen::encoderOnList() const {
+    return sel == 6;   // play-mode list
+}
+#endif
+
 void PlaybackScreen::onEncoder(int d) {
     change(d);
     refreshBar();
@@ -710,7 +716,7 @@ void PlaybackScreen::draw(Gfx& g) {
     else if (isSynthInstrument(ci)) synthui::slotLabel(a, synthSlotOf(ci), sub, sizeof(sub));
     else std::snprintf(sub, sizeof(sub), "MIDI instrument");
     ui_.drawTitle(g, "Sample Playback", sub);
-    if (ui_.bar.label[6].hidden) barSelector(g, th, 6, ui_.bar.label[6].top, 67);
+    if (ui_.bar.label[6].hidden && !ui_.askOpen()) barSelector(g, th, 6, ui_.bar.label[6].top, 67);
     if (ci >= kSampleInstrumentCount) return;
     const Instrument& in = a.instruments[ci];
     float v0, v1;

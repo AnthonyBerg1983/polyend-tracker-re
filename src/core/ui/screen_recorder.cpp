@@ -7,12 +7,18 @@
 // (5 undo levels, kept as views into the buffer, so no copies) and is saved
 // as Recordings[/ N]/recordingNNN.wav, optionally loaded into the first free
 // instrument slot ("Save & Load").
+//
+// 2.x stereo sampling (2x-04 §5, revived 2026-10-19 as an OpenTracker extra;
+// the Tracker Mini records mono): the Line In source with Config "Line in
+// channel" = Stereo records two lanes (Capture stereo mode) and saves a
+// 2-channel WAV; the radio (PWR_MONO) and the mics stay mono. Pads and MIDI
+// notes play the selection through the preview player's pitch step, so a
+// transposed stereo take keeps both lanes.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 #include "app/app.h"
-#include "fmath.h"
 #include "ui/screens.h"
 
 namespace ot {
@@ -25,6 +31,12 @@ const float kRadioMin[4] = {87.5f, 87.5f, 87.5f, 76.0f};
 const float kRadioStep[4] = {0.1f, 0.2f, 0.2f, 0.1f};
 constexpr float kRadioMax = 108.0f;
 const char* const kMonitor[2] = {"On", "Off"};
+// Source 0 = Line in (kSources); Config::lineInChannel 0 Stereo, 1 Mono
+// Left, 2 Mono Right (screen_config.cpp kLineIn). No named constants exist
+// for either, so the values are spelled here once.
+constexpr uint8_t kSourceLineIn = 0;
+constexpr uint8_t kLineInStereo = 0;
+const char* const kLineInNames[3] = {"Line in ST", "Line in L", "Line in R"};
 
 // Setup layout (stock 005, VISUAL_DIFF §3.4): seven column panels at
 // x = 2 + 100 k mirroring the bar (source list, Radio Freq bar, a blank
@@ -34,6 +46,13 @@ constexpr int kColX0 = 2;
 constexpr float kMinBar = 1.0f / float(wg::kPanelH - 25);
 // Waveform (recording / edit): x 100..699, rows 116..334, markers 108..334.
 constexpr int kWaveX = 100, kWaveW = 600, kWaveY = 116, kWaveH = 219;
+// Stereo take: two lanes, L on top, R below (like the Tracker+ recorder),
+// split by a 5-row gap; the markers still span the whole area [I].
+constexpr int kLaneH = (kWaveH - 5) / 2, kLaneY2 = kWaveY + kLaneH + 5;
+void laneTags(Gfx& g, const Theme& th) {
+    g.text(kWaveX - 12, kWaveY + kLaneH / 2, kFontText, th.dim, "L", IDisplay::kOptCenter);
+    g.text(kWaveX - 12, kLaneY2 + kLaneH / 2, kFontText, th.dim, "R", IDisplay::kOptCenter);
+}
 
 void listItem(void* ctx, int i, char* out, int cap) {
     std::snprintf(out, size_t(cap), "%s", static_cast<const char* const*>(ctx)[i]);
@@ -67,6 +86,20 @@ void barSeekArrows(Gfx& g, const Theme& th, int i, int dir, bool enabled);
 const int16_t* RecorderScreen::data() const {
     const int16_t* b = app_.capture.buffer();
     return b ? b + off : nullptr;
+}
+
+const int16_t* RecorderScreen::dataR() const {
+    const int16_t* b = app_.capture.bufferR();
+    return b ? b + off : nullptr;
+}
+
+bool RecorderScreen::stereoInput() const {
+    return app_.cfg.recSource == kSourceLineIn && app_.cfg.lineInChannel == kLineInStereo;
+}
+
+const char* RecorderScreen::sourceName(int src) const {
+    if (src == kSourceLineIn) return kLineInNames[app_.cfg.lineInChannel > 2 ? 0 : app_.cfg.lineInChannel];
+    return kSources[clampi(src, 0, 3)];
 }
 
 void RecorderScreen::start(int opt) {
@@ -109,6 +142,7 @@ void RecorderScreen::enter() {
     a.capture.setBuffer(a.bank.tail(), uint32_t(a.bank.freeSamples()));
     a.capture.setMetering(true);
     a.inputMonitorMuted = a.cfg.recMonitor == 0;   // appendix C §2.2 monitor
+    meter = meterR = 0;
     // appendix C §2.2: the current instrument is forced into the MIDI range
     // 48..63 (the last one used here, else 48) so pads and notes on this
     // screen never trigger a sample instrument.
@@ -144,6 +178,7 @@ void RecorderScreen::setSource(int s) {
         a.markConfigDirty();
     }
     sourceOk = a.selectInput(uint8_t(s), a.cfg.recGain[s]);
+    a.capture.setStereo(stereoInput());   // setup-page meters (2.x)
     if (s == 1 && a.radio()) {
         const int r = a.cfg.radioRegion & 3;
         a.radio()->setBand(kRadioMin[r], kRadioMax, kRadioStep[r]);
@@ -171,7 +206,7 @@ void RecorderScreen::refreshBar() {
     }
     if (state == 0) {
         const int src = a.cfg.recSource;
-        b.set(0, "Source", sourceOk ? kSources[src] : "n/a");
+        b.set(0, "Source", sourceOk ? sourceName(src) : "n/a");
         if (src == 1) {
             std::snprintf(v, sizeof(v), "%.1fMHz", double(a.cfg.radioFreq10) / 10.0);
             b.set(1, "Radio Freq", v, sourceOk);
@@ -218,7 +253,10 @@ bool RecorderScreen::record() {
     }
     a.capture.stop();
     a.capture.setBuffer(a.bank.tail(), uint32_t(a.bank.freeSamples()));
-    if (a.capture.capacity() < 44100) {
+    // 2.x: Line In with Config "Line in channel" = Stereo records two lanes
+    // (half the frames of the same memory); every other case is mono.
+    const bool stereo = stereoInput();
+    if (a.capture.capacityFor(stereo) < 44100) {
         ui_.ask("Sample Recorder", "Not enough sample memory", nullptr, nullptr, "OK", nullptr, nullptr);
         return false;
     }
@@ -237,7 +275,7 @@ bool RecorderScreen::record() {
         const float t = a.project.tempo();
         stepSecs = 15.0f / (t >= 1.0f ? t : 120.0f);
     }
-    a.capture.start(steps, stepSecs, beat, bar, click);
+    a.capture.start(steps, stepSecs, beat, bar, click, stereo);
     countIn_ = steps > 0;
     recording_ = true;
     state = 1;
@@ -257,7 +295,7 @@ void RecorderScreen::stopRecording() {
     off = 0;
     undoDepth = 0;
     uint32_t s = 0, e = len;
-    autoTrim(a.capture.buffer(), len, &s, &e);   // appendix C §2.10
+    autoTrimLR(a.capture.buffer(), a.capture.bufferR(), len, &s, &e);   // appendix C §2.10, both lanes
     startM = len ? uint16_t(uint64_t(s) * 65535 / len) : 0;
     endM = len ? uint16_t(uint64_t(e) * 65535 / len) : 65535;
     if (endM <= startM) endM = uint16_t(startM + 1);
@@ -323,6 +361,7 @@ bool RecorderScreen::save(const char* name, bool load, bool overwrite) {
     uint32_t s0, s1;
     selection(&s0, &s1);
     const uint32_t frames = s1 - s0;
+    const int16_t* r = dataR();   // stereo recording: the right lane
     int slot = -1;
     if (load) {
         // appendix C §2.12: memory and a free sample slot are checked first.
@@ -333,7 +372,7 @@ bool RecorderScreen::save(const char* name, bool load, bool overwrite) {
             refreshBar();
             return false;
         }
-        if (uint64_t(a.bank.usedBytes()) + uint64_t(frames) * 2 > a.bank.capacityBytes()) {
+        if (uint64_t(a.bank.usedBytes()) + uint64_t(frames) * (r ? 4u : 2u) > a.bank.capacityBytes()) {
             ui_.ask("Sample Recorder", "Not enough memory in sample bank", nullptr, nullptr, "OK", nullptr, nullptr);
             state = 1;
             refreshBar();
@@ -363,7 +402,7 @@ bool RecorderScreen::save(const char* name, bool load, bool overwrite) {
         return false;
     }
     ui_.progress("Saving recording", 0);
-    const bool ok = a.writeWav(path, data() + s0, frames);
+    const bool ok = a.writeWav(path, data() + s0, r ? r + s0 : nullptr, frames);
     ui_.progressDone();
     if (!ok) {
         ui_.notify("Save failed");
@@ -437,6 +476,12 @@ void RecorderScreen::change(int d) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool RecorderScreen::encoderOnList() const {
+    return state == 0 && sel == 0;   // source list
+}
+#endif
+
 void RecorderScreen::onEncoder(int d) {
     if (app_.capture.active()) return;
     change(d);
@@ -447,37 +492,17 @@ void RecorderScreen::play(int note) {
     a.previewFile(nullptr, 0, false);
     uint32_t s0, s1;
     selection(&s0, &s1);
-    const int16_t* src = data() + s0;
     const uint32_t n = s1 - s0;
-    const int16_t* out = src;
-    uint32_t frames = n;
-    if (note != 60 && n > 1) {
-        // The preview player has no pitch control: the selection is resampled
-        // (linear) into the free sample memory behind the recording. A
-        // transposition longer than that memory is cut short; with none left
-        // the recording plays at its own pitch.
-        int16_t* dst = a.capture.buffer() + a.capture.length();
-        const uint32_t avail = a.capture.capacity() - a.capture.length();
-        const double ratio = fm::kNoteRatio[clampi(note, 0, 127)];
-        const uint64_t step = uint64_t(ratio * 4294967296.0);
-        uint64_t m = (uint64_t(n - 1) << 32) / step + 1;
-        if (m > avail) m = avail;
-        if (m > 0) {
-            uint64_t ph = 0;
-            for (uint32_t i = 0; i < uint32_t(m); ++i, ph += step) {
-                const uint32_t k = uint32_t(ph >> 32);
-                const int32_t fr = int32_t((ph >> 16) & 0xFFFF);
-                const int32_t x0 = src[k], x1 = k + 1 < n ? src[k + 1] : x0;
-                dst[i] = int16_t(x0 + (((x1 - x0) * fr) >> 16));
-            }
-            out = dst;
-            frames = uint32_t(m);
-        }
-    }
-    a.previewFile(out, frames, false);
+    const int16_t* r = dataR();
+    // The preview player transposes (16.16 step, linear interpolation per
+    // lane; 2.x). Before, the selection was resampled into the free sample
+    // memory behind the recording, mono only and cut short when that memory
+    // ran out.
+    const uint32_t step = App::previewStep(note);
+    a.previewPitched(data() + s0, r ? r + s0 : nullptr, n, note);
     previewing_ = true;
     playNote = note;
-    playFrames = frames;
+    playFrames = n > 1 ? uint32_t((uint64_t(n - 1) << 16) / step + 1) : n;
 }
 
 void RecorderScreen::playStop() {
@@ -685,12 +710,20 @@ void RecorderScreen::update(uint32_t now) {
     if (now - lastMeterAt_ >= kMeterMs) {
         const uint32_t dt = now - lastMeterAt_;
         lastMeterAt_ = now;
-        const int u = meterUnits(a.capture.takePeak());
-        if (u >= 85) clipUntil_ = now + 350;
-        const int before = meter;
+        // 2.x stereo: one meter per lane (side by side); mono: both the mix.
+        // Config "Line in channel" may have changed (Metronome -> Config):
+        // follow it while idle on the setup page.
+        if (state == 0 && !a.capture.active()) a.capture.setStereo(stereoInput());
+        const bool st2 = a.capture.stereo();
+        const int u = meterUnits(a.capture.takePeak(0));
+        const int ur = st2 ? meterUnits(a.capture.takePeak(1)) : u;
+        if (!st2) a.capture.takePeak(1);   // keep the unused side fresh
+        if (u >= 85 || ur >= 85) clipUntil_ = now + 350;
+        const int before = meter, beforeR = meterR;
         meter = meterFall(meter, u, dt);
+        meterR = meterFall(meterR, ur, dt);
         const bool clip = int32_t(now - clipUntil_) < 0;
-        if (state == 0 && (meter != before || clip != clipShown_)) ui_.dirty();
+        if (state == 0 && (meter != before || meterR != beforeR || clip != clipShown_)) ui_.dirty();
         clipShown_ = clip;
     }
     if (seeking_ && a.radio() && !a.radio()->busy()) {
@@ -710,12 +743,22 @@ void RecorderScreen::draw(Gfx& g) {
     const uint32_t wave = th.slot(slot::kWave);
     if (a.capture.active()) {
         const uint32_t l = a.capture.length();
-        waveRegion(g, th, kWaveX, kWaveX + kWaveW - 1, kWaveY, kWaveH);
-        drawWaveData(g, th, a.capture.buffer(), l, 0.0f, 1.0f, kWaveX, kWaveY, kWaveW, kWaveH, th.alert);
+        if (a.capture.stereo()) {
+            waveRegion(g, th, kWaveX, kWaveX + kWaveW - 1, kWaveY, kLaneH);
+            waveRegion(g, th, kWaveX, kWaveX + kWaveW - 1, kLaneY2, kLaneH);
+            drawWaveData(g, th, a.capture.buffer(), l, 0.0f, 1.0f, kWaveX, kWaveY, kWaveW, kLaneH, wave);
+            drawWaveData(g, th, a.capture.bufferR(), l, 0.0f, 1.0f, kWaveX, kLaneY2, kWaveW, kLaneH, wave);
+            laneTags(g, th);
+        } else {
+            waveRegion(g, th, kWaveX, kWaveX + kWaveW - 1, kWaveY, kWaveH);
+            drawWaveData(g, th, a.capture.buffer(), l, 0.0f, 1.0f, kWaveX, kWaveY, kWaveW, kWaveH, wave);
+        }
         if (a.capture.state() == Capture::kCountIn) {
             g.text(400, 80, kFontLarge, th.yellow, "Counting in...", IDisplay::kOptCenter);
         } else {
-            g.textf(400, 80, kFontLarge, th.alert, IDisplay::kOptCenter, "Recording  %.1f s", double(l) / 44100.0);
+            g.textf(400, 80, kFontLarge, th.alert, IDisplay::kOptCenter, a.capture.stereo() ? "Recording ST  %.1f s"
+                                                                                          : "Recording  %.1f s",
+                    double(l) / 44100.0);
         }
         g.textf(400, 370, kFontSmall, th.dim, IDisplay::kOptCenter, "Memory: %.1f s left",
                 double(a.capture.capacity() - l) / 44100.0);
@@ -723,7 +766,8 @@ void RecorderScreen::draw(Gfx& g) {
     }
     if (state == 0) {
         const int src = a.cfg.recSource;
-        list(g, th, 0, kSources, 4, src);
+        const char* names[4] = {sourceName(0), kSources[1], kSources[2], kSources[3]};
+        list(g, th, 0, names, 4, src);
         if (src == 1 && sourceOk) {
             // Radio frequency as a bar (needle position 0..100, appendix C §2.8).
             const int r = a.cfg.radioRegion & 3;
@@ -733,13 +777,38 @@ void RecorderScreen::draw(Gfx& g) {
             wg::panel(g, th, kColX0 + 100);
         }
         wg::panel(g, th, kColX0 + 200, wg::kPanelY, wg::columnW(2));
+        // Free recording time for the current mode (2.x): stereo takes two
+        // samples per frame, so half the time of mono. On the bottom row of
+        // the blank double panel, which stays blank above it as on stock.
+        const bool st2 = a.capture.stereo();
+        const double freeS = double(a.bank.freeSamples()) / (st2 ? 2.0 : 1.0) / 44100.0;
+        g.textf(kColX0 + 200 + wg::columnW(2) / 2, 407, kFontSmall, th.dim, IDisplay::kOptCenter, "Free %.1f s %s",
+                freeS, st2 ? "stereo" : "mono");
         // Level meter (appendix C §2.3 obj+0x68, §2.6): a green bar, the
-        // 61..70 / 71..84 bands and the clip window in their colours.
+        // 61..70 / 71..84 bands and the clip window in their colours. 2.x
+        // stereo: L and R as two half-width bars side by side in the column.
+        const bool clipNow = int32_t(ui_.now() - clipUntil_) < 0;
+        auto meterColour = [&](int units) {
+            uint32_t c = th.good;
+            if (units > 70) c = th.yellow;
+            if (units >= 85 || clipNow) c = th.alert;
+            return c;
+        };
         const int units = clampi(meter, 0, 100);
-        uint32_t c = th.good;
-        if (units > 70) c = th.yellow;
-        if (units >= 85 || int32_t(ui_.now() - clipUntil_) < 0) c = th.alert;
-        bar(g, th, 4, float(units) / 100.0f, c);
+        if (!st2) {
+            bar(g, th, 4, float(units) / 100.0f, meterColour(units));
+        } else {
+            const int unitsR = clampi(meterR, 0, 100);
+            const int x = kColX0 + 400, w = wg::columnW();
+            wg::ValueBarStyle vs;
+            wg::panel(g, th, x, wg::kPanelY, w, wg::kPanelH, th.slot(vs.set + 4));
+            vs.background = false;
+            vs.fill = meterColour(units);
+            wg::valueBar(g, th, x, wg::kPanelY, w / 2 + 1, wg::kPanelH, units < 1 ? kMinBar : float(units) / 100.0f, vs);
+            vs.fill = meterColour(unitsR);
+            wg::valueBar(g, th, x + w / 2 - 1, wg::kPanelY, w / 2 + 1, wg::kPanelH,
+                         unitsR < 1 ? kMinBar : float(unitsR) / 100.0f, vs);
+        }
         bar(g, th, 5, float(a.cfg.recGain[src]) / 100.0f);
         list(g, th, 6, kMonitor, 2, a.cfg.recMonitor ? 0 : 1);
         wg::panel(g, th, kColX0 + 700);
@@ -756,8 +825,18 @@ void RecorderScreen::draw(Gfx& g) {
     auto mx = [&](uint16_t m) { return kWaveX + int((float(m) / 65535.0f - v0) / (v1 - v0) * 599.0f + 0.5f); };
     const int xs = mx(startM), xe = mx(endM);
     const int last = kWaveX + kWaveW - 1;
-    if (xe >= kWaveX && xs <= last) waveRegion(g, th, clampi(xs, kWaveX, last), clampi(xe, kWaveX, last), kWaveY, kWaveH);
-    drawWaveData(g, th, data(), len, v0, v1, kWaveX, kWaveY, kWaveW, kWaveH, wave);
+    if (const int16_t* r = dataR()) {   // stereo take: L and R lanes
+        if (xe >= kWaveX && xs <= last) {
+            waveRegion(g, th, clampi(xs, kWaveX, last), clampi(xe, kWaveX, last), kWaveY, kLaneH);
+            waveRegion(g, th, clampi(xs, kWaveX, last), clampi(xe, kWaveX, last), kLaneY2, kLaneH);
+        }
+        drawWaveData(g, th, data(), len, v0, v1, kWaveX, kWaveY, kWaveW, kLaneH, wave);
+        drawWaveData(g, th, r, len, v0, v1, kWaveX, kLaneY2, kWaveW, kLaneH, wave);
+        laneTags(g, th);
+    } else {
+        if (xe >= kWaveX && xs <= last) waveRegion(g, th, clampi(xs, kWaveX, last), clampi(xe, kWaveX, last), kWaveY, kWaveH);
+        drawWaveData(g, th, data(), len, v0, v1, kWaveX, kWaveY, kWaveW, kWaveH, wave);
+    }
     if (xs >= kWaveX && xs <= last) waveMarker(g, th, xs, sel == 1 ? th.accent : wave, 1, true, false, 108, 334);
     if (xe >= kWaveX && xe <= last) waveMarker(g, th, xe, sel == 2 ? th.accent : wave, -1, true, false, 108, 334);
     g.textf(400, 80, kFontText, th.text, IDisplay::kOptCenter, "Recorded %.2f s   crop levels %d/%d", double(len) / 44100.0,

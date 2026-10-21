@@ -562,6 +562,15 @@ Ui::Ui(App& a) : app(a), factory(*this, a) {}
 
 Ui::~Ui() { destroyScreens(screenOwner_, screens_); }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool Ui::encoderOnList() const {
+    if (askOpen_ || progressOpen_ || powerOpen_ || kb.isOpen()) return false;
+    if (picker.isOpen()) return true;
+    const Screen* s = screen(active_);
+    return s && s->encoderOnList();
+}
+#endif
+
 const Theme& Ui::th() const { return theme(app.cfg.theme); }
 
 void Ui::start() {
@@ -1075,7 +1084,40 @@ void Ui::render() {
     // RAM_DL guard (docs/VERIFY_1.9.5.md §6): never send more than the
     // FT81x can hold next to the driver's per-frame words (appended RAM_G
     // fragments included, Gfx::dlTotalWords).
-    g.setWordLimit(dlFrameLimit_);
+    // Device feedback (FT81x). A frame the coprocessor faulted on is lost
+    // (the driver recovers); drawing the same frame again would fault again
+    // and the screen would look frozen (user report: Master -> Track Mixer).
+    // So: low detail for this screen and a tighter guard. The measured
+    // RAM_DL size of finished frames calibrates the estimate (gradients and
+    // other coprocessor commands expand on the device).
+    // Per screen: text-heavy and bar-heavy pages expand differently.
+    if (scaleGen_ != gen_) {
+        scaleGen_ = gen_;
+        dlScale_ = 64;
+    }
+    const uint32_t hwFaults = display_->frameFaultCount();
+    if (hwFaults != hwFaultsSeen_) {
+        hwFaultsSeen_ = hwFaults;
+        ++hwFaultFrames_;
+        lowDetail_ = true;
+        lowDetailGen_ = gen_;
+        lowDetailOverlays_ = ov;
+        dlScale_ = uint8_t(dlScale_ + 8 > 128 ? 128 : dlScale_ + 8);
+        if (platform.dlOverflow) platform.dlOverflow(current() ? current()->name() : "-", lastWords_, 0, true);
+    }
+    const uint32_t meas = display_->measuredDlBytes();
+    if (meas != hwMeasSeen_) {
+        hwMeasSeen_ = meas;
+        // Only a steady screen pairs the measurement with its estimate (the
+        // last two frames within 1/16 of each other).
+        const uint32_t mw = meas / 4 > kDriverDlWords ? meas / 4 - kDriverDlWords : 0;
+        const uint32_t d = lastWords_ > prevWords_ ? lastWords_ - prevWords_ : prevWords_ - lastWords_;
+        if (lastWords_ >= 400 && d * 16 <= lastWords_ && mw > lastWords_) {
+            const uint32_t sc = mw * 64 / lastWords_;
+            if (sc > dlScale_) dlScale_ = uint8_t(sc > 128 ? 128 : sc);
+        }
+    }
+    g.setWordLimit(dlFrameLimit_ ? uint32_t(uint64_t(dlFrameLimit_) * 64 / dlScale_) : 0);
     g.setLowDetail(lowDetail_);
     g.beginFrame(t.bg);
     Screen* s = current();
@@ -1169,6 +1211,8 @@ void Ui::render() {
 
 void Ui::finishFrame(Gfx& g, const char* screenName) {
     // RAM_DL words including appended fragments; the command-FIFO upload.
+    prevWords_ = frameGen_ == gen_ ? lastWords_ : 0;   // pairs only frames of one screen
+    frameGen_ = gen_;
     lastWords_ = g.dlTotalWords();
     lastUpload_ = g.dlWords();
     if (lastWords_ > maxWords_) maxWords_ = lastWords_;

@@ -503,10 +503,16 @@ void Gfx::textRotated(int x, int y, uint8_t font, uint32_t c, const char* s, int
     //   q 1 (CCW, bottom to top): u = cw - py, v = px
     //   q 2 (upside down):        u = cw - px, v = H - py
     //   q 3 (CW, top to bottom):  u = py,      v = H - px
+    // The mirrored axes start half a pixel inside the cell (cw - 0.5,
+    // H - 0.5): sampled at pixel centres that lands exactly on the source
+    // column, sampled at pixel corners (the device) it still floors to it.
+    // Without it the device sampled u = cw at the first pixel, shifting
+    // every glyph by one and dropping column 0 -- the stems of r / i / l / M
+    // in the proportional set-1 font (user report: "T'ack", "Midi" garbled).
     int32_t A = 0, B = 0, C = 0, D = 0, E = 0, F = 0;
-    if (q == 1) { B = -256; C = cw * 256; D = 256; }
-    else if (q == 2) { A = -256; C = cw * 256; E = -256; F = H * 256; }
-    else { B = 256; D = -256; F = H * 256; }
+    if (q == 1) { B = -256; C = cw * 256 - 128; D = 256; }
+    else if (q == 2) { A = -256; C = cw * 256 - 128; E = -256; F = H * 256 - 128; }
+    else { B = 256; D = -256; F = H * 256 - 128; }
     if (!admit(14 + 2 * uint32_t(std::strlen(s)))) return;
     sync();   // the saved context (and the restored one) has translate 0
     color(c);

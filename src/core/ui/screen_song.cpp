@@ -362,7 +362,7 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
                 const int top = a.fileUndo.topNumber();
                 uint8_t num = 0;
                 if (top < 1 || !a.popFileUndo(&num)) {
-                    ui_.notify("Nothing to undo");
+                    ui_.notify("No undo data :(");
                     break;
                 }
                 s.stop();
@@ -481,6 +481,12 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
     }
     refreshBar();
 }
+
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool SongScreen::encoderOnList() const {
+    return focus == 0 || (focus == 1 && !(edit && ui_.shift()));   // grid rows, song list
+}
+#endif
 
 void SongScreen::onEncoder(int d) {
     App& a = app_;

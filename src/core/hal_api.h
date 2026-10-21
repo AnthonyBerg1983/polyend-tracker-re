@@ -176,6 +176,11 @@ public:
     // (REG_DLSWAP == 0 on the FT81x). The UI skips a frame instead of
     // spinning when this is false. Default: always ready.
     virtual bool frameReady() { return true; }
+    // Device feedback (FT81x): frames the coprocessor faulted on after they
+    // were sent (a running count), and the RAM_DL bytes the last completed
+    // frame really used. 0 where unknown (host displays).
+    virtual uint32_t frameFaultCount() const { return 0; }
+    virtual uint32_t measuredDlBytes() const { return 0; }
 
     // --- cached display-list fragments (spec 05 §3.3 stock scheme) --------
     // The stock firmware keeps each control's display list in RAM_G and

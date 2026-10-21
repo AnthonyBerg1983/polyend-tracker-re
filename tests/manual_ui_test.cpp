@@ -353,3 +353,127 @@ TEST(render_and_load_opens_sample_loader) {
     LoaderScreen& l = *static_cast<LoaderScreen*>(a.ui.screen(kModLoader));
     CHECK_EQ(l.insCursor, int(a.currentInstrument()));
 }
+
+// File > Open Project and Import Mod list up to ProjectBrowser::kMaxEntries
+// (80 like stock, spec 05 appendix E1.2; 2.x: 200). User report: the list
+// stopped at 64.
+TEST(file_lists_hold_80_entries) {
+    Harness h;
+    h.fs.dirs.insert("Projects");
+    h.fs.dirs.insert("Mod");
+    for (int i = 0; i < 210; ++i) {
+        char p[64];
+        std::snprintf(p, sizeof p, "Projects/Song %03d", i);
+        h.fs.dirs.insert(p);
+        std::snprintf(p, sizeof p, "Projects/Song %03d/project.mt", i);
+        h.fs.files[p] = std::vector<uint8_t>(64, 0);
+        std::snprintf(p, sizeof p, "Mod/tune%03d.mod", i);
+        h.fs.files[p] = std::vector<uint8_t>(2048, 0);
+    }
+    auto& f = *static_cast<FileScreen*>(h.app->ui.screen(kModFile));
+    h.tap(btn::File);
+    h.tap(btn::F2);   // Open Project
+    CHECK_EQ(f.state, 1);
+    std::printf("  open list %d entries\n", f.count);
+    CHECK_EQ(f.count, ProjectBrowser::kMaxEntries);
+    f.state = 0;      // back to the File page
+    f.count = 0;
+    h.tap(btn::F3);   // Import Mod
+    CHECK_EQ(f.state, 2);
+    std::printf("  mod list %d entries (state %d)\n", f.count, f.state);
+    CHECK_EQ(f.count, ProjectBrowser::kMaxEntries);
+}
+
+TEST(pattern_stop_keeps_the_cursor_on_the_stop_row) {
+    // User report (stock 1.9.2): Play, then Play again to stop -- the cursor
+    // stays on the row where playback stopped instead of jumping to the top.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    CHECK(!a.editMode);
+    h.tap(btn::Play);
+    CHECK(a.seq.isPlaying());
+    for (int i = 0; i < 300; ++i) {   // ~1.7 s at 130 BPM
+        h.audio.pump(3);
+        h.run(10);
+    }
+    const int row = a.seq.step(0);
+    CHECK(row > 4);
+    h.tap(btn::Play);
+    CHECK(!a.seq.isPlaying());
+    h.run(60);
+    CHECK(p.step >= row && p.step <= row + 1);
+}
+
+TEST(pattern_tap_alone_leaves_the_column_view) {
+    // Manual Quick Reference / user report: Pattern + Note shows the Note
+    // column of 8 tracks; pressing Pattern alone goes back to the 4-track view.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    CHECK_EQ(p.colMask, 0);
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.up(btn::Pattern);
+    h.run(60);
+    CHECK_EQ(p.colMask, 1);   // the combo keeps the view
+    h.tap(btn::Pattern);
+    h.run(60);
+    CHECK_EQ(p.colMask, 0);   // Pattern alone: full view
+    // Two columns, then Pattern alone again.
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    CHECK_EQ(p.colMask, 1 | 4);
+    h.tap(btn::Pattern);
+    CHECK_EQ(p.colMask, 0);
+}
+
+TEST(encoder_on_list_hint_for_the_simulator_wheel) {
+    // The simulator flips its mouse wheel on lists (Ui::encoderOnList):
+    // lists, options and rows are lists; value bars are not.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Config);
+    CHECK(a.ui.encoderOnList());   // categories / options
+    h.tap(btn::Pattern);
+    CHECK(!a.editMode);
+    CHECK(a.ui.encoderOnList());   // rows while stopped, not editing
+    h.tap(btn::Rec);
+    CHECK(!a.ui.encoderOnList());  // edit mode: the encoder changes values
+    h.tap(btn::Rec);
+    a.setCurrentInstrument(0);
+    h.tap(btn::InstrParams);
+    auto& s = *static_cast<InstrumentScreen*>(a.ui.screen(kModInstrument));
+    s.mode = 0;
+    s.effects = false;
+    s.column = 0;
+    CHECK(!a.ui.encoderOnList());  // Volume bar
+    s.column = 4;
+    CHECK(a.ui.encoderOnList());   // filter type list
+    h.tap(btn::SampleLoader);
+    CHECK(a.ui.encoderOnList());
+}
+
+TEST(pattern_preview_plays_the_row_once) {
+    // Stock 1.9.2 (owner check): Preview on a cell plays that row once and
+    // stops; the cursor is free again. It looped before and held the cursor.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    p.step = 8;
+    h.tap(btn::F5);   // Preview
+    CHECK(a.seq.isPlaying());
+    for (int i = 0; i < 100 && a.seq.isPlaying(); ++i) {
+        h.audio.pump(3);
+        h.run(10);
+    }
+    CHECK(!a.seq.isPlaying());
+    const int row = p.step;
+    h.tap(btn::Down);
+    CHECK_EQ(p.step, row + 1);
+}

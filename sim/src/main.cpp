@@ -127,7 +127,8 @@ struct Machine {
     HostMidi midi;
     SdlAudio sdlAudio;
     ManualAudio manualAudio;
-    // Synthetic line input: 0.25 s silence, then 0.4 s tone bursts every 0.6 s.
+    // Synthetic line input: 0.25 s silence, then 0.4 s tone bursts every 0.6 s
+    // (L at hz, R a fifth above: distinct stereo lanes).
     struct ToneIn {
         float hz = 440.0f;
         uint64_t n = 0;
@@ -137,8 +138,9 @@ struct Machine {
                 const double t = double(n) / 44100.0;
                 const double ph = std::fmod(t - 0.25, 0.6);
                 const double env = t < 0.25 || ph > 0.4 ? 0.0 : std::sin(3.14159265 * ph / 0.4);
-                const int16_t v = int16_t(12000.0 * env * std::sin(2.0 * 3.14159265 * hz * t));
-                buf[2 * i] = buf[2 * i + 1] = v;
+                // Distinct lanes for the 2.x stereo recorder: R a fifth above, softer.
+                buf[2 * i] = int16_t(12000.0 * env * std::sin(2.0 * 3.14159265 * hz * t));
+                buf[2 * i + 1] = int16_t(9000.0 * env * std::sin(2.0 * 3.14159265 * 1.5 * hz * t));
             }
             return buf;
         }
@@ -905,6 +907,10 @@ int runInteractive(Machine& m, const Options& o) {
                 case SDL_MOUSEWHEEL: {
                     int d = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) d = -d;
+                    // Wheel up = clockwise (values go up). On a list (names,
+                    // options, rows) clockwise moves down, so the wheel is
+                    // flipped there and scrolls with the list (user report).
+                    if (m.app && m.app->ui.encoderOnList()) d = -d;
                     if (d) m.input.encoder(d);
                     break;
                 }

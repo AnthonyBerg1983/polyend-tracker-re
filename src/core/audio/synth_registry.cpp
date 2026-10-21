@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "audio/engines/acd.h"
+#include "audio/engines/fat.h"
 #include "audio/engines/perc.h"
 #include "audio/engines/vap.h"
 #include "audio/synth_engine.h"
@@ -17,14 +18,16 @@ ISynthEngine* synthEngineFor(int32_t engineId) {
     switch (engineId) {
         case kSynthEngineAcd:
             return synthAcdEngine();
+        case kSynthEngineFat:
+            return fat::engine();
         case kSynthEngineVap:
             return vap::engine();
         case kSynthEnginePerc:
             return percEngine();
         case kSynthEngineTest:
             return synthTestEngine();
-        // FAT and WTFM are 2.1 (docs/MINI_PLAN.md §3): the slot loads and
-        // saves, the UI shows "not available", nothing sounds.
+        // WTFM is planned for 2.2 (docs/MINI_PLAN.md §3): the slot loads
+        // and saves, the UI shows "not available", nothing sounds.
         default:
             return nullptr;
     }

@@ -193,7 +193,7 @@ bool EditorScreen::undo() {
     return true;
 }
 
-bool EditorScreen::preview() {
+bool EditorScreen::preview(int note) {
     App& a = app_;
     if (inert || !a.bank.loaded(slot_)) return false;
     stopPreview();
@@ -204,6 +204,10 @@ bool EditorScreen::preview() {
     selection(&s0, &s1);
     const uint32_t sel = s1 - s0;
     const uint32_t outSel = sfx::outputFrames(effect, params[effect], sel);
+    // The processed preview belongs to one selection and effect: moving a
+    // marker made the old audio play cut to the new length (user report:
+    // the further Start moved, the more was missing at the end).
+    if (s0 != prevS0_ || s1 != prevS1_ || effect != prevEffect_) previewState = 0;
     // Keep the undo data at the tail intact: process after it.
     const uint32_t keep = undoAvail ? undoFrames_ * (undoStereo_ ? 2u : 1u) : 0u;
     if (!fits(outSel, keep)) return false;
@@ -214,11 +218,32 @@ bool EditorScreen::preview() {
         for (uint32_t c = 0; c < ch; ++c) sfx::process(effect, params[effect], cur + c * len + s0, sel, out + c * outSel, outSel);
         ui_.progressDone();
         previewState = 1;
+        prevS0_ = s0;
+        prevS1_ = s1;
+        prevEffect_ = effect;
     }
-    a.previewFile(out, outSel, stereo);
+    // Pads play at their note (2.x; 60 = own pitch) through the player's
+    // 16.16 step; Preview and MIDI notes keep the own pitch.
+    a.engine.previewBuffer(out, outSel, stereo, 0xFFFFFFFFu, App::previewStep(note));
     previewPlaying = true;
     refreshBar();
     return true;
+}
+
+void EditorScreen::onPad(uint8_t pad, uint8_t state) {
+    // Pads audition the sample being edited, like the Preview button: the
+    // processed selection (crop and the current effect, not applied), cut
+    // when the pad is released. Before, pads played the instrument through
+    // the Sample Playback points and envelope, so an edit was only heard
+    // after the job finished (user report) [I]. 2.x: at the pad's note
+    // (App::padNote, note 60 = own pitch), as the recorder pads play.
+    if (state == kPress) {
+        if (preview(app_.padNote(pad))) padPreview_ = pad;
+    } else if (state == kRelease && previewPlaying && padPreview_ == int(pad)) {
+        padPreview_ = -1;
+        stopPreview();
+        refreshBar();
+    }
 }
 
 bool EditorScreen::onMidiNote(uint8_t note, uint8_t velocity, bool on) {
@@ -413,6 +438,12 @@ void EditorScreen::onButton(uint8_t id, uint8_t state) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool EditorScreen::encoderOnList() const {
+    return !inert && page != 2 && focus == 3;   // effect list
+}
+#endif
+
 void EditorScreen::onEncoder(int d) {
     if (inert) return;
     if (page == 2) {
@@ -502,7 +533,7 @@ void EditorScreen::draw(Gfx& g) {
     if (focus == 3) wg::panelFocus(g, th, kListX, kListW);
     if (inert) return;
     const BottomBar& b = ui_.bar;
-    if (b.label[6].hidden) barSelector(g, th, 6, b.label[6].top, 57);
+    if (b.label[6].hidden && !ui_.askOpen()) barSelector(g, th, 6, b.label[6].top, 57);
     if (b.label[5].hidden) barGreyLabel(g, th, 5, b.label[5].top, b.label[5].bottom);
 }
 

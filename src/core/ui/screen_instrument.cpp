@@ -487,7 +487,10 @@ void InstrumentScreen::onButton(uint8_t id, uint8_t state) {
             const uint8_t ci = a.currentInstrument();
             bool inv = false;
             if (mode == 0 && !effects) inv = column == 4;
-            else if (mode == 1 && ci < kSampleInstrumentCount) inv = column == 3 && iedit::autoType(a.instruments[ci], dest) == 2;
+            // Automation 2/2: Destination, Type and the LFO Shape are
+            // top-down lists too (user reports: Up moved down in them).
+            else if (mode == 1 && ci < kSampleInstrumentCount)
+                inv = column <= 1 || ((column == 2 || column == 3) && iedit::autoType(a.instruments[ci], dest) == 2);
             else if (mode == 3) inv = column >= 2;
             const int d = id == btn::Up ? 1 : -1;
             edit(column, inv ? -d : d, false);
@@ -512,6 +515,18 @@ uint8_t InstrumentScreen::auditionNote() const {
         return uint8_t(24 + app_.instruments[ci].selectedSlice);
     return app_.padNote(12);
 }
+
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool InstrumentScreen::encoderOnList() const {
+    if (mode == 2) return true;   // CC mapping list
+    if (mode == 0) return !effects && column == 4;   // filter type
+    if (mode == 3) return column >= 2;
+    const uint8_t ci = app_.currentInstrument();
+    if (ci >= kSampleInstrumentCount) return false;
+    // Automation 2/2: Destination, Type; LFO Shape and Speed.
+    return column <= 1 || ((column == 2 || column == 3) && iedit::autoType(app_.instruments[ci], dest) == 2);
+}
+#endif
 
 void InstrumentScreen::onEncoder(int d) {
     if (mode == 2) {
@@ -681,8 +696,10 @@ void InstrumentScreen::draw(Gfx& g) {
             if (type == 2 && c == 2) {
                 listColumn(g, th, col, 1, kShapeNames, 5, in.lfo[dest].shape % 5);
             } else if (type == 2 && c == 3) {
-                const int idx = clampi(dest == 0 ? in.lfo[dest].speed + 5 : in.lfo[dest].speed, 0, 28);
-                listColumn(g, th, col, 1, kSpeedNames, 29, idx);
+                // Volume's LFO speeds run 24 steps .. 1/64 step: the list
+                // starts at "24 steps", nothing above it is listed (stock).
+                if (dest == 0) listColumn(g, th, col, 1, kSpeedNames + 5, 24, clampi(in.lfo[0].speed, 0, 23));
+                else listColumn(g, th, col, 1, kSpeedNames, 29, clampi(in.lfo[dest].speed, 0, 28));
             } else {
                 valueText(c, v, sizeof(v), &fr, &bi);
                 barColumn(g, th, col, fr, false, true);
@@ -690,7 +707,7 @@ void InstrumentScreen::draw(Gfx& g) {
         }
         focusX = column == 0 ? wg::columnX(0) : wg::columnX(column + 1);
         if (column == 0) focusW = wg::columnW(2);
-        barSelector(g, th, 0, nullptr, 67);
+        if (!ui_.askOpen()) barSelector(g, th, 0, nullptr, 67);
     } else {
         const Instrument& in = a.instruments[ci % kSampleInstrumentCount];
         const int n = columns();

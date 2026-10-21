@@ -488,6 +488,7 @@ void PatternScreen::refreshBar() {
 
 void PatternScreen::onButton(uint8_t id, uint8_t state) {
     App& a = app_;
+    if (patternHeld_ && id != btn::Pattern && state == kPress) patternCombo_ = true;
     if (fillOpen) {
         if (state == kPress) fillButton(id);
         refreshBar();
@@ -555,8 +556,19 @@ void PatternScreen::onButton(uint8_t id, uint8_t state) {
     }
     switch (id) {
         case btn::Pattern:
+            // Manual (Quick Reference): Pattern + column keys pick the
+            // column view; pressing Pattern alone goes back to the 4-track
+            // view (user report: the view could not be left).
+            if (state == kPress) {
+                patternCombo_ = false;
+            } else if (state == kRelease) {
+                if (patternHeld_ && !patternCombo_ && colMask) {
+                    colMask = 0;
+                    keepTrackVisible();
+                }
+                maskKeys_[0] = maskKeys_[1] = -1;
+            }
             patternHeld_ = state != kRelease;
-            if (state == kRelease) maskKeys_[0] = maskKeys_[1] = -1;
             break;
         case btn::Play:
             if (state == kPress) transport();
@@ -757,9 +769,12 @@ void PatternScreen::pageButton(int f, uint8_t state) {
                 }
                 return;
             case 4:
+                // Preview plays the cursor / selection once and stops, as on
+                // stock 1.9.2 (user report: a looping one-row preview held
+                // the cursor and looked like a hang until Play).
                 if (state == kPress && !a.seq.isPlaying()) {
                     const SelRect r = target();
-                    a.seq.playSelection(r.s0, r.s1, r.t0, r.t1, true);
+                    a.seq.playSelection(r.s0, r.s1, r.t0, r.t1, false);
                 }
                 return;
             case 5:
@@ -910,7 +925,8 @@ void PatternScreen::transport() {
         } else {
             s.stop();
             a.allVoicesOff();
-            if (!edit()) step = 0;
+            // The cursor stays on the row where playback stopped (it
+            // follows the playhead while playing), as on stock 1.9.2.
         }
     }
     focus = -1;
@@ -972,7 +988,16 @@ void PatternScreen::focusDelta(int d) {
     }
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool PatternScreen::encoderOnList() const {
+    if (pop_.isOpen()) return true;          // note / instrument / FX lists
+    if (fillOpen || focus >= 0) return false;
+    return !edit();                          // stopped, not editing: the rows
+}
+#endif
+
 void PatternScreen::onEncoder(int d) {
+    if (patternHeld_) patternCombo_ = true;
     if (pop_.isOpen()) {   // spec 06 §1.6 step 3: the encoder scrolls the popup
         pop_.move(d);
         if (pop_.kind() == 0) followNoteWindow();
@@ -1127,7 +1152,11 @@ void PatternScreen::onPad(uint8_t pad, uint8_t state) {
             a.setCurrentInstrument(isMidiTrack(track) ? synthui::midiTrackPadInstrument(pad) : pad);
             refreshBar();
         }
-        a.previewOn(voice, a.currentInstrument(), note, 127);
+        // Instr column: the pad picks an instrument and auditions it at note
+        // 60, like the Instr-column record and edit paths (spec 16 §A.6),
+        // not at the pad's own note (user report: every instrument one
+        // semitone higher than the previous one).
+        a.previewOn(voice, a.currentInstrument(), col == 1 ? uint8_t(60) : note, 127);
         padVoice_[pad] = int8_t(pad);
         return;
     }

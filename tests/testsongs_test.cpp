@@ -21,6 +21,7 @@
 #include "../tools/make_testsongs/stock_check.cpp"
 #include "../tools/make_testsongs/testsongs.cpp"
 #include "formats/instrument_pti.h"
+#include "ui/screens.h"
 #include "ui/gfx.h"
 
 namespace {
@@ -138,6 +139,50 @@ void checkVapOnly(ot::App& a) {
     std::printf("    peak synth voices held %d (budget %d)\n", held, int(ot::Config::kDefaultSynthVoices));
     CHECK_EQ(held, int(ot::Config::kDefaultSynthVoices));
     CHECK(std::fabs(a.project.tempo() - 112.0f) < 0.01f);
+    int patterns = 0, notes = 0, maxVol = 0;
+    for (int n = 1; n <= ot::kPatternCount; ++n) {
+        if (!a.patternPresent(n)) continue;
+        ++patterns;
+        ot::Track tr;
+        for (int t = 0; t < ot::kTrackCount; ++t) {
+            a.readStoredTrack(n, t, tr);
+            for (int st = 0; st < ot::kStepCount; ++st) {
+                const ot::Step& x = tr.steps[st];
+                for (const auto& f : x.fx)
+                    if (f.type == uint8_t(ot::FxId::Volume)) maxVol = std::max(maxVol, int(f.value));
+                if (x.note < 0) continue;
+                ++notes;
+                CHECK(x.instrument >= 64 && x.instrument <= 66);
+            }
+        }
+    }
+    std::printf("    %d patterns, %d notes, max Volume %d\n", patterns, notes, maxVol);
+    CHECK_EQ(patterns, 7);
+    CHECK(maxVol <= 50);
+}
+
+// Song 16 (fatsong.inc), after the open: Synth 1-3 are FAT patches with our
+// own names (pad polyphony 4, lead and bass mono; the lead Reset Off, the
+// bass Reset On); every note is a synth note; the held notes stay inside the
+// default budget.
+void checkFatOnly(ot::App& a) {
+    namespace fat = ot::audio::fat;
+    const char* names[3] = {"OT FAT Pad", "OT FAT Lead", "OT FAT Bass"};
+    const uint32_t poly[3] = {4, 1, 1};
+    for (int k = 0; k < 3; ++k) {
+        const ot::SynthSlotRecord r = a.synthSlot(k);
+        CHECK_EQ(r.model, uint32_t(ot::SynthModel::FAT));
+        CHECK_EQ(r.polyphony, poly[k]);
+        CHECK(std::strcmp(r.patchName, names[k]) == 0);
+        CHECK_EQ(a.synthPatch(k).engine, int32_t(ot::kSynthEngineFat));
+    }
+    CHECK(ot::audio::synthParamGet(a.synthPatch(1), fat::kReset) < 0.5f);
+    CHECK(ot::audio::synthParamGet(a.synthPatch(2), fat::kReset) >= 0.5f);
+    CHECK(ot::audio::synthParamGet(a.synthPatch(0), fat::kFatness) > 2.0f / 3.0f);   // all three pairs
+    const int held = ts::bgr::peakSynthVoices(a);
+    std::printf("    peak synth voices held %d (budget %d)\n", held, int(ot::Config::kDefaultSynthVoices));
+    CHECK_EQ(held, int(ot::Config::kDefaultSynthVoices));
+    CHECK(std::fabs(a.project.tempo() - 128.0f) < 0.01f);
     int patterns = 0, notes = 0, maxVol = 0;
     for (int n = 1; n <= ot::kPatternCount; ++n) {
         if (!a.patternPresent(n)) continue;
@@ -381,6 +426,10 @@ void checkSong(ts::SongId id, bool force) {
         CHECK_EQ(ptiFiles, 0);
         checkVapOnly(*h.app);
     }
+    if (id == ts::SongId::FatOnly) {
+        CHECK_EQ(ptiFiles, 0);
+        checkFatOnly(*h.app);
+    }
 
     // Re-encode everything from the loaded model, then Save.
     h.app->markProjectDirty();
@@ -453,7 +502,7 @@ void checkSong(ts::SongId id, bool force) {
         CHECK(voices <= int(ot::Config::kDefaultSynthVoices));
         CHECK_EQ(h.app->engine.synth().steals(), 0u);
     }
-    if (id == ts::SongId::VapOnly) {
+    if (id == ts::SongId::VapOnly || id == ts::SongId::FatOnly) {
         std::printf("    synth voices sounding at most %d, steals %u\n", voices, unsigned(h.app->engine.synth().steals()));
         CHECK(voices >= 4);
         CHECK(voices <= int(ot::Config::kDefaultSynthVoices));
@@ -478,6 +527,7 @@ TEST(testsongs_table) {
     CHECK_EQ(ts::findSong(ts::SongId::Synths)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK_EQ(ts::findSong(ts::SongId::PercOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK_EQ(ts::findSong(ts::SongId::VapOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
+    CHECK_EQ(ts::findSong(ts::SongId::FatOnly)->available, ts::kHasSynths && ts::kHas16Tracks);
     CHECK(ts::kHasSynths);
     for (int i = 5; i < ts::kSongCount; ++i) CHECK_EQ(ts::songInfo(i).available, ts::kHasSynths && ts::kHas16Tracks);
     for (int i = 0; i < ts::kSongCount; ++i) CHECK(std::strlen(ts::songInfo(i).name) <= ot::mt::kNameMax);
@@ -533,14 +583,15 @@ std::vector<int16_t> wavSamples(const std::vector<uint8_t>& f) {
 
 }  // namespace
 
-// Songs 1 and 5, two BG remixes and the PERC- and VAP-only songs rendered through the
+// Songs 1 and 5, two BG remixes and the PERC-, VAP- and FAT-only songs rendered through the
 // App's own stem export (spec 04 §6.1): no stem clips (sample tracks at the
 // voice AMP clamp, synth slot buses at int16), and the sum of the stems --
 // what reaches the master sum before its clamp and the limiter (spec 07
 // §5.4) -- stays under full scale but for isolated transients.
 TEST(testsongs_rendered_levels_do_not_clip) {
     const ts::SongId ids[] = {ts::SongId::TwelveTracks, ts::SongId::Synths, ts::SongId::BgTitle,
-                              ts::SongId::BgFinalBoss, ts::SongId::PercOnly, ts::SongId::VapOnly};
+                              ts::SongId::BgFinalBoss, ts::SongId::PercOnly, ts::SongId::VapOnly,
+                              ts::SongId::FatOnly};
     for (ts::SongId id : ids) {
         const ts::SongInfo* info = ts::findSong(id);
         if (!info || !info->available) continue;
@@ -669,4 +720,93 @@ TEST(midi_input_synth_polyphonic_while_playing) {
     pump(3000);               // past the Init release
     CHECK_EQ(a.engine.synth().voicesOf(0), 0);
     CHECK(a.seq.isPlaying());
+}
+
+// Track Mixer 2/3 meters include the synth notes a track plays (simulator
+// report on "BG Battle": only the sample track's meter moved).
+TEST(track_mixer_meters_follow_synth_tracks) {
+    std::unique_ptr<Harness> hp = deviceHarness();
+    Harness& h = *hp;
+    ot::App& a = *h.app;
+    ts::GenOptions opt;
+    std::string err;
+    CHECK(ts::generateSong(a, h.fs, ts::SongId::BgBattle, opt, err));
+    // Tracks 1-8 that play a synth in pattern 1.
+    bool synthTrack[8] = {};
+    std::vector<ot::Track> tr(ot::kTrackCount);
+    const int pat = a.project.playlist[0];
+    for (int t = 0; t < 8; ++t) {
+        a.readStoredTrack(pat, t, tr[size_t(t)]);
+        for (int st = 0; st < ot::kStepCount; ++st)
+            if (tr[size_t(t)].steps[st].note >= 0 && tr[size_t(t)].steps[st].instrument >= ts::kSynthBase) synthTrack[t] = true;
+    }
+    h.tap(ot::btn::Master);
+    h.tap(ot::btn::Master);   // Track Mixer 2/3
+    auto& m = *static_cast<ot::MixerScreen*>(a.ui.screen(ot::kModMaster));
+    CHECK_EQ(m.page, 1);
+    a.seq.playSong(0);
+    int maxMeter[8] = {};
+    uint32_t acc = 0;
+    for (uint32_t t = 0; t < 4000; t += 10) {
+        acc += 10u * 44100u;
+        int blocks = 0;
+        while (acc >= 128000u) {
+            acc -= 128000u;
+            ++blocks;
+        }
+        h.audio.pump(blocks);
+        h.run(10);
+        for (int k = 0; k < 8; ++k) maxMeter[k] = std::max(maxMeter[k], m.meter[k]);
+    }
+    int synthTracks = 0;
+    for (int k = 0; k < 8; ++k) {
+        if (!synthTrack[k]) continue;
+        ++synthTracks;
+        std::printf("    track %d (synth): meter max %d\n", k + 1, maxMeter[k]);
+        CHECK(maxMeter[k] > 0);
+    }
+    CHECK(synthTracks >= 2);
+}
+
+// Track Mixer faders and mutes act on the synth notes of a track (user
+// report: tracks 4/5 playing synths ignored the Track Mixer volume).
+TEST(track_mixer_fader_scales_synth_tracks) {
+    std::unique_ptr<Harness> hp = deviceHarness();
+    Harness& h = *hp;
+    ot::App& a = *h.app;
+    ts::GenOptions opt;
+    std::string err;
+    CHECK(ts::generateSong(a, h.fs, ts::SongId::BgBattle, opt, err));
+    const int t = 3;   // track 4: a synth track in BG Battle (track_mixer_meters_follow_synth_tracks)
+    auto measure = [&](uint32_t ms) {
+        a.seq.stop();
+        a.engine.synth().stopAll();
+        a.seq.playSong(0);
+        float pk = 0.0f;
+        uint32_t acc = 0;
+        for (uint32_t x = 0; x < ms; x += 10) {
+            acc += 10u * 44100u;
+            int blocks = 0;
+            while (acc >= 128000u) {
+                acc -= 128000u;
+                ++blocks;
+            }
+            h.audio.pump(blocks);
+            h.run(10);
+            pk = std::max(pk, a.engine.synth().trackPeak(t));
+        }
+        return pk;
+    };
+    const float full = measure(3000);
+    a.project.setU8(ot::pf::kTrackVolume + uint32_t(t), 40);   // well below 0 dB (86)
+    a.applyEngineSettings();
+    const float low = measure(3000);
+    a.project.setU8(ot::pf::kTrackVolume + uint32_t(t), 86);
+    a.setTrackMute(t, true);
+    a.applyEngineSettings();
+    const float muted = measure(3000);
+    std::printf("    track 4 synth peak: 0 dB %.4f, fader 40 %.4f, muted %.4f\n", full, low, muted);
+    CHECK(full > 0.01f);
+    CHECK(low < full * 0.6f);
+    CHECK(muted < full * 0.01f);
 }

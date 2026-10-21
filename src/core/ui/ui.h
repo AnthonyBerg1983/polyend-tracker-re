@@ -70,6 +70,13 @@ public:
     virtual void onPad(uint8_t pad, uint8_t state);      // default: audition current instrument
     virtual void onEncoder(int d) { (void)d; }
     virtual bool encoderFast() const { return false; }   // Shift-fast acceleration (spec 05 §2.1.4)
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)   // simulator / host only
+    // True while the encoder moves a highlight through a list (names,
+    // options, rows): clockwise = down the list. False on values, where
+    // clockwise = more. Not used by the firmware; the simulator reads it so
+    // its mouse wheel scrolls lists with the wheel.
+    virtual bool encoderOnList() const { return false; }
+#endif
     // True if this screen gives its own module key a local meaning (spec 06 §0.3).
     virtual bool ownsModuleKey(uint8_t id) const { (void)id; return false; }
     // Base pad LED layer, levels 0..31.
@@ -302,6 +309,9 @@ public:
     void switchTo(int module, int opt = 0);
     int active() const { return active_; }
     int previous() const { return previous_; }
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const;   // overlays first, then the active screen (Screen::encoderOnList)
+#endif
     Screen* screen(int module) const { return module >= 0 && module < kModCount ? screens_[module] : nullptr; }
     Screen* current() const { return screen(active_); }
 
@@ -444,6 +454,8 @@ public:
     // Frame limit of the guard (host tests lower it to force the fallback).
     void setDlFrameLimit(uint32_t words) { dlFrameLimit_ = words; }
     uint32_t overBudgetFrames() const { return overBudget_; }
+    uint32_t hwFaultFrames() const { return hwFaultFrames_; }
+    uint8_t dlScale() const { return dlScale_; }   // 64 = 1.0
     uint32_t lowDetailFrames() const { return lowDetailFrames_; }
     bool lowDetail() const { return lowDetail_; }
     // Display-list words of the last frame including appended fragments
@@ -496,6 +508,13 @@ private:
     uint32_t frames_ = 0, lastWords_ = 0, lastUpload_ = 0, deferred_ = 0;
     bool readyRetry_ = false;             // frameReady() was false: next poll at readyRetryAt_
     uint32_t readyRetryAt_ = 0;
+    // Device RAM_DL feedback (render): faults seen, the measured size last
+    // used, the estimate of the frame before the last, and the guard scale
+    // (64 = the estimate is right, up to 128 = the device needs twice as
+    // many words; it only grows).
+    uint32_t hwFaultsSeen_ = 0, hwFaultFrames_ = 0, hwMeasSeen_ = 0, prevWords_ = 0;
+    uint32_t scaleGen_ = 0, frameGen_ = 0;   // screen the scale / last frame belong to
+    uint8_t dlScale_ = 64;                   // per screen: reset when it changes
     uint32_t maxWords_ = 0, overBudget_ = 0, lowDetailFrames_ = 0, statOver0_ = 0, statLow0_ = 0;
     uint32_t overLogged_ = 0;             // modules whose first overflow was logged
     uint32_t dlFrameLimit_ = kDlFrameWords;

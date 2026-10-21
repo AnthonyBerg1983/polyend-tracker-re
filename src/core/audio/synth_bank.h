@@ -101,6 +101,12 @@ struct SynthSlotView {
 struct SynthMixInputs {
     float delayLevel = 1.0f;    // Global Mixer delay level (0 when muted)
     float reverbLevel = 1.0f;
+    // Track Mixer fader of each sequencer track's synth notes (TRK law; 0
+    // when muted / soloed out). Tracks 9-16 have no fader (Tracker Mini): 1.
+    float trackGain[16];
+    SynthMixInputs() {
+        for (float& g : trackGain) g = 1.0f;
+    }
 };
 
 class SynthBank : public IVoicePool {
@@ -179,6 +185,10 @@ public:
     // Peak of slot s's post gain / pan bus since the last call (main loop:
     // the Global Mixer 3/3 synth meters, Tracker Mini manual p.220).
     float slotPeak(int s);
+    // Peak of the synth notes of sequencer track t since the last call (Track
+    // Mixer meters: a track playing a synth meters its share of the slot bus,
+    // split by the voices' envelope level x gain). Main loop.
+    float trackPeak(int t);
 
 private:
     enum VState : uint8_t { kFree = 0, kOn, kFading };
@@ -267,7 +277,7 @@ private:
     void fade(int r, bool steal = false);
     void startOn(int r, int track, int s, const SynthNote& n, float bend, float bendTarget, float bendStep);
     void releaseTrack(int track);
-    void mixSlot(Slot& sl, float* mL, float* mR, float* dsend, float* rsend, int16_t* stem);
+    float mixSlot(Slot& sl, float* mL, float* mR, float* dsend, float* rsend, int16_t* stem);   // block peak
     void notePitchFx(const SynthNoteOn& n, float prevPitch, bool hasPrev, float& bend, float& target, float& step) const;
 
     Voice voices_[kSynthMaxVoices];
@@ -313,6 +323,7 @@ private:
     }
     float busL_[kBlock] = {}, busR_[kBlock] = {};   // slot bus, zero between slots
     volatile float peak_[kSynthSlots] = {};          // bus peaks for slotPeak()
+    volatile float trackPeak_[kSynthTracks] = {};    // per-track shares for trackPeak()
     float tempo_ = 130.0f;
 
 public:
