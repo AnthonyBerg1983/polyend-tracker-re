@@ -907,6 +907,10 @@ int runInteractive(Machine& m, const Options& o) {
                 case SDL_MOUSEWHEEL: {
                     int d = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) d = -d;
+                    // Wheel up = clockwise (values go up). On a list (names,
+                    // options, rows) clockwise moves down, so the wheel is
+                    // flipped there and scrolls with the list (user report).
+                    if (m.app && m.app->ui.encoderOnList()) d = -d;
                     if (d) m.input.encoder(d);
                     break;
                 }

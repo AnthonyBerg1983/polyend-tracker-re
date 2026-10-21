@@ -560,6 +560,15 @@ Ui::Ui(App& a) : app(a), factory(*this, a) {}
 
 Ui::~Ui() { destroyScreens(screenOwner_, screens_); }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool Ui::encoderOnList() const {
+    if (askOpen_ || progressOpen_ || powerOpen_ || kb.isOpen()) return false;
+    if (picker.isOpen()) return true;
+    const Screen* s = screen(active_);
+    return s && s->encoderOnList();
+}
+#endif
+
 const Theme& Ui::th() const { return theme(app.cfg.theme); }
 
 void Ui::start() {

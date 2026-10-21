@@ -773,6 +773,12 @@ void LoaderScreen::onPad(uint8_t pad, uint8_t state) {
     (void)state;   // pads are only used by the keyboard here (spec 06 §5.4)
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool LoaderScreen::encoderOnList() const {
+    return !trim;   // SD and instrument lists (trim markers are values)
+}
+#endif
+
 void LoaderScreen::onEncoder(int d) {
     if (trim) {
         // 109 units per detent; Start <= End - 2 (spec 06 §5.5).

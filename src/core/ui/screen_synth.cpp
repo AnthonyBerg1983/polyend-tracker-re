@@ -784,6 +784,20 @@ void SynthScreen::onButton(uint8_t id, uint8_t state) {
     ui_.dirty();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool SynthScreen::encoderOnList() const {
+    if (view == View::Browser) return true;     // patch list
+    if (view == View::Params) return param == 0;   // model list
+    if (view != View::Edit || !available()) return false;
+    const synthui::Section* sec = nullptr;
+    const int n = synthui::sections(engine(), &sec);
+    if (section < 0 || section >= n || sec[section].macro >= 0) return false;
+    if (row < 0 || row >= sec[section].count) return false;
+    const synthui::ParamUi* u = synthui::paramUi(engine(), sec[section].params[row]);
+    return u && u->fmt == synthui::kFmtEnum;   // Filter Type, LFO Waveform, ...
+}
+#endif
+
 void SynthScreen::onEncoder(int d) {
     switch (view) {
         case View::Params: paramsChange(param == 0 ? (d > 0 ? 1 : -1) : d); break;

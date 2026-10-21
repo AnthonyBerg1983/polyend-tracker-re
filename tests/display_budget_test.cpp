@@ -957,6 +957,26 @@ TEST(overlay_matrix_synth) {
         std::snprintf(nm, sizeof(nm), "synth edit patch PERC %s", sec[i].name);
         r.measure(nm);
     }
+    // FAT (2.1): an available model, six Edit Patch sections plus M1..M7.
+    a.setSynthModel(0, int(SynthModel::FAT));
+    a.setCurrentInstrument(64);
+    h.tap(btn::Pattern);
+    r.screen(btn::InstrParams, "synth parameters (FAT)");
+    CHECK(sy.available());
+    h.tap(btn::F8);
+    CHECK(sy.view == SynthScreen::View::Edit);
+    n = synthui::sections(kSynthEngineFat, &sec);
+    CHECK(n >= 6);
+    for (int i = 0; i < n; ++i) {
+        sy.section = i;
+        sy.row = sy.rows() - 1;
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "synth edit patch FAT %s", sec[i].name);
+        r.measure(nm);
+    }
+    sy.section = 0;
+    sy.row = 0;
+    h.tap(btn::F8);
     // WTFM: "not available" header, read-only.
     a.setSynthModel(0, int(SynthModel::WTFM));
     a.setCurrentInstrument(64);

@@ -1,6 +1,6 @@
 # OpenTracker preset pack
 
-Our own synth patches for the ACD, VAP and PERC engines of OpenTracker 2.x, written by
+Our own synth patches for the ACD, FAT, VAP and PERC engines of OpenTracker 2.x, written by
 `reimpl/tools/make_patches` (`make -C reimpl patches`) through the firmware's own Save As path.
 Every patch starts from the engine's built-in Init patch; no factory patch is used.
 
@@ -10,8 +10,8 @@ then use Load Patch on a synth page.
 Macros: M1-M6 (FX CC A-F). A bipolar macro (+-) at 63 and a unipolar macro at 0 play the
 patch as saved. M7 is Velocity (Volume FX), as in the Init patch. Levels are voiced for the
 default slot gain (-9 dB); `tests/patches_test.cpp` checks that every patch is audible, stays
-at least 1 dB below full scale (VAP: 4-voice chords; PERC: five drums at once, toms alone) and does not
-clip with all macros at either extreme.
+at least 1 dB below full scale (VAP and FAT Poly 4: 4-voice chords; PERC: five drums at once, toms
+alone) and does not clip with all macros at either extreme.
 
 Poly: the suggested slot polyphony (1 = mono, 4 = chords). It is a slot setting on the synth
 page, not part of the patch.
@@ -32,6 +32,19 @@ page, not part of the patch.
 | OT Bent Acid | Dirty acid: pulse sweep, a touch of noise, glide on every note. | 1 | Cutoff (+-), Resonance (+-), Env Amt (+-), Decay (+-), Noise, Glide (+-) |
 | OT Sub Pluck | Short sub-heavy pluck bass for house and garage lines. | 1 | Cutoff (+-), Punch (+-), Decay (+-), Saw (+-), Resonance (+-), Release (+-) |
 | OT Wah Lead | Saw lead with a slow resonant filter wah. | 1 | Cutoff (+-), Resonance (+-), Wah Depth (+-), Wah Rate (+-), Release (+-), Glide |
+
+## FAT (8)
+
+| Patch | Description | Poly | Macros M1-M6 |
+|---|---|---|---|
+| OT Super Saw | The classic seven-saw stack: wide detune, open OB filter, a little vibrato. | 4 | Cutoff (+-), Fatness (+-), Brightness (+-), Resonance (+-), Attack (+-), Release (+-) |
+| OT Wide Pad | Slow, dark unison pad: soft attack, a filter swell and a slow free-running sweep. | 4 | Cutoff (+-), Fatness (+-), Sweep, Attack (+-), Release (+-), Brightness (+-) |
+| OT Hoover Lead | Mono hoover: full stack part pulse, deep vibrato, legato glide. | 1 | Cutoff (+-), Timbre (+-), Vibrato (+-), Glide (+-), Resonance (+-), Fatness (+-) |
+| OT Trance Pluck | Short unison pluck: resonant OB filter snapped open by its envelope. | 4 | Cutoff (+-), Env Amt (+-), Decay (+-), Resonance (+-), Fatness (+-), Release (+-) |
+| OT Thick Bass | Mono unison bass: three saws, a touch of pulse, MG filter bounce, short glide. | 1 | Cutoff (+-), Resonance (+-), Env Amt (+-), Fatness (+-), Timbre, Glide |
+| OT Dark Strings | String ensemble: a warm stack under a 12 dB filter, swell and vibrato. | 4 | Cutoff (+-), Brightness (+-), Vibrato (+-), Attack (+-), Release (+-), Fatness (+-) |
+| OT Square Stack | Mono lead of detuned squares (Timbre 1), OB 24 filter, overlap glide. | 1 | Cutoff (+-), Timbre (+-), Resonance (+-), Env Amt (+-), Fatness (+-), Glide |
+| OT Detuned Keys | Keys from a light stack: free-running phases, a decaying filter, a breath of noise. | 4 | Cutoff (+-), Env Amt (+-), Decay (+-), Fatness (+-), Timbre (+-), Release (+-) |
 
 ## VAP (16)
 
@@ -70,4 +83,4 @@ note plays the tom at that pitch.
 | OT Kit Studio | Tight acoustic-like kit: beater kick, ringing toms, crisp snare, washy cymbal. | 1 | Tone (+-), Decay (+-), Pitch (+-), Snap (+-), Drive (+-), Space (+-) |
 | OT Kit Glitch | Glitch kit: bit-twisted bodies, crushed bus, delays on hats and shaker. | 1 | Tone (+-), Decay (+-), Pitch (+-), Snap (+-), Drive (+-), Space (+-) |
 
-Total: 36 patches.
+Total: 44 patches.

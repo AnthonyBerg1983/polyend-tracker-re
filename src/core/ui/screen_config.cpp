@@ -570,6 +570,12 @@ void ConfigScreen::onButton(uint8_t id, uint8_t state) {
     if (ui_.active() == kModConfig) refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool ConfigScreen::encoderOnList() const {
+    return !gLicMode;   // categories, options and their pick lists
+}
+#endif
+
 void ConfigScreen::onEncoder(int d) {
     d = clampi(d, -3, 3);   // spec 06 §7.4
     if (gLicMode) return;

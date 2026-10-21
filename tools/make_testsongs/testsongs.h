@@ -35,8 +35,10 @@ enum class SongId : uint8_t {
     VapOnly = 14,
     // Track Mixer meter calibration, stock-compatible (metersong.inc).
     MeterCheck = 15,
+    // FAT engine only, three patches (fatsong.inc): 2.1 (FAT) + M1.
+    FatOnly = 16,
 };
-constexpr int kSongCount = 15;
+constexpr int kSongCount = 16;
 
 // Songs 6-12 (the BLAST GRID remixes).
 inline bool isBgSong(SongId id) { return int(id) >= int(SongId::BgTitle) && int(id) <= int(SongId::BgFinalBoss); }

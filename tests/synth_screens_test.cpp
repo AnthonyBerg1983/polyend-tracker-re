@@ -6,6 +6,7 @@
 #include "test.h"
 #include "ui_fakes.h"
 
+#include <cstring>
 #include <cmath>
 #include <string>
 
@@ -550,6 +551,36 @@ TEST(not_available_is_read_only) {
     CHECK(frameHas(h, "Synth 1 (PERC)"));
 }
 
+// FAT has an engine since 2.1: the header names it without "not available",
+// values edit, and the pads play the slot.
+TEST(fat_slot_is_live) {
+    Harness h;
+    App& a = *h.app;
+    a.setSynthModel(0, int(SynthModel::FAT));
+    CHECK(a.synthPatch(0).engine == kSynthEngineFat);
+    a.setCurrentInstrument(64);
+    h.tap(btn::Pattern);
+    h.tap(btn::InstrParams);
+    SynthScreen& s = synth(a);
+    CHECK(a.ui.active() == kModSynth && s.slot == 0);
+    CHECK(s.available());
+    CHECK(frameHas(h, "Synth 1 (FAT)"));
+    CHECK(!frameHas(h, "not available"));
+    // Edit Patch: the first value (Fatness) moves with the encoder.
+    const float f0 = audio::synthParamGet(a.synthPatch(0), 0);
+    h.tap(btn::F8);
+    CHECK(s.view == SynthScreen::View::Edit);
+    h.enc(5);
+    CHECK(audio::synthParamGet(a.synthPatch(0), 0) > f0);
+    h.tap(btn::F8);
+    // Pads audition the FAT slot.
+    h.push(InputEvent::kPadDown, 5);
+    h.audio.pump(4);
+    CHECK(a.engine.synth().voicesOf(0) == 1);
+    h.push(InputEvent::kPadUp, 5);
+    h.audio.pump(4);
+}
+
 TEST(pads_audition_the_slot) {
     Harness h;
     App& a = *h.app;
@@ -805,8 +836,8 @@ TEST(global_mixer_synth_columns) {
     CHECK_EQ(MixerScreen::synthMeterBar(std::pow(10.0f, -24.0f / 20.0f)), 50);
 }
 
-// Opening a project with a WTFM / FAT slot shows one notice (MINI_PLAN §3);
-// a project whose slots all play shows none.
+// Opening a project with a WTFM slot shows one notice (MINI_PLAN §3; FAT
+// plays since 2.1); a project whose slots all play shows none.
 namespace {
 std::string g_notes;
 void onNote(const char* t) { g_notes += std::string(t) + "\n"; }
@@ -817,8 +848,8 @@ TEST(unavailable_slot_notice_on_open) {
     App& a = *h.app;
     a.ui.platform.notified = &onNote;
     CHECK(a.saveProjectAs("AllPlay"));
-    a.setSynthModel(2, int(SynthModel::FAT));
-    a.setSynthModel(1, int(SynthModel::WTFM));
+    a.setSynthModel(1, int(SynthModel::FAT));   // plays since 2.1: not named
+    a.setSynthModel(2, int(SynthModel::WTFM));
     CHECK(a.saveProjectAs("Dead"));
     CHECK(a.newProject());
     g_notes.clear();
@@ -826,7 +857,7 @@ TEST(unavailable_slot_notice_on_open) {
     CHECK(g_notes.find("not available") == std::string::npos);
     g_notes.clear();
     CHECK(a.openProject("Projects", "Dead"));
-    CHECK_STR(g_notes.c_str(), "Synth 2 (WTFM) not available\n");
+    CHECK_STR(g_notes.c_str(), "Synth 3 (WTFM) not available\n");
 }
 
 // Edit Patch bottom bar (manual p.153): Save, Save As, Init Patch, -, Up,
@@ -1328,4 +1359,33 @@ TEST(stop_cuts_synth_voices) {
     h.tap(btn::Play);
     h.audio.pump(1);
     CHECK_EQ(a.engine.synth().busyRecords(), 0);
+}
+
+TEST(synth_edit_wheel_hint_lists_and_values) {
+    // The simulator flips its wheel on lists (Ui::encoderOnList): in Edit
+    // Patch the enum rows (Filter Type, LFO Waveform) are lists, value rows
+    // (Cutoff, Resonance) are not; the patch browser is a list.
+    Harness h;
+    App& a = *h.app;
+    openSlot(h, 1);
+    SynthScreen& s = synth(a);
+    if (s.view != SynthScreen::View::Params) h.tap(btn::InstrParams);
+    h.tap(btn::F8);
+    CHECK(s.view == SynthScreen::View::Edit);
+    const synthui::Section* sec = nullptr;
+    const int n = synthui::sections(s.engine(), &sec);
+    int lists = 0, values = 0;
+    for (int i = 0; i < n; ++i) {
+        if (std::strcmp(sec[i].name, "Filter") != 0) continue;
+        s.section = i;
+        for (int r = 0; r < sec[i].count; ++r) {
+            s.row = r;
+            const synthui::ParamUi* u = synthui::paramUi(s.engine(), sec[i].params[r]);
+            const bool isEnum = u && u->fmt == synthui::kFmtEnum;
+            CHECK_EQ(a.ui.encoderOnList(), isEnum);
+            (isEnum ? lists : values)++;
+        }
+    }
+    CHECK(lists >= 1);
+    CHECK(values >= 2);
 }

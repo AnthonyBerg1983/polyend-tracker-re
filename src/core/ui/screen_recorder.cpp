@@ -476,6 +476,12 @@ void RecorderScreen::change(int d) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool RecorderScreen::encoderOnList() const {
+    return state == 0 && sel == 0;   // source list
+}
+#endif
+
 void RecorderScreen::onEncoder(int d) {
     if (app_.capture.active()) return;
     change(d);

@@ -6,11 +6,11 @@
 // re-encode to the same bytes. Each loaded patch is then played through a
 // real SynthBank slot at the default slot record (-9 dB, sends off, macros
 // at their page defaults: 63 bipolar = the patch as saved): a few notes
-// (ACD), 4-voice chords and single notes (VAP), every drum and the whole kit
-// at once (PERC). It must be audible (peak > -30 dBFS) and stay at least
-// 1 dB below full scale. Macros M1..M6 at both extremes must stay finite and
+// (ACD, FAT Poly 1), 4-voice chords and single notes (VAP, FAT Poly 4),
+// every drum and the whole kit at once (PERC). It must be audible (peak >
+// -30 dBFS) and stay at least 1 dB below full scale. Macros M1..M6 at both extremes must stay finite and
 // below full scale too. When the release folder (releases/OpenTracker-Presets)
-// exists, its files must be the generator's bytes.
+// exists, its files must be the generator's bytes (for the models it has).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -103,8 +103,10 @@ double dbfs(float x) { return 20.0 * std::log10(x > 1e-9f ? double(x) : 1e-9); }
 
 constexpr int kBlocksPerSec = 345;   // 44.1 kHz / 128
 
-// The test performance of one preset; returns the slot (peak, clips).
-void perform(Slot& s, SynthModel m) {
+// The test performance of one preset; returns the slot (peak, clips). FAT
+// presets play as ACD (mono, Poly 1) or as VAP (chords, Poly 4).
+void perform(Slot& s, SynthModel m, int poly) {
+    if (m == SynthModel::FAT) m = poly > 1 ? SynthModel::VAP : SynthModel::ACD;
     if (m == SynthModel::ACD) {
         const int notes[5] = {36, 43, 48, 60, 72};
         for (int n : notes) {
@@ -147,7 +149,10 @@ void perform(Slot& s, SynthModel m) {
     s.run(kBlocksPerSec);
 }
 
-int polyFor(SynthModel m) { return m == SynthModel::VAP ? 4 : 1; }
+int polyFor(const presets::Preset& p) {
+    if (p.model == SynthModel::FAT) return p.playPoly;
+    return p.model == SynthModel::VAP ? 4 : 1;
+}
 
 // Generated pack (name -> bytes) and the loaded patches, built once.
 struct Pack {
@@ -162,10 +167,11 @@ Pack& pack() {
 }  // namespace
 
 TEST(presets_names_counts_and_macros) {
-    int acd = 0, vap = 0, perc = 0;
+    int acd = 0, fat = 0, vap = 0, perc = 0;
     std::vector<std::string> names;
     for (const presets::Preset& p : presets::all()) {
         acd += p.model == SynthModel::ACD;
+        fat += p.model == SynthModel::FAT;
         vap += p.model == SynthModel::VAP;
         perc += p.model == SynthModel::PERC;
         CHECK(std::strncmp(p.name, "OT ", 3) == 0);
@@ -179,8 +185,9 @@ TEST(presets_names_counts_and_macros) {
             CHECK(!m.targets.empty() && m.targets.size() <= size_t(kPatchMacroTargets));
         }
     }
-    std::printf("  presets: ACD %d, VAP %d, PERC %d\n", acd, vap, perc);
+    std::printf("  presets: ACD %d, FAT %d, VAP %d, PERC %d\n", acd, fat, vap, perc);
     CHECK(acd >= 10);
+    CHECK(fat >= 8);
     CHECK(vap >= 14);
     CHECK(perc >= 8);
 }
@@ -240,8 +247,8 @@ TEST(presets_render_audible_and_never_full_scale) {
     std::string loudName, quietName;
     for (size_t i = 0; i < pk.loaded.size(); ++i) {
         const presets::Preset& p = presets::all()[i];
-        Slot s(pk.loaded[i], p.model, polyFor(p.model));
-        perform(s, p.model);
+        Slot s(pk.loaded[i], p.model, polyFor(p));
+        perform(s, p.model, polyFor(p));
         std::printf("  %-5s %-22s peak %6.1f dBFS\n", synthModelName(p.model), p.name, dbfs(s.peak));
         CHECK(s.finite);
         CHECK(dbfs(s.peak) > -30.0);
@@ -259,8 +266,8 @@ TEST(presets_macro_extremes_stay_in_bounds) {
     for (size_t i = 0; i < pk.loaded.size(); ++i) {
         const presets::Preset& p = presets::all()[i];
         for (int v : {0, 127}) {
-            Slot s(pk.loaded[i], p.model, polyFor(p.model), v);
-            perform(s, p.model);
+            Slot s(pk.loaded[i], p.model, polyFor(p), v);
+            perform(s, p.model, polyFor(p));
             if (!s.finite || s.clips)
                 std::printf("       %s macros %d: peak %.1f dBFS, %ld clipped\n", p.name, v, dbfs(s.peak), s.clips);
             CHECK(s.finite);
@@ -276,11 +283,18 @@ TEST(presets_release_folder_matches_the_generator) {
         std::printf("  (no release folder: skipped)\n");
         return;
     }
+    // A pack released before a model had presets (FAT: 2.1) has no folder
+    // for it: the models it has must match the generator.
     const Pack& pk = pack();
-    int files = 0;
+    int files = 0, want = 0;
     for (const auto& e : fs::recursive_directory_iterator(dir / "Patches")) files += e.is_regular_file();
-    CHECK_EQ(files, int(presets::all().size()));
+    auto released = [&](const presets::Preset& p) {
+        return fs::is_directory(dir / "Patches" / synthModelName(p.model));
+    };
+    for (const presets::Preset& p : presets::all()) want += released(p);
+    CHECK_EQ(files, want);
     for (size_t i = 0; i < pk.files.size(); ++i) {
+        if (!released(presets::all()[i])) continue;
         std::ifstream f(dir / libPath(presets::all()[i]), std::ios::binary);
         CHECK(f.good());
         const std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

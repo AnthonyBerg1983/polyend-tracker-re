@@ -30,6 +30,9 @@ public:
     void onButton(uint8_t id, uint8_t state) override;
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     bool ownsModuleKey(uint8_t id) const override { return id == btn::Pattern; }
     void padLeds(uint8_t* levels) override;
@@ -138,6 +141,7 @@ private:
     uint8_t noteKeysOn_ = 0;        // Note popup F-keys sounding (bit = F-key)
     bool encUsedInHold_ = false;
     bool patternHeld_ = false;
+    bool patternCombo_ = false;   // another key / the encoder was used while Pattern was held
     int maskKeys_[2] = {-1, -1};
     uint32_t lastUpdate_ = 0;
     int lastPlayStep_ = -1;
@@ -168,6 +172,9 @@ public:
     void draw(Gfx& g) override;
     void onButton(uint8_t id, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool ownsModuleKey(uint8_t id) const override { return id == btn::Song; }
 
     int length() const;
@@ -219,6 +226,9 @@ public:
     void draw(Gfx& g) override;
     void onButton(uint8_t id, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     bool ownsModuleKey(uint8_t id) const override { return id == btn::InstrParams; }
     void onPad(uint8_t pad, uint8_t state) override;
@@ -260,6 +270,9 @@ public:
     void onButton(uint8_t id, uint8_t state) override;
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
 
     static constexpr int kMaxEntries = 101;   // spec 06 §5.2
     static constexpr int kMaxDepth = 20;
@@ -321,6 +334,9 @@ public:
     void draw(Gfx& g) override;
     void onButton(uint8_t id, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool ownsModuleKey(uint8_t id) const override { return id == btn::Master; }
 
     int page = 0;           // 0 master, 1 track mixer, 2 global mixer
@@ -401,6 +417,9 @@ public:
     void draw(Gfx& g) override;
     void onButton(uint8_t id, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
 
     int state = 0;          // 0 main, 1 open, 2 import mod, 3 save, 4 export
     int count = 0;
@@ -449,6 +468,9 @@ public:
     void onButton(uint8_t id, uint8_t state) override;
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     // The Sample Recorder key goes back to the recorder that opened Config
     // with F4 Metronome (spec 05 appendix C §2.9).
@@ -516,6 +538,9 @@ public:
     void onButton(uint8_t id, uint8_t state) override;
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     void padLeds(uint8_t* levels) override;
     bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
@@ -644,6 +669,9 @@ public:
     void draw(Gfx& g) override;
     void onButton(uint8_t id, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     bool ownsModuleKey(uint8_t id) const override { return id == btn::SampleEditor; }
     bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
@@ -701,6 +729,9 @@ public:
     void onPad(uint8_t pad, uint8_t state) override;
     bool onMidiNote(uint8_t note, uint8_t velocity, bool on) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
 
     static constexpr int kUndoLevels = 5;   // appendix C §2.11 "depth counter max 5"
@@ -780,7 +811,7 @@ private:
 //     highlighted patch in the slot (App::previewSynthLibraryPatch), Cancel
 //     restores the slot's patch byte for byte.
 // The Instrument Params key toggles pages 1/2 (and leaves Edit / Load Patch).
-// A slot whose model has no engine in this build (WTFM, FAT in 2.0) shows
+// A slot whose model has no engine in this build (WTFM; FAT until 2.1) shows
 // "Synth k (MODEL) not available" and is read-only except F1 Model.
 namespace synthui {
 // Value display / step kinds of one engine parameter.
@@ -892,6 +923,9 @@ public:
     void onButton(uint8_t id, uint8_t state) override;
     void onPad(uint8_t pad, uint8_t state) override;
     void onEncoder(int d) override;
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const override;
+#endif
     bool encoderFast() const override { return true; }
     bool ownsModuleKey(uint8_t id) const override { return id == btn::InstrParams; }
     void padLeds(uint8_t* levels) override;

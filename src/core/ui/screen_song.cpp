@@ -482,6 +482,12 @@ void SongScreen::onButton(uint8_t id, uint8_t state) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool SongScreen::encoderOnList() const {
+    return focus == 0 || (focus == 1 && !(edit && ui_.shift()));   // grid rows, song list
+}
+#endif
+
 void SongScreen::onEncoder(int d) {
     App& a = app_;
     if (focus == 1) {
