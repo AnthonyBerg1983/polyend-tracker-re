@@ -516,8 +516,8 @@ TEST(synth_stop_resets_macro_overrides) {
 }
 
 TEST(synth_unsupported_engine_silent) {
-    // WTFM (and FAT) are not in 2.0: the slot keeps its patch, plays nothing
-    // and reports "not available".
+    // WTFM is not in this build (planned for 2.2): the slot keeps its patch,
+    // plays nothing and reports "not available".
     BankRig r;
     patchInit(kSynthEngineWtfm, &r.patch[0]);
     r.bank.setEngineOverride(nullptr);
@@ -550,6 +550,29 @@ TEST(synth_unsupported_engine_silent) {
     r.bank.patchChanged(2);
     r.block();
     CHECK(r.bank.slotAvailable(2));
+}
+
+TEST(synth_fat_available_and_sounding) {
+    // FAT has an engine since 2.1: available, its voices start and sound.
+    BankRig r;
+    patchInit(kSynthEngineFat, &r.patch[0]);
+    r.bank.setEngineOverride(nullptr);
+    r.bank.patchChanged(0);
+    r.bank.setSlotRecord(0, rec(SynthModel::FAT, 2));
+    r.block();
+    CHECK(r.bank.slotAvailable(0));
+    CHECK(r.bank.slotView(0).available);
+    CHECK(!r.bank.slotView(0).patchMismatch);
+    CHECK_STR(r.bank.slotView(0).model, "FAT");
+    r.on(0, 0, 60);
+    r.on(1, 0, 67);
+    CHECK_EQ(r.bank.voicesOf(0), 2);
+    double e = 0.0;
+    for (int b = 0; b < 20; ++b) {
+        CHECK(r.block());
+        for (uint32_t i = 0; i < kBlock; ++i) e += double(r.L[i]) * r.L[i];
+    }
+    CHECK(e > 1.0);
 }
 
 TEST(synth_voice_memory_budget) {

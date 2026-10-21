@@ -576,6 +576,12 @@ void MixerScreen::onButton(uint8_t id, uint8_t state) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool MixerScreen::encoderOnList() const {
+    return page == 0 && isListParam(sub, param);   // Master option lists
+}
+#endif
+
 void MixerScreen::onEncoder(int d) {
     change(d);
     refreshBar();

@@ -809,6 +809,12 @@ void FileScreen::runExport(int id) {
     else if (!named || !exportWasCancelled()) ui_.notify("Export failed");
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool FileScreen::encoderOnList() const {
+    return state >= 1 && state <= 3;   // project / mod lists
+}
+#endif
+
 void FileScreen::onEncoder(int d) {
     if (state == 2) {
         cursor = clampi(cursor + d, 0, g_modCount - 1);

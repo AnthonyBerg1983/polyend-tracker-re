@@ -438,6 +438,12 @@ void EditorScreen::onButton(uint8_t id, uint8_t state) {
     refreshBar();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool EditorScreen::encoderOnList() const {
+    return !inert && page != 2 && focus == 3;   // effect list
+}
+#endif
+
 void EditorScreen::onEncoder(int d) {
     if (inert) return;
     if (page == 2) {

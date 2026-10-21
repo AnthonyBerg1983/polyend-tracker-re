@@ -2,20 +2,22 @@
 //
 // Every sound here is our own design, built on the engine's built-in Init
 // patch (patchInit) with the parameter semantics of our engines
-// (audio/engines/{acd,vap,perc}.*). Macro amounts follow the macro law of
+// (audio/engines/{acd,fat,vap,perc}.*). Macro amounts follow the macro law of
 // audio/synth_params.h: amount x stored range per unit of the macro, so a
 // bipolar macro at 63 (and a unipolar one at 0) plays the patch as saved.
 //
 // Levels: the slot gain is not part of a patch; every preset is voiced for
 // the default slot gain (-9 dB, SynthSlotRecord::defaults) and checked by
-// tests/patches_test.cpp: audible, and no sample at full scale (VAP: 4-voice
-// chords; PERC: every drum and five drums at once, toms alone).
+// tests/patches_test.cpp: audible, and no sample at full scale (VAP and the
+// FAT presets for chords: 4-voice chords; PERC: every drum and five drums at
+// once, toms alone).
 #include "presets.h"
 
 #include <cstdio>
 #include <cstring>
 
 #include "audio/engines/acd.h"
+#include "audio/engines/fat.h"
 #include "audio/engines/perc.h"
 #include "audio/engines/vap.h"
 #include "audio/synth_params.h"
@@ -163,6 +165,100 @@ std::vector<Preset> acdPresets() {
           {"Wah Rate", true, {{kLfoHz, 0.01f}}},
           {"Release", true, {{kAmpR, 0.03f}}},
           {"Glide", false, {{kGlideTime, 0.1f}}}}},
+    };
+}
+
+// ---------------------------------------------------------------------------
+// FAT: a unison stack of up to 7 saws (Fatness), saw -> pulse (Timbre),
+// Brightness and noise into LP MG 24 / LP OB 24 / LP OB 12, Amp Env, Filter
+// Env, one LFO (vibrato, cutoff), glide.
+
+std::vector<Preset> fatPresets() {
+    using namespace ot::audio::fat;
+    const SynthModel F = SynthModel::FAT;
+    return {
+        {F, "OT Super Saw", "The classic seven-saw stack: wide detune, open OB filter, a little vibrato.", 4,
+         {{kVolume, 0.95f}, {kFatness, 0.85f}, {kBrightness, 0.8f}, {kOscLfo, 0.06f}, {kFilterType, float(kLpOb24)},
+          {kCutoff, 6000.0f}, {kResonance, 0.2f}, {kFilterEnv, 0.1f}, {kEnvD, 0.8f}, {kEnvS, 0.4f}, {kAmpA, 0.01f},
+          {kAmpD, 1.0f}, {kAmpS, 0.9f}, {kAmpR, 0.6f}, {kLfoHz, 5.0f}},
+         {{"Cutoff", true, {{kCutoff, cut(5000)}}},
+          {"Fatness", true, {{kFatness, 0.15f}}},
+          {"Brightness", true, {{kBrightness, 0.4f}}},
+          {"Resonance", true, {{kResonance, 0.2f}}},
+          {"Attack", true, {{kAmpA, 0.05f}}},
+          {"Release", true, {{kAmpR, 0.08f}}}}},
+        {F, "OT Wide Pad", "Slow, dark unison pad: soft attack, a filter swell and a slow free-running sweep.", 4,
+         {{kVolume, 0.89f}, {kFatness, 0.7f}, {kBrightness, 0.3f}, {kOscLfo, 0.08f}, {kFilterType, float(kLpMg24)},
+          {kCutoff, 1800.0f}, {kResonance, 0.3f}, {kFilterEnv, 0.15f}, {kFilterLfo, 0.05f}, {kEnvA, 1.0f},
+          {kEnvD, 2.0f}, {kEnvS, 0.5f}, {kEnvR, 1.5f}, {kAmpA, 0.8f}, {kAmpD, 1.0f}, {kAmpS, 1.0f}, {kAmpR, 1.8f},
+          {kLfoHz, 0.3f}, {kLfoWave, float(kSine)}, {kLfoRetrig, float(kFree)}},
+         {{"Cutoff", true, {{kCutoff, cut(1500)}}},
+          {"Fatness", true, {{kFatness, 0.2f}}},
+          {"Sweep", false, {{kFilterLfo, 0.2f}}},
+          {"Attack", true, {{kAmpA, 0.05f}, {kEnvA, 0.05f}}},
+          {"Release", true, {{kAmpR, 0.1f}}},
+          {"Brightness", true, {{kBrightness, 0.3f}}}}},
+        {F, "OT Hoover Lead", "Mono hoover: full stack part pulse, deep vibrato, legato glide.", 1,
+         {{kVolume, 1.16f}, {kFatness, 1.0f}, {kTimbre, 0.4f}, {kBrightness, 0.6f}, {kOscLfo, 0.15f},
+          {kFilterType, float(kLpOb12)}, {kCutoff, 2500.0f}, {kResonance, 0.5f}, {kFilterEnv, 0.2f}, {kEnvD, 0.5f},
+          {kEnvS, 0.3f}, {kAmpA, 0.005f}, {kAmpS, 1.0f}, {kAmpR, 0.3f}, {kLfoHz, 5.5f}, {kLfoWave, float(kSine)},
+          {kGlideMode, float(kLegato)}, {kGlideTime, 0.12f}},
+         {{"Cutoff", true, {{kCutoff, cut(2000)}}},
+          {"Timbre", true, {{kTimbre, 0.4f}}},
+          {"Vibrato", true, {{kOscLfo, 0.1f}}},
+          {"Glide", true, {{kGlideTime, 0.05f}}},
+          {"Resonance", true, {{kResonance, 0.25f}}},
+          {"Fatness", true, {{kFatness, 0.3f}}}}},
+        {F, "OT Trance Pluck", "Short unison pluck: resonant OB filter snapped open by its envelope.", 4,
+         {{kVolume, 1.18f}, {kFatness, 0.6f}, {kFilterType, float(kLpOb24)}, {kCutoff, 300.0f}, {kResonance, 0.7f},
+          {kFilterEnv, 0.45f}, {kEnvD, 0.25f}, {kEnvS, 0.0f}, {kAmpD, 0.6f}, {kAmpS, 0.0f}, {kAmpR, 0.3f}},
+         {{"Cutoff", true, {{kCutoff, cut(600)}}},
+          {"Env Amt", true, {{kFilterEnv, 0.15f}}},
+          {"Decay", true, {{kEnvD, 0.02f}, {kAmpD, 0.03f}}},
+          {"Resonance", true, {{kResonance, 0.2f}}},
+          {"Fatness", true, {{kFatness, 0.25f}}},
+          {"Release", true, {{kAmpR, 0.03f}}}}},
+        {F, "OT Thick Bass", "Mono unison bass: three saws, a touch of pulse, MG filter bounce, short glide.", 1,
+         {{kVolume, 1.5f}, {kFatness, 0.35f}, {kTimbre, 0.2f}, {kBrightness, 0.5f}, {kNoise, 0.03f},
+          {kFilterType, float(kLpMg24)}, {kCutoff, 220.0f}, {kResonance, 0.6f}, {kFilterEnv, 0.35f}, {kEnvD, 0.3f},
+          {kEnvS, 0.1f}, {kAmpA, 0.002f}, {kAmpD, 0.8f}, {kAmpS, 0.8f}, {kAmpR, 0.1f}, {kOscLfo, 0.0f},
+          {kGlideMode, float(kLegato)}, {kGlideTime, 0.05f}},
+         {{"Cutoff", true, {{kCutoff, cut(400)}}},
+          {"Resonance", true, {{kResonance, 0.2f}}},
+          {"Env Amt", true, {{kFilterEnv, 0.2f}}},
+          {"Fatness", true, {{kFatness, 0.2f}}},
+          {"Timbre", false, {{kTimbre, 0.6f}}},
+          {"Glide", false, {{kGlideTime, 0.1f}}}}},
+        {F, "OT Dark Strings", "String ensemble: a warm stack under a 12 dB filter, swell and vibrato.", 4,
+         {{kVolume, 0.98f}, {kFatness, 0.75f}, {kBrightness, -0.2f}, {kOscLfo, 0.1f}, {kFilterType, float(kLpOb12)},
+          {kCutoff, 1400.0f}, {kResonance, 0.15f}, {kFilterEnv, 0.1f}, {kEnvA, 0.6f}, {kEnvS, 0.7f}, {kEnvR, 1.0f},
+          {kAmpA, 0.5f}, {kAmpD, 1.0f}, {kAmpS, 1.0f}, {kAmpR, 1.2f}, {kLfoHz, 5.0f}, {kLfoWave, float(kSine)}},
+         {{"Cutoff", true, {{kCutoff, cut(1200)}}},
+          {"Brightness", true, {{kBrightness, 0.4f}}},
+          {"Vibrato", true, {{kOscLfo, 0.08f}}},
+          {"Attack", true, {{kAmpA, 0.04f}, {kEnvA, 0.04f}}},
+          {"Release", true, {{kAmpR, 0.08f}}},
+          {"Fatness", true, {{kFatness, 0.2f}}}}},
+        {F, "OT Square Stack", "Mono lead of detuned squares (Timbre 1), OB 24 filter, overlap glide.", 1,
+         {{kVolume, 1.5f}, {kFatness, 0.5f}, {kTimbre, 1.0f}, {kBrightness, 0.7f}, {kFilterType, float(kLpOb24)},
+          {kCutoff, 1600.0f}, {kResonance, 0.4f}, {kFilterEnv, 0.2f}, {kEnvD, 0.4f}, {kEnvS, 0.3f}, {kAmpS, 0.9f},
+          {kAmpR, 0.2f}, {kGlideMode, float(kOverlap)}, {kGlideTime, 0.08f}},
+         {{"Cutoff", true, {{kCutoff, cut(1500)}}},
+          {"Timbre", true, {{kTimbre, 0.5f}}},
+          {"Resonance", true, {{kResonance, 0.25f}}},
+          {"Env Amt", true, {{kFilterEnv, 0.2f}}},
+          {"Fatness", true, {{kFatness, 0.3f}}},
+          {"Glide", false, {{kGlideTime, 0.1f}}}}},
+        {F, "OT Detuned Keys", "Keys from a light stack: free-running phases, a decaying filter, a breath of noise.", 4,
+         {{kVolume, 0.9f}, {kFatness, 0.3f}, {kTimbre, 0.15f}, {kBrightness, 0.4f}, {kNoise, 0.02f},
+          {kReset, 0.0f}, {kFilterType, float(kLpMg24)}, {kCutoff, 900.0f}, {kResonance, 0.35f},
+          {kFilterEnv, 0.25f}, {kEnvD, 0.6f}, {kEnvS, 0.2f}, {kAmpD, 1.5f}, {kAmpS, 0.4f}, {kAmpR, 0.4f}},
+         {{"Cutoff", true, {{kCutoff, cut(800)}}},
+          {"Env Amt", true, {{kFilterEnv, 0.15f}}},
+          {"Decay", true, {{kAmpD, 0.1f}, {kEnvD, 0.04f}}},
+          {"Fatness", true, {{kFatness, 0.2f}}},
+          {"Timbre", true, {{kTimbre, 0.15f}}},
+          {"Release", true, {{kAmpR, 0.04f}}}}},
     };
 }
 
@@ -527,6 +623,7 @@ const char* modelName(SynthModel m) { return ot::synthModelName(m); }
 const std::vector<Preset>& all() {
     static const std::vector<Preset> v = [] {
         std::vector<Preset> out = acdPresets();
+        for (Preset& p : fatPresets()) out.push_back(p);
         for (Preset& p : vapPresets()) out.push_back(p);
         for (Preset& p : percPresets()) out.push_back(p);
         return out;
@@ -581,7 +678,7 @@ bool buildAndSave(ot::App& a, int s, const Preset& pr, std::string& err) {
 std::string markdown() {
     std::string o;
     o += "# OpenTracker preset pack\n\n";
-    o += "Our own synth patches for the ACD, VAP and PERC engines of OpenTracker 2.x, written by\n";
+    o += "Our own synth patches for the ACD, FAT, VAP and PERC engines of OpenTracker 2.x, written by\n";
     o += "`reimpl/tools/make_patches` (`make -C reimpl patches`) through the firmware's own Save As path.\n";
     o += "Every patch starts from the engine's built-in Init patch; no factory patch is used.\n\n";
     o += "Files: `Patches/<MODEL>/<name>.patch`. Copy the `Patches` folder to the root of the SD card,\n";
@@ -589,8 +686,8 @@ std::string markdown() {
     o += "Macros: M1-M6 (FX CC A-F). A bipolar macro (+-) at 63 and a unipolar macro at 0 play the\n";
     o += "patch as saved. M7 is Velocity (Volume FX), as in the Init patch. Levels are voiced for the\n";
     o += "default slot gain (-9 dB); `tests/patches_test.cpp` checks that every patch is audible, stays\n";
-    o += "at least 1 dB below full scale (VAP: 4-voice chords; PERC: five drums at once, toms alone) and does not\n";
-    o += "clip with all macros at either extreme.\n\n";
+    o += "at least 1 dB below full scale (VAP and FAT Poly 4: 4-voice chords; PERC: five drums at once, toms\n";
+    o += "alone) and does not clip with all macros at either extreme.\n\n";
     o += "Poly: the suggested slot polyphony (1 = mono, 4 = chords). It is a slot setting on the synth\n";
     o += "page, not part of the patch.\n";
     SynthModel cur = SynthModel(255);

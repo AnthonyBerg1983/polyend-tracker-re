@@ -29,6 +29,14 @@
 # chords"), avg 143535. play8 / worst / stereo8 / mix* / pswitch re-recorded (-0.1..-1.0 %,
 # the governor / profile code moved the layout); idle / idle2 / synth4 kept (+0.3..0.7 %:
 # the block-profile checks and the start counter, within the 5 % rule).
+# fatinit / fatworst / mixfat (2.1, FAT engine, docs/specs/2x-07-fat-engine.md): one FAT
+# voice per block incl. prepare, Init patch and the costliest settings (limits: Init <= 12k,
+# worst <= 22k), and the mix set with 4 worst-case FAT voices in Synth 1 instead of ACD.
+# Recorded with the complete engine (FAT M3): mixfat est. 62.2 % of the block budget (peak
+# block 63.4 %); the existing scenarios did not move (FAT code is not on their paths).
+# fatworst re-recorded (FAT review follow-ups): measured at pitch ~108 (glide 108 -> 96;
+# polyBLEP event cost grows with pitch), was 16110 at 36 -> 60. mixfat unchanged (same
+# patch, its own notes 36..57).
 idle     10731
 idle2    10863
 play8    138113
@@ -37,9 +45,12 @@ stereo8  167310
 synth4   66420
 vapinit  9025
 vapworst 17148
+fatinit  9224
+fatworst 18679
 mix      249396
 mix5     265354
 mix6     265357
+mixfat   252014
 pswitch  137875
 peakavg  143387
 peak     224440

@@ -423,3 +423,22 @@ TEST(song_undo_without_data_shows_stock_text) {
     CHECK(h.disp.lastHasText("No undo data :("));
     (void)a;
 }
+
+TEST(automation_lfo_shape_up_moves_up) {
+    // User report: with Type = LFO, Up/Down were reversed in the Shape list
+    // (Rev saw, Saw, Triangle, Square, Random from the top).
+    Harness h;
+    App& a = *h.app;
+    a.setCurrentInstrument(0);
+    h.tap(btn::InstrParams);
+    auto& s = *static_cast<InstrumentScreen*>(a.ui.screen(kModInstrument));
+    if (s.mode != 1) h.tap(btn::InstrParams);
+    CHECK(iedit::set(a.instruments[0], InstrParam::AutoType, 0, 2));   // LFO
+    s.dest = 0;
+    s.column = 2;
+    const int sh0 = iedit::get(a.instruments[0], InstrParam::AutoAttackShape, 0);
+    h.tap(btn::Down);
+    CHECK_EQ(iedit::get(a.instruments[0], InstrParam::AutoAttackShape, 0), sh0 + 1);
+    h.tap(btn::Up);
+    CHECK_EQ(iedit::get(a.instruments[0], InstrParam::AutoAttackShape, 0), sh0);
+}

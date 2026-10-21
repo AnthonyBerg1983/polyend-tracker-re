@@ -113,6 +113,8 @@ SECTIONS
 		*/engines/acd.cpp.o(.fastrun*)
 		__fastrun_perc = .;
 		*/engines/perc.cpp.o(.fastrun*)
+		__fastrun_fat = .;
+		*/engines/fat.cpp.o(.fastrun*)
 		__fastrun_other = .;
 		*(.fastrun*)
 		__fastrun_end = .;

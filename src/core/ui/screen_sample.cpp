@@ -696,6 +696,12 @@ void PlaybackScreen::padLeds(uint8_t* lv) {
     for (int p = 0; p < in.sliceCount && p < kPadCount; ++p) lv[p] = app_.cfg.padDim();
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool PlaybackScreen::encoderOnList() const {
+    return sel == 6;   // play-mode list
+}
+#endif
+
 void PlaybackScreen::onEncoder(int d) {
     change(d);
     refreshBar();

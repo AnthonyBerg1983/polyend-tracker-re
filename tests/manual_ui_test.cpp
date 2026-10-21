@@ -431,3 +431,29 @@ TEST(pattern_tap_alone_leaves_the_column_view) {
     h.tap(btn::Pattern);
     CHECK_EQ(p.colMask, 0);
 }
+
+TEST(encoder_on_list_hint_for_the_simulator_wheel) {
+    // The simulator flips its mouse wheel on lists (Ui::encoderOnList):
+    // lists, options and rows are lists; value bars are not.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Config);
+    CHECK(a.ui.encoderOnList());   // categories / options
+    h.tap(btn::Pattern);
+    CHECK(!a.editMode);
+    CHECK(a.ui.encoderOnList());   // rows while stopped, not editing
+    h.tap(btn::Rec);
+    CHECK(!a.ui.encoderOnList());  // edit mode: the encoder changes values
+    h.tap(btn::Rec);
+    a.setCurrentInstrument(0);
+    h.tap(btn::InstrParams);
+    auto& s = *static_cast<InstrumentScreen*>(a.ui.screen(kModInstrument));
+    s.mode = 0;
+    s.effects = false;
+    s.column = 0;
+    CHECK(!a.ui.encoderOnList());  // Volume bar
+    s.column = 4;
+    CHECK(a.ui.encoderOnList());   // filter type list
+    h.tap(btn::SampleLoader);
+    CHECK(a.ui.encoderOnList());
+}

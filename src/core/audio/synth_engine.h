@@ -145,7 +145,7 @@ public:
 };
 
 // Engine registry keyed by the Tracker Mini engine id (synth_registry.cpp).
-// nullptr = the model is not available in this build (WTFM, FAT in 2.0):
+// nullptr = the model is not available in this build (WTFM; FAT until 2.1):
 // such a slot loads and saves its patch but stays silent.
 ISynthEngine* synthEngineFor(int32_t engineId);
 

@@ -396,19 +396,6 @@ void saveShot(Machine& m, const std::string& path, bool panel) {
 std::vector<std::string> gNotices;
 void recordNotice(const char* text) { gNotices.push_back(text); }
 
-// The synth screen's Edit view with a list (enum) row selected.
-bool wheelOnSynthList(const Machine& m) {
-    if (!m.app || m.app->ui.active() != ot::kModSynth) return false;
-    const auto* s = static_cast<const ot::SynthScreen*>(m.app->ui.screen(ot::kModSynth));
-    if (!s || s->view != ot::SynthScreen::View::Edit) return false;
-    const ot::synthui::Section* sec = nullptr;
-    const int n = ot::synthui::sections(s->engine(), &sec);
-    if (s->section < 0 || s->section >= n || sec[s->section].macro >= 0) return false;
-    if (s->row < 0 || s->row >= sec[s->section].count) return false;
-    const ot::synthui::ParamUi* u = ot::synthui::paramUi(s->engine(), sec[s->section].params[s->row]);
-    return u && u->fmt == ot::synthui::kFmtEnum;
-}
-
 struct Headless {
     Machine& m;
     bool panel;
@@ -920,11 +907,10 @@ int runInteractive(Machine& m, const Options& o) {
                 case SDL_MOUSEWHEEL: {
                     int d = ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) d = -d;
-                    // Wheel up = clockwise (raises values). On a synth Edit
-                    // Patch list (Filter Type, LFO Waveform, ...) clockwise
-                    // moves down the list, so there the wheel is flipped to
-                    // scroll with the list (simulator only; user report).
-                    if (wheelOnSynthList(m)) d = -d;
+                    // Wheel up = clockwise (values go up). On a list (names,
+                    // options, rows) clockwise moves down, so the wheel is
+                    // flipped there and scrolls with the list (user report).
+                    if (m.app && m.app->ui.encoderOnList()) d = -d;
                     if (d) m.input.encoder(d);
                     break;
                 }

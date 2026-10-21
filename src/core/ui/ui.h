@@ -70,6 +70,13 @@ public:
     virtual void onPad(uint8_t pad, uint8_t state);      // default: audition current instrument
     virtual void onEncoder(int d) { (void)d; }
     virtual bool encoderFast() const { return false; }   // Shift-fast acceleration (spec 05 §2.1.4)
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)   // simulator / host only
+    // True while the encoder moves a highlight through a list (names,
+    // options, rows): clockwise = down the list. False on values, where
+    // clockwise = more. Not used by the firmware; the simulator reads it so
+    // its mouse wheel scrolls lists with the wheel.
+    virtual bool encoderOnList() const { return false; }
+#endif
     // True if this screen gives its own module key a local meaning (spec 06 §0.3).
     virtual bool ownsModuleKey(uint8_t id) const { (void)id; return false; }
     // Base pad LED layer, levels 0..31.
@@ -300,6 +307,9 @@ public:
     void switchTo(int module, int opt = 0);
     int active() const { return active_; }
     int previous() const { return previous_; }
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+    bool encoderOnList() const;   // overlays first, then the active screen (Screen::encoderOnList)
+#endif
     Screen* screen(int module) const { return module >= 0 && module < kModCount ? screens_[module] : nullptr; }
     Screen* current() const { return screen(active_); }
 

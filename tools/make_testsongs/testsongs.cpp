@@ -2,7 +2,8 @@
 // Am - F - C - G, one chord per bar, 16 steps per bar, 124 BPM. Songs 6-12:
 // BLAST GRID remixes (bgsongs.inc, bg_data.h). Song 13 "OT Test 06": the
 // PERC engine alone (percsong.inc). Song 14 "OT Test 07": the VAP engine
-// alone (vapsong.inc).
+// alone (vapsong.inc). Song 16 "OT Test 09": the FAT engine alone
+// (fatsong.inc).
 #include "testsongs.h"
 
 #include <cmath>
@@ -16,6 +17,7 @@
 #include "app/project_fields.h"
 #include "audio/audio_tables.h"
 #include "audio/engines/acd.h"
+#include "audio/engines/fat.h"
 #include "audio/engines/perc.h"
 #include "audio/engines/vap.h"
 #include "audio/synth_params.h"
@@ -44,6 +46,7 @@ const SongInfo kSongs[kSongCount] = {
     {SongId::PercOnly, "OT Test 06 - PERC Only", "M3 (PERC engine) + M1", kHasSynths && kHas16Tracks},
     {SongId::VapOnly, "OT Test 07 - VAP Only", "M3 (VAP engine) + M1", kHasSynths && kHas16Tracks},
     {SongId::MeterCheck, "OT Test 08 - Meter Check", "stock 1.9.2 / 1.9.3", true},
+    {SongId::FatOnly, "OT Test 09 - FAT Only", "2.1 (FAT engine) + M1", kHasSynths && kHas16Tracks},
     {SongId::BgTitle, "BG Title", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
     {SongId::BgWorld1, "BG World 1", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
     {SongId::BgWorld4, "BG World 4", "M3 (synth engines) + M1", kHasSynths && kHas16Tracks},
@@ -1032,6 +1035,7 @@ bool synthSong(Gen& g) {
 #include "percsong.inc"
 #include "vapsong.inc"
 #include "metersong.inc"
+#include "fatsong.inc"
 
 }  // namespace
 
@@ -1076,6 +1080,7 @@ bool generateSong(App& app, IStorage& fs, SongId id, const GenOptions& opt, std:
         case SongId::PercOnly: built = perconly::percOnlySong(g); break;
         case SongId::VapOnly: built = vaponly::vapOnlySong(g); break;
         case SongId::MeterCheck: built = metercheck::meterSong(g); break;
+        case SongId::FatOnly: built = fatonly::fatOnlySong(g); break;
     }
     if (built) built = g.finish(info->name);
     if (!built) err = g.err.empty() ? "generation failed" : g.err;

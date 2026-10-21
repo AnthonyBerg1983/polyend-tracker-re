@@ -985,6 +985,14 @@ void PatternScreen::focusDelta(int d) {
     }
 }
 
+#if !(defined(OT_TARGET_DEVICE) && OT_TARGET_DEVICE)
+bool PatternScreen::encoderOnList() const {
+    if (pop_.isOpen()) return true;          // note / instrument / FX lists
+    if (fillOpen || focus >= 0) return false;
+    return !edit();                          // stopped, not editing: the rows
+}
+#endif
+
 void PatternScreen::onEncoder(int d) {
     if (patternHeld_) patternCombo_ = true;
     if (pop_.isOpen()) {   // spec 06 §1.6 step 3: the encoder scrolls the popup
