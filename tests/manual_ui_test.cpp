@@ -457,3 +457,23 @@ TEST(encoder_on_list_hint_for_the_simulator_wheel) {
     h.tap(btn::SampleLoader);
     CHECK(a.ui.encoderOnList());
 }
+
+TEST(pattern_preview_plays_the_row_once) {
+    // Stock 1.9.2 (owner check): Preview on a cell plays that row once and
+    // stops; the cursor is free again. It looped before and held the cursor.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    p.step = 8;
+    h.tap(btn::F5);   // Preview
+    CHECK(a.seq.isPlaying());
+    for (int i = 0; i < 100 && a.seq.isPlaying(); ++i) {
+        h.audio.pump(3);
+        h.run(10);
+    }
+    CHECK(!a.seq.isPlaying());
+    const int row = p.step;
+    h.tap(btn::Down);
+    CHECK_EQ(p.step, row + 1);
+}
