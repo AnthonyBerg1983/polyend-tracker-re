@@ -116,9 +116,11 @@ uint8_t BottomBar::separatorMask() const {
     return m;
 }
 
-void BottomBar::drawStrip(Gfx& g, const Theme& th) const {
-    wg::bottomStrip(g, th, separatorMask(), stripBg == wg::kThemeColour ? wg::stripColour(th, stripStyle) : stripBg);
+uint32_t BottomBar::stripColour(const Theme& th) const {
+    return stripBg == wg::kThemeColour ? wg::stripColour(th, stripStyle) : stripBg;
 }
+
+void BottomBar::drawStrip(Gfx& g, const Theme& th) const { wg::bottomStrip(g, th, separatorMask(), stripColour(th)); }
 
 void BottomBar::drawLabels(Gfx& g, const Theme& th) const {
     // spec 20 §1.2: text-only labels centred at 50 + 100 i (wide: 100 + 100 i)
@@ -1143,7 +1145,12 @@ void Ui::render() {
     // first: panel fades end on top of its edge row); labels go on top.
     const bool barShown = !factory.active() && !usbPage && !kb.isOpen() && ph != PopupHeader::kFull &&
                           (askOpen_ || !s || !s->fullScreen());
-    if (barShown) (askOpen_ ? BottomBar{} : bar).drawStrip(g, t);
+    stripUnder_ = barShown;
+    if (barShown) {
+        const BottomBar& sb = askOpen_ ? BottomBar{} : bar;
+        stripUnderC_ = sb.stripColour(t);
+        sb.drawStrip(g, t);
+    }
     if (factory.active()) {
         factory.draw(g);
     } else if (usbPage) {
