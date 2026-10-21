@@ -886,7 +886,7 @@ int runInteractive(Machine& m, const Options& o) {
                         break;
                     }
                     if (sc == SDL_SCANCODE_PAGEUP || sc == SDL_SCANCODE_PAGEDOWN) {
-                        if (down) m.input.encoder(sc == SDL_SCANCODE_PAGEUP ? 1 : -1);
+                        if (down) m.input.encoder(sc == SDL_SCANCODE_PAGEDOWN ? 1 : -1);
                         break;
                     }
                     if (!padMode && (sc == SDL_SCANCODE_LEFTBRACKET || sc == SDL_SCANCODE_RIGHTBRACKET)) {
@@ -905,7 +905,9 @@ int runInteractive(Machine& m, const Options& o) {
                     break;
                 }
                 case SDL_MOUSEWHEEL: {
-                    int d = ev.wheel.y;
+                    // Wheel down = clockwise: lists then scroll with the wheel
+                    // (a clockwise turn moves down a list on the Tracker).
+                    int d = -ev.wheel.y;
                     if (ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) d = -d;
                     if (d) m.input.encoder(d);
                     break;

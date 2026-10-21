@@ -138,6 +138,7 @@ private:
     uint8_t noteKeysOn_ = 0;        // Note popup F-keys sounding (bit = F-key)
     bool encUsedInHold_ = false;
     bool patternHeld_ = false;
+    bool patternCombo_ = false;   // another key / the encoder was used while Pattern was held
     int maskKeys_[2] = {-1, -1};
     uint32_t lastUpdate_ = 0;
     int lastPlayStep_ = -1;

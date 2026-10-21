@@ -488,6 +488,7 @@ void PatternScreen::refreshBar() {
 
 void PatternScreen::onButton(uint8_t id, uint8_t state) {
     App& a = app_;
+    if (patternHeld_ && id != btn::Pattern && state == kPress) patternCombo_ = true;
     if (fillOpen) {
         if (state == kPress) fillButton(id);
         refreshBar();
@@ -555,8 +556,19 @@ void PatternScreen::onButton(uint8_t id, uint8_t state) {
     }
     switch (id) {
         case btn::Pattern:
+            // Manual (Quick Reference): Pattern + column keys pick the
+            // column view; pressing Pattern alone goes back to the 4-track
+            // view (user report: the view could not be left).
+            if (state == kPress) {
+                patternCombo_ = false;
+            } else if (state == kRelease) {
+                if (patternHeld_ && !patternCombo_ && colMask) {
+                    colMask = 0;
+                    keepTrackVisible();
+                }
+                maskKeys_[0] = maskKeys_[1] = -1;
+            }
             patternHeld_ = state != kRelease;
-            if (state == kRelease) maskKeys_[0] = maskKeys_[1] = -1;
             break;
         case btn::Play:
             if (state == kPress) transport();
@@ -910,7 +922,8 @@ void PatternScreen::transport() {
         } else {
             s.stop();
             a.allVoicesOff();
-            if (!edit()) step = 0;
+            // The cursor stays on the row where playback stopped (it
+            // follows the playhead while playing), as on stock 1.9.2.
         }
     }
     focus = -1;
@@ -973,6 +986,7 @@ void PatternScreen::focusDelta(int d) {
 }
 
 void PatternScreen::onEncoder(int d) {
+    if (patternHeld_) patternCombo_ = true;
     if (pop_.isOpen()) {   // spec 06 §1.6 step 3: the encoder scrolls the popup
         pop_.move(d);
         if (pop_.kind() == 0) followNoteWindow();

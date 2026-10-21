@@ -383,3 +383,51 @@ TEST(file_lists_hold_80_entries) {
     std::printf("  mod list %d entries (state %d)\n", f.count, f.state);
     CHECK_EQ(f.count, ProjectBrowser::kMaxEntries);
 }
+
+TEST(pattern_stop_keeps_the_cursor_on_the_stop_row) {
+    // User report (stock 1.9.2): Play, then Play again to stop -- the cursor
+    // stays on the row where playback stopped instead of jumping to the top.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    CHECK(!a.editMode);
+    h.tap(btn::Play);
+    CHECK(a.seq.isPlaying());
+    for (int i = 0; i < 300; ++i) {   // ~1.7 s at 130 BPM
+        h.audio.pump(3);
+        h.run(10);
+    }
+    const int row = a.seq.step(0);
+    CHECK(row > 4);
+    h.tap(btn::Play);
+    CHECK(!a.seq.isPlaying());
+    h.run(60);
+    CHECK(p.step >= row && p.step <= row + 1);
+}
+
+TEST(pattern_tap_alone_leaves_the_column_view) {
+    // Manual Quick Reference / user report: Pattern + Note shows the Note
+    // column of 8 tracks; pressing Pattern alone goes back to the 4-track view.
+    Harness h;
+    App& a = *h.app;
+    h.tap(btn::Pattern);
+    auto& p = *static_cast<PatternScreen*>(a.ui.screen(kModPattern));
+    CHECK_EQ(p.colMask, 0);
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.up(btn::Pattern);
+    h.run(60);
+    CHECK_EQ(p.colMask, 1);   // the combo keeps the view
+    h.tap(btn::Pattern);
+    h.run(60);
+    CHECK_EQ(p.colMask, 0);   // Pattern alone: full view
+    // Two columns, then Pattern alone again.
+    h.down(btn::Pattern);
+    h.tap(btn::Note);
+    h.tap(btn::Fx1);
+    h.up(btn::Pattern);
+    CHECK_EQ(p.colMask, 1 | 4);
+    h.tap(btn::Pattern);
+    CHECK_EQ(p.colMask, 0);
+}
