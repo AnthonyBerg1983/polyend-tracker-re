@@ -282,6 +282,19 @@ void MixerScreen::start(int opt) {
         actStep_[i] = -1;
         actUntil_[i] = 0;
     }
+    // Meters and peak-hold marks restart empty: they only update while this
+    // page is shown, so marks from an earlier visit stayed frozen after the
+    // song stopped (user report).
+    for (int t = 0; t < 8; ++t) {
+        meter[t] = meterHold[t] = 0;
+        for (float& v : hist_[t]) v = 0.0f;
+    }
+    for (int i = 0; i < 4; ++i)
+        for (int c = 0; c < 2; ++c) {
+            globalMeter[i][c] = 0;
+            for (float& v : ghist_[i][c]) v = 0.0f;
+        }
+    for (int& v : synthMeter) v = 0;
     // The entering Master press is consumed by the switch (spec 06 §0.3).
     masterPending_ = otherKeyDuringMaster_ = masterHoldFired_ = false;
     refreshBar();
@@ -970,8 +983,8 @@ void MixerScreen::draw(Gfx& g) {
         br[nr++] = wg::ValueBarItem{x, 64, 32, 359, p.u8(kGlobalLevel[i]) / 100.0f, muted ? off : wg::kThemeColour};
         // A muted channel's meters rest in the muted colour too [S round 3,
         // snap 010 Line In].
-        br[nr++] = wg::ValueBarItem{x + 32, 64, 32, 359, 0.0f, muted ? off : green};
-        br[nr++] = wg::ValueBarItem{x + 64, 64, 32, 359, 0.0f, muted ? off : green};
+        br[nr++] = wg::ValueBarItem{x + 32, 64, 32, 359, globalMeter[i][0] / 100.0f, muted ? off : green};
+        br[nr++] = wg::ValueBarItem{x + 64, 64, 32, 359, globalMeter[i][1] / 100.0f, muted ? off : green};
     }
     // 2.x synth slots (manual p.220): the level setting (left) and the
     // actual level (right: the live slot-bus meter), Track Mixer geometry;
