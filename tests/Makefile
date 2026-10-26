@@ -48,6 +48,17 @@ $(OUT)/usb_desc_test_nomsc: usb_desc_test.cpp $(OUT)/obj/usb_desc_nomsc.o
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -DOT_USB_MSC=0 $< $(OUT)/obj/usb_desc_nomsc.o $(LDFLAGS) -o $@
 
+# FatFs allocation check (fatfs_alloc_test.cpp): the device's FatFs compiled
+# on the host against an in-memory disk.
+FATFS := ../third_party/fatfs
+FATFS_CFLAGS := -std=gnu11 -g -O1 -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -I$(FATFS)
+$(OUT)/obj/fatfs/%.o: $(FATFS)/%.c $(FATFS)/ff.h $(FATFS)/ffconf.h
+	@mkdir -p $(dir $@)
+	$(CC) $(FATFS_CFLAGS) -c $< -o $@
+$(OUT)/fatfs_alloc_test: fatfs_alloc_test.cpp $(OUT)/obj/fatfs/ff.o $(OUT)/obj/fatfs/ffunicode.o
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I$(FATFS) $< $(OUT)/obj/fatfs/ff.o $(OUT)/obj/fatfs/ffunicode.o $(LDFLAGS) -o $@
+
 build: $(TEST_BINS)
 
 # Private vendor fixtures (never committed): the repo-root fixtures symlink.
