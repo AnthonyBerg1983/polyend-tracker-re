@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include <type_traits>
+
 #include "diag.h"
 #include "sdram_bss.h"
 
@@ -12,10 +14,20 @@ namespace hal {
 
 namespace {
 OT_SDRAM_BSS SdStreamReader::Binding gBindings[audio::kMaxStreams];
+static_assert(std::is_trivially_default_constructible<SdStreamReader::Binding>::value,
+              "SDRAM object: no static constructor (tools/check_ctors.py)");
 alignas(4) uint8_t gEdge[512];   // partial head / tail sectors (SRAM)
 }  // namespace
 
-SdStreamReader::SdStreamReader(SdStorage& sd) : sd_(sd), b_(gBindings) {}
+// Constructed in otAppMain (a function-local static), after the SDRAM is up.
+SdStreamReader::SdStreamReader(SdStorage& sd) : sd_(sd), b_(gBindings) {
+    for (int i = 0; i < audio::kMaxStreams; ++i) {
+        b_[i].instrument = 0xFF;
+        b_[i].stereo = false;
+        b_[i].nExt = 0;
+        b_[i].dataOffset = b_[i].frames = 0;
+    }
+}
 
 SdStreamReader::Binding* SdStreamReader::find(uint8_t instrument) const {
     for (int i = 0; i < audio::kMaxStreams; ++i)

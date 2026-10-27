@@ -170,6 +170,8 @@ $(BUILD)/%.cpp.o: %.cpp
 $(BUILD)/opentracker.elf: $(OBJS) $(LDSCRIPT)
 	$(CXX) $(LDFLAGS) $(OBJS) -L$(CORE) $(LIBS) -o $@ -Wl,-Map=$(BUILD)/opentracker.map
 	$(SIZE) $@
+	@# No static constructor may touch SDRAM (it is not running before main()).
+	python3 -I tools/check_ctors.py $(CROSS)objdump $@ || { rm -f $@; exit 1; }
 
 $(BUILD)/opentracker.hex: $(BUILD)/opentracker.elf
 	$(OBJCOPY) -O ihex -R .eeprom $< $@

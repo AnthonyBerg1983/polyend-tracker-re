@@ -24,11 +24,15 @@ public:
     bool read(const audio::StreamSource& s, uint32_t frame, uint32_t n, int16_t* l, int16_t* r) override;
     uint32_t mismatches() const { return mismatches_; }   // bind self-check failures (diagnostics)
 
-    struct Binding {   // 16 + 32 x 8 = 272 B, in .sdram_bss
-        uint8_t instrument = 0xFF;
-        bool stereo = false;
-        uint8_t nExt = 0;
-        uint32_t dataOffset = 0, frames = 0;
+    // 16 + 32 x 8 = 272 B, in .sdram_bss: no default member values (a
+    // static constructor would write SDRAM before boardInit() starts it and
+    // the Tracker stays black at power on); the reader's constructor clears
+    // the bindings at run time.
+    struct Binding {
+        uint8_t instrument;   // 0xFF: free
+        bool stereo;
+        uint8_t nExt;
+        uint32_t dataOffset, frames;
         audio::StreamExtent ext[audio::kStreamMaxExtents];
     };
 
