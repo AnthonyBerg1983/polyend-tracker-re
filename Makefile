@@ -51,6 +51,12 @@ OT_GAMES ?= 0
 ifeq ($(OT_GAMES),1)
 BUILD     := $(BUILD)/games
 endif
+# Stack guard test build (src/hal/stack_guard.h): 1 = with
+# /Firmware/ot_guardtest.txt on the card, overflows the stack once on purpose.
+OT_STACK_GUARD_TEST ?= 0
+ifeq ($(OT_STACK_GUARD_TEST),1)
+BUILD     := $(BUILD)/guardtest
+endif
 # USB Storage mode (docs/PLAN_2X.md, Tracker Mini manual §13.10): 1 = the USB
 # device adds a mass-storage interface (third_party/teensy3/usb_msc.h) next to
 # MIDI + Serial; 0 = the old MIDI + Serial descriptors exactly (fallback image).
@@ -79,9 +85,9 @@ CPUFLAGS  := -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
 DEFS      := -D__MK66FX1M0__ -DF_CPU=180000000 -DUSB_MIDI_SERIAL -DLAYOUT_US_ENGLISH \
              -DF_BUS=90000000 -DSERIAL5_TX_BUFFER_SIZE=512 -DSERIAL5_RX_BUFFER_SIZE=512 \
              -DTEENSYDUINO=159 -DARDUINO=10819 -DOT_VERSION=\"$(VERSION)\" -DOT_TARGET_DEVICE=1 \
-             -DOT_SDRAM_CACHE=$(OT_SDRAM_CACHE) -DOT_GAMES=$(OT_GAMES) -DOT_FASTRUN=$(OT_FASTRUN) -DOT_USB_MSC=$(OT_USB_MSC) -DOT_FONTS_COMPRESSED=1 $(USB_ID) $(DEFS_EXTRA)
+             -DOT_SDRAM_CACHE=$(OT_SDRAM_CACHE) -DOT_GAMES=$(OT_GAMES) -DOT_FASTRUN=$(OT_FASTRUN) -DOT_USB_MSC=$(OT_USB_MSC) -DOT_STACK_GUARD_TEST=$(OT_STACK_GUARD_TEST) -DOT_FONTS_COMPRESSED=1 $(USB_ID) $(DEFS_EXTRA)
 INCS      := -I$(CORE) -Isrc -Isrc/core -Isrc/hal -Ithird_party/fatfs
-COMMON    := $(CPUFLAGS) $(DEFS) $(INCS) -O2 -g -ffunction-sections -fdata-sections -Wall -MMD
+COMMON    := $(CPUFLAGS) $(DEFS) $(INCS) -O2 -g -ffunction-sections -fdata-sections -Wall -MMD -fstack-usage
 CFLAGS    := $(COMMON) -std=gnu11
 CXXFLAGS  := $(COMMON) -std=gnu++17 -fno-exceptions -fno-rtti -felide-constructors -Wno-psabi
 # Own linker script: the Teensy one + the uncached `.dma` section (src/hal/opentracker.ld).
@@ -201,6 +207,9 @@ clean:
 #     against the thresholds (render avg < 45 %, max < 70 %, loop max < 50 ms outside loading).
 #  4. Flash size of the firmware image (.text + .data): fail above 720,000 B, warn above
 #     600,000 B (docs/VERIFY_M1.md R4); builds build/opentracker.elf when it is stale.
+#  5. Stack frames (-fstack-usage .su files): fail when one function's frame reaches the stack
+#     guard (src/hal/stack_guard.h) less 256 B for an interrupt's exception frame, or is
+#     unbounded; warn above 75 % of the guard.
 PERF_OUT := build/perf
 perf-gate:
 	@mkdir -p $(PERF_OUT)
@@ -211,8 +220,9 @@ perf-gate:
 	@if command -v $(CXX) >/dev/null 2>&1; then \
 	    { $(MAKE) -s $(BUILD)/opentracker.elf > $(PERF_OUT)/firmware_build.txt 2>&1 || \
 	      { tail -20 $(PERF_OUT)/firmware_build.txt; exit 1; }; } && \
-	    python3 tools/telemetry_check.py size --size-tool $(SIZE) $(BUILD)/opentracker.elf; \
-	else echo "perf-gate: $(CXX) missing -- flash size check SKIPPED"; fi
+	    python3 tools/telemetry_check.py size --size-tool $(SIZE) $(BUILD)/opentracker.elf && \
+	    python3 tools/telemetry_check.py frames $(BUILD); \
+	else echo "perf-gate: $(CXX) missing -- flash size and stack frame checks SKIPPED"; fi
 	@$(MAKE) -s -C tests bench > $(PERF_OUT)/bench_host.txt && sed 's/^/  host: /' $(PERF_OUT)/bench_host.txt | head -8
 	@python3 tools/telemetry_check.py selftest
 	@if [ -n "$(LOG)" ]; then python3 tools/telemetry_check.py log "$(LOG)" \
