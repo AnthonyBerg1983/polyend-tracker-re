@@ -12,6 +12,7 @@
 #include "app/midi_cc.h"
 #include "app/pattern_ops.h"
 #include "app/project_io.h"
+#include "app/stream_policy.h"
 #include "app/undo.h"
 #include "audio/engine.h"
 #include "hal_api.h"
@@ -119,6 +120,17 @@ enum class ImportRoute : uint8_t {
     NoMemory,    // too big, and not even its streamed head fits
     CardFull,    // the card cannot hold the converted file
     Unreadable,  // not a supported WAV / .pti
+};
+
+// What the import route needs of a file (App::importProbe, one header read):
+// frames / channels as the import produces them; a .pti's own play mode and
+// loop start (a WAV takes the slot's).
+struct ImportProbe {
+    uint32_t frames = 0;
+    bool stereo = false;
+    bool pti = false;
+    uint8_t playMode = 0;
+    uint16_t loopPoint1 = 0;
 };
 
 class App final : public ISequencerHost {
@@ -386,7 +398,15 @@ public:
     // route is not Streams or the job could not start.
     // bankBytes (optional): what the slot then holds in the sample memory
     // (the whole sample when it fits, the streamed head when it streams).
+    // The route follows Config > Stream from card like a project open
+    // (importDecision); why (optional): the reason it streams. The probe
+    // form makes no I/O; cardFree UINT64_MAX skips the card-space check;
+    // pendingBytes / pendingStreams: what the files placed before this one
+    // add to the memory and the streams (the Sample Loader's selection).
     ImportRoute importRoute(const char* path, int slot, uint32_t* bankBytes = nullptr);
+    bool importProbe(const char* path, ImportProbe& p);
+    ImportRoute importRoute(const ImportProbe& p, int slot, uint32_t* bankBytes, StreamWhy* why,
+                            uint64_t cardFree, int64_t pendingBytes = 0, int pendingStreams = 0);
     bool startStreamedImport(const char* path, int slot, void (*done)(void* ctx, bool ok) = nullptr,
                              void* ctx = nullptr);
     const char* importNotice() const { return importNotice_; }
@@ -683,7 +703,10 @@ private:
     // whether it streams), its bank ranges, and the bind at the end.
     uint32_t streamWouldResident(int slot, uint32_t frames, bool stereo);
     void planStreamRanges(int slot, uint32_t frames, bool stereo, uint32_t off);
-    bool bindStreamSlot(int slot, const char* path);
+    // False with *reason (StreamBindInfo::reason, or "no reader" / "no slot")
+    // when the slot cannot stream; a load without `reason` notes it in
+    // loadNotice_ instead.
+    bool bindStreamSlot(int slot, const char* path, const char** reason = nullptr);
     ExtTrackPool ext_;              // tracks 12..15 of the store (SDRAM blocks)
     Track* extDiscard_ = nullptr;   // storedTrack() target when the pool is full (SDRAM)
     uint32_t extFullReported_ = 0;  // ext_.fullEvents() at the last notice

@@ -41,6 +41,7 @@ struct ImportJob {
     bool ioError = false;
     bool finishing = false;         // every pass written: close and finalize next
     bool forcedOneShot = false;
+    StreamWhy why = StreamWhy::None;   // for the notice
     void (*userDone)(void*, bool) = nullptr;
     void* userCtx = nullptr;
 };
@@ -111,39 +112,81 @@ void sinkWrite(void* ctx, const int16_t* smp, uint32_t n) {
     j.done += uint32_t(want);
 }
 
+ImportProbe probeOf(const Source& s) {
+    ImportProbe p;
+    p.frames = s.frames;
+    p.stereo = s.stereo;
+    p.pti = !s.wav;
+    p.playMode = s.ins.playMode;
+    p.loopPoint1 = s.ins.loopPoint1;
+    return p;
+}
+
 }  // namespace
+
+bool App::importProbe(const char* path, ImportProbe& p) {
+    Source s;
+    if (!path || !probe(fs(), path, s)) return false;
+    p = probeOf(s);
+    return true;
+}
 
 ImportRoute App::importRoute(const char* path, int slot, uint32_t* bankBytes) {
     if (bankBytes) *bankBytes = 0;
-    if (!path || slot < 0 || slot >= kSampleInstrumentCount) return ImportRoute::Unreadable;
-    Source s;
-    if (!probe(fs(), path, s)) return ImportRoute::Unreadable;
-    const uint64_t bytes = uint64_t(s.frames) * (s.stereo ? 2u : 1u) * 2u;
+    ImportProbe p;
+    if (!path || slot < 0 || slot >= kSampleInstrumentCount || !importProbe(path, p)) return ImportRoute::Unreadable;
+    // No free-space query (a whole-FAT scan after a mount): the import's
+    // reserve() says when the card is full.
+    return importRoute(p, slot, bankBytes, nullptr, UINT64_MAX);
+}
+
+ImportRoute App::importRoute(const ImportProbe& p, int slot, uint32_t* bankBytes, StreamWhy* why,
+                             uint64_t cardFree, int64_t pendingBytes, int pendingStreams) {
+    if (bankBytes) *bankBytes = 0;
+    if (why) *why = StreamWhy::None;
+    if (slot < 0 || slot >= kSampleInstrumentCount || !p.frames) return ImportRoute::Unreadable;
+    const uint64_t bytes = uint64_t(p.frames) * (p.stereo ? 2u : 1u) * 2u;
     if (bankBytes) *bankBytes = bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(bytes);
-    const uint64_t others = uint64_t(bank.usedBytes()) - uint64_t(bank.samples(slot)) * 2u;
+    const int64_t o = int64_t(bank.usedBytes()) - int64_t(bank.samples(slot)) * 2 + pendingBytes;
+    const uint64_t others = o > 0 ? uint64_t(o) : 0;
     const uint64_t cap = uint64_t(bank.capacityBytes()) - uint64_t(bank.reserved()) * 2u;
-    if (others + bytes <= cap) return ImportRoute::Fits;
-    if (!streamingOn() || !hal_.streamReader) return ImportRoute::Off;
-    int inUse = 0;
+    int inUse = pendingStreams;
     for (int i = 0; i < kSampleInstrumentCount; ++i) inUse += i != slot && stream_.streamOf[i] >= 0;
+    // Kept settings (WAV into an existing instrument) or the file's (.pti).
+    uint8_t pm = !p.pti ? (instrPresent[slot] ? instruments[slot].playMode : uint8_t(PlayMode::OneShot)) : p.playMode;
+    const uint16_t lp1 = !p.pti ? (instrPresent[slot] ? instruments[slot].loopPoint1 : 0) : p.loopPoint1;
+    ImportDecisionIn d;
+    d.mode = streamingOn() ? StreamMode(cfg.streamMode > 2 ? 0 : cfg.streamMode) : StreamMode::Off;
+    d.playMode = pm;
+    d.frames = p.frames;
+    d.stereo = p.stereo;
+    d.thresholdSec = kStreamThresholdSec[cfg.streamThreshold > 3 ? 1 : cfg.streamThreshold];
+    d.fitsWhole = others + bytes <= cap;
+    d.readerAvailable = hal_.streamReader != nullptr;
+    d.streamsInUse = inUse;
+    const ImportDecision dec = importDecision(d);
+    if (!dec.streams) return d.fitsWhole ? ImportRoute::Fits : ImportRoute::Off;
     if (inUse >= audio::kMaxStreams) return ImportRoute::TooMany;
-    // Kept settings (WAV into an existing instrument) or the file's (.pti);
-    // a play mode that cannot stream becomes 1-Shot.
-    uint8_t pm = s.wav ? (instrPresent[slot] ? instruments[slot].playMode : uint8_t(PlayMode::OneShot)) : s.ins.playMode;
-    uint16_t lp1 = s.wav ? (instrPresent[slot] ? instruments[slot].loopPoint1 : 0) : s.ins.loopPoint1;
-    if (!audio::AudioEngine::streamablePlayMode(pm)) pm = uint8_t(PlayMode::OneShot);
-    const StreamResident r = streamResident(pm, s.frames, lp1);
-    const uint64_t head = uint64_t(r.framesPerChannel()) * (s.stereo ? 2u : 1u) * 2u;
+    // A play mode that cannot stream becomes 1-Shot.
+    if (dec.forcedOneShot) pm = uint8_t(PlayMode::OneShot);
+    const StreamResident r = streamResident(pm, p.frames, lp1);
+    const uint64_t head = uint64_t(r.framesPerChannel()) * (p.stereo ? 2u : 1u) * 2u;
     if (others + head > cap) return ImportRoute::NoMemory;
     if (bankBytes) *bankBytes = uint32_t(head);
-    const uint64_t free = fs().freeBytes();
-    if (free != UINT64_MAX && free < ptiFileSize(s.frames, s.stereo)) return ImportRoute::CardFull;
+    if (cardFree != UINT64_MAX && cardFree < ptiFileSize(p.frames, p.stereo)) return ImportRoute::CardFull;
+    if (why) *why = dec.why;
     return ImportRoute::Streams;
 }
 
 bool App::startStreamedImport(const char* path, int slot, void (*done)(void*, bool), void* ctx) {
     importNotice_[0] = 0;
-    const ImportRoute route = importRoute(path, slot);
+    Source s;
+    StreamWhy streamWhy = StreamWhy::None;
+    const ImportRoute route = !path || !probe(fs(), path, s)
+                                  ? ImportRoute::Unreadable
+                                  // No free-space query: the first after a mount scans the
+                                  // whole FAT (seconds); reserve() below fails on a full card.
+                                  : importRoute(probeOf(s), slot, nullptr, &streamWhy, UINT64_MAX);
     if (route != ImportRoute::Streams) {
         const char* why = "Cannot read the file";
         switch (route) {
@@ -160,11 +203,10 @@ bool App::startStreamedImport(const char* path, int slot, void (*done)(void*, bo
     finishJob();
     ImportJob& j = g_import.get();
     j = ImportJob{};
-    Source s;
-    if (!probe(fs(), path, s)) return false;
     std::snprintf(j.src, sizeof(j.src), "%s", path);
     workspaceInstrumentPath(j.dst, sizeof(j.dst), kWorkspace, slot + 1);
     j.slot = slot;
+    j.why = streamWhy;
     j.wav = s.wav;
     j.info = s.info;
     j.opt.stereo = true;
@@ -208,7 +250,30 @@ bool App::startStreamedImport(const char* path, int slot, void (*done)(void*, bo
     f.remove(kImportTmp);
     j.in = f.open(path, IStorage::kRead);
     j.out = j.in >= 0 ? f.open(kImportTmp, IStorage::kWrite) : -1;
-    bool ok = j.out >= 0 && f.reserve(j.out, uint32_t(ptiFileSize(s.frames, s.stereo)));
+    const uint64_t need = ptiFileSize(s.frames, s.stereo);
+    if (j.out >= 0 && !f.reserve(j.out, uint32_t(need))) {
+        // Room on the card but no contiguous run of that size: formatting fixes it.
+        const uint64_t free = f.freeBytes();
+        importCleanup();
+        std::snprintf(importNotice_, sizeof(importNotice_), "%s",
+                      free != UINT64_MAX && free >= need ? "Card too fragmented to stream: format the SD card"
+                                                         : "Not enough space on the SD card");
+        return false;
+    }
+    // Pre-check: the laid-out file can be bound, before minutes of
+    // conversion (the size and the map self-check stay in bind()).
+    audio::StreamBindInfo bi;
+    if (j.out >= 0 && !hal_.streamReader->streamable(uint8_t(slot), kImportTmp, &bi)) {
+        importCleanup();
+        if (std::strcmp(bi.reason, "no slot") == 0)
+            std::snprintf(importNotice_, sizeof(importNotice_), "16 instruments already stream from the card");
+        else if (std::strcmp(bi.reason, "fragmented") == 0)
+            std::snprintf(importNotice_, sizeof(importNotice_), "Card too fragmented to stream: format the SD card");
+        else
+            std::snprintf(importNotice_, sizeof(importNotice_), "Cannot stream the file (%s)", bi.reason);
+        return false;
+    }
+    bool ok = j.out >= 0;
     uint8_t hdr[pti::kHeaderBlockSize];
     encodePtiHeader(ins, hdr);
     ok = ok && f.write(j.out, hdr, sizeof(hdr)) == int32_t(sizeof(hdr)) && f.seek(j.in, j.dataOff);
@@ -225,8 +290,10 @@ bool App::startStreamedImport(const char* path, int slot, void (*done)(void*, bo
     j.userDone = done;
     j.userCtx = ctx;
     if (!startExternalJob("Importing - Delete cancels", &App::importUnitThunk, &App::importPercentThunk, this,
-                          &App::importDoneThunk, this))
+                          &App::importDoneThunk, this)) {
+        importCleanup();   // the laid-out file goes too
         return false;
+    }
     ui.progressCancel(
         [](void* c) {
             App& a = *static_cast<App*>(c);
@@ -270,6 +337,11 @@ int App::importUnit(uint32_t& cost) {
     IStorage& f = fs();
     cost += kChunk;
     if (j.finishing) {
+        // The file ends where the conversion did (reserve() laid out all of it).
+        if (!f.truncate(j.out)) {
+            std::snprintf(importNotice_, sizeof(importNotice_), "Cannot write the instrument file");
+            return -1;
+        }
         f.close(j.out);
         j.out = -1;
         f.close(j.in);
@@ -337,7 +409,9 @@ bool App::importFinalize() {
     // Head (and loop head) into the bank: [L head | L loop][R head | R loop].
     const StreamResident r = streamResident(j.ins.playMode, j.frames, j.ins.loopPoint1);
     const uint32_t perCh = r.framesPerChannel();
-    bool ok = bank.freeSamples() >= size_t(perCh) * j.ch;
+    const bool room = bank.freeSamples() >= size_t(perCh) * j.ch;
+    bool ok = room;
+    const char* why = "read";   // bindStreamSlot names its own reason
     int16_t* t = bank.tail();
     IStorage::Handle h = ok ? f.open(j.dst, IStorage::kRead) : -1;
     ok = ok && h >= 0;
@@ -361,7 +435,7 @@ bool App::importFinalize() {
         pj_.resLoopStart = r.loopStart;
         pj_.resLoopFrames = r.loopFrames;
         pj_.dataOff[slot] = pti::kDataOff;
-        ok = bindStreamSlot(slot, j.dst);
+        ok = bindStreamSlot(slot, j.dst, &why);
         if (!ok) bank.remove(slot);
     }
     if (!ok) {
@@ -370,14 +444,28 @@ bool App::importFinalize() {
         instruments[slot].setDefault();
         refreshStreamSources();
         markInstrumentDirty(slot);
-        std::snprintf(importNotice_, sizeof(importNotice_), "Cannot stream the file: format the SD card");
+        // Only a fragmented card is fixed by formatting it.
+        if (!room)
+            std::snprintf(importNotice_, sizeof(importNotice_), "Not enough sample memory");
+        else if (std::strcmp(why, "fragmented") == 0)
+            std::snprintf(importNotice_, sizeof(importNotice_), "Card too fragmented to stream: format the SD card");
+        else
+            std::snprintf(importNotice_, sizeof(importNotice_), "Cannot stream the file (%s)", why);
         return false;
     }
     instrPresent[slot] = true;
     refreshStreamSources();
     markInstrumentDirty(slot);   // header only: the file on the card is the sample
-    std::snprintf(importNotice_, sizeof(importNotice_), j.forcedOneShot ? "Streams from the card (play mode 1-Shot)"
-                                                                         : "Streams from the card");
+    // Why it streams, and a play mode that became 1-Shot.
+    const char* oneShot = j.forcedOneShot ? ", 1-Shot" : "";
+    if (j.why == StreamWhy::Threshold)
+        std::snprintf(importNotice_, sizeof(importNotice_), "Streams from the card (longer than %u s%s)",
+                      unsigned(kStreamThresholdSec[cfg.streamThreshold & 3]), oneShot);
+    else if (j.why == StreamWhy::All)
+        std::snprintf(importNotice_, sizeof(importNotice_), "Streams from the card (%s)",
+                      j.forcedOneShot ? "All, 1-Shot" : "Stream from card: All");
+    else
+        std::snprintf(importNotice_, sizeof(importNotice_), "Streams from the card (does not fit memory%s)", oneShot);
     return true;
 }
 

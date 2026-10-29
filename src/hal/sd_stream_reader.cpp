@@ -4,8 +4,6 @@
 #include <Arduino.h>
 #include <string.h>
 
-#include <type_traits>
-
 #include "diag.h"
 #include "sdram_bss.h"
 
@@ -14,25 +12,16 @@ namespace hal {
 
 namespace {
 OT_SDRAM_BSS SdStreamReader::Binding gBindings[audio::kMaxStreams];
-static_assert(std::is_trivially_default_constructible<SdStreamReader::Binding>::value,
-              "SDRAM object: no static constructor (tools/check_ctors.py)");
 alignas(4) uint8_t gEdge[512];   // partial head / tail sectors (SRAM)
 }  // namespace
 
 // Constructed in otAppMain (a function-local static), after the SDRAM is up.
 SdStreamReader::SdStreamReader(SdStorage& sd) : sd_(sd), b_(gBindings) {
-    for (int i = 0; i < audio::kMaxStreams; ++i) {
-        b_[i].instrument = 0xFF;
-        b_[i].stereo = false;
-        b_[i].nExt = 0;
-        b_[i].dataOffset = b_[i].frames = 0;
-    }
+    audio::streamBindingUnbindAll(b_, audio::kMaxStreams);
 }
 
 SdStreamReader::Binding* SdStreamReader::find(uint8_t instrument) const {
-    for (int i = 0; i < audio::kMaxStreams; ++i)
-        if (b_[i].instrument == instrument) return &b_[i];
-    return nullptr;
+    return audio::streamBindingFind(b_, audio::kMaxStreams, instrument);
 }
 
 bool SdStreamReader::bind(const audio::StreamSource& s, const char* path, uint32_t dataOffset, bool stereo,
@@ -40,8 +29,7 @@ bool SdStreamReader::bind(const audio::StreamSource& s, const char* path, uint32
     audio::StreamBindInfo dummy;
     if (!info) info = &dummy;
     const uint32_t t0 = micros();
-    Binding* slot = find(s.instrument);
-    if (!slot) slot = find(0xFF);
+    Binding* slot = audio::streamBindingSlot(b_, audio::kMaxStreams, s.instrument);
     if (!slot) {
         info->reason = "no slot";
         return false;
@@ -93,13 +81,32 @@ bool SdStreamReader::bind(const audio::StreamSource& s, const char* path, uint32
     return true;
 }
 
-void SdStreamReader::unbind(uint8_t instrument) {
-    if (Binding* b = find(instrument)) *b = Binding{};
+bool SdStreamReader::streamable(uint8_t instrument, const char* path, audio::StreamBindInfo* info) {
+    audio::StreamBindInfo dummy;
+    if (!info) info = &dummy;
+    const uint32_t t0 = micros();
+    if (!audio::streamBindingSlot(b_, audio::kMaxStreams, instrument)) {
+        info->reason = "no slot";
+        return false;
+    }
+    // The import's reserved file (an allocated chain, SdStorage::reserve):
+    // its map must fit a binding, as bind() checks after the conversion.
+    audio::StreamExtent ext[audio::kStreamMaxExtents];
+    int n = 0;
+    if (!sd_.fileExtents(path, ext, audio::kStreamMaxExtents, &n, nullptr)) {
+        info->reason = "fragmented";
+        diagLogf("sd stream: pre-check \"%s\": fragmented", path);
+        return false;
+    }
+    info->extents = uint16_t(n);
+    info->bindUs = micros() - t0;
+    diagLogf("sd stream: pre-check \"%s\" extents %d in %lu us", path, n, static_cast<unsigned long>(info->bindUs));
+    return true;
 }
 
-void SdStreamReader::unbindAll() {
-    for (int i = 0; i < audio::kMaxStreams; ++i) b_[i] = Binding{};
-}
+void SdStreamReader::unbind(uint8_t instrument) { audio::streamBindingUnbind(b_, audio::kMaxStreams, instrument); }
+
+void SdStreamReader::unbindAll() { audio::streamBindingUnbindAll(b_, audio::kMaxStreams); }
 
 bool SdStreamReader::bound(uint8_t instrument) const { return instrument != 0xFF && find(instrument); }
 

@@ -15,6 +15,8 @@
 
 namespace ot {
 
+struct ImportProbe;   // app/app.h
+
 // [I] One buffer for the browsers' name lists (SDRAM on the device,
 // screens.cpp): Sample Loader, Synth patch browser, File Open / Save,
 // Import Mod and the firmware-update list. Only one is on screen at a time
@@ -359,12 +361,14 @@ private:
     void addFrom(int i, int n);
     static void streamedDone(void* ctx, bool ok);
     bool entryPath(int i, char* out, int cap) const;
+    ImportProbe probeOf(int i) const;   // the listing's probe of entry i
     uint32_t now() const { return ui_.now(); }
     LoaderList* list_ = static_cast<LoaderList*>(browserListMem());
     int depth_ = 0;
     int cursorHist_[kMaxDepth] = {};
     int partHist_[kMaxDepth] = {};
     uint8_t marked_[kMaxEntries] = {};
+    uint8_t rowRoute_[kMaxEntries] = {};   // 2.x: ImportRoute of each row (projectSelection)
     uint8_t insMarked_[48] = {};
     int prevFocus_ = 0;
     uint32_t projected_ = 0;
@@ -375,6 +379,8 @@ private:
     int importSd_ = 0, importIns_ = 0, importF_ = 0, importL_ = 0;
     bool addNext_ = false;
     int addI_ = 0, addN_ = 0;   // C14: where a streamed import resumes the Add
+    int addFiles_ = 0, addStreamed_ = 0;   // 2.x: files in the Add, streamed so far (summary notice)
+    bool addLastFailed_ = false;
     int copySrc_ = -1, copyCount_ = 0;
     bool previewing_ = false;
     uint32_t pendingProjAt_ = 0;

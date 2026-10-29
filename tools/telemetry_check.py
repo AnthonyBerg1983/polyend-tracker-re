@@ -25,10 +25,11 @@
       Flash use = .text + .data (Berkeley size): fail above 720,000 B, warn above
       600,000 B (docs/VERIFY_M1.md R4, docs/MINI_PLAN.md §5).
       With nm (default: the size tool's sibling): no double-precision libm in the
-      image, and the stack headroom _estack - _ebss: fail below 90 KiB
-      (docs/OPTIMIZATION_2X.md OP-4 / OP-5).
-  telemetry_check.py frames <build dir> [--guard-header src/hal/stack_guard.h]
-      Per-function stack frames from the build's -fstack-usage .su files against
+      image, and the stack headroom _estack - _ebss: fail below 75 KiB
+      (docs/OPTIMIZATION_2X.md OP-4 / OP-5; see STACK_MIN).
+  telemetry_check.py frames <build dir> | --objects <x.o ...> [--guard-header src/hal/stack_guard.h]
+      Per-function stack frames from the -fstack-usage .su files (of the given
+      objects, failing when one has none; else every .su under the build dir) against
       the stack guard (kStackGuardBytes): a frame plus an interrupt's exception
       frame (104 B with FP state) must stay inside the guard, so fail at >= the
       guard - 256 B and on unbounded dynamic frames, warn above 75 % of it.
@@ -48,6 +49,7 @@ import argparse
 import os
 import re
 import sys
+import tempfile
 
 BUDGET = 522240
 
@@ -84,9 +86,11 @@ LIMIT_RE = re.compile(r"^\s+((?:acd|vap|fat|wtfm|perc|pswitch|stream)[\w.]*)\s+(
 FLASH_FAIL = 720000
 FLASH_WARN = 600000
 # _estack - _ebss holds the stack and newlib's heap (src/hal/stack_watch.h). With the stack
-# guard (src/hal/stack_guard.h) this headroom also holds the 4 KB heap reserve and the 8 KB
-# guard: the stack itself gets at least 78 KiB.
-STACK_MIN = 90 * 1024
+# guard (src/hal/stack_guard.h) it also holds the 4 KB heap reserve and the 8 KB guard, so
+# the stack itself gets at least 63 KiB. Measured on the device (telemetry "stack peak"):
+# 10,852 B over playback, synths + chords, Sample Editor effects, open / save / Open Recent,
+# export and import, resample, USB storage; the heap ~0.2 KB. Was 90 KiB.
+STACK_MIN = 75 * 1024
 # newlib double-precision libm entry points / kernels (the float ones end in f).
 DOUBLE_LIBM = {"__ieee754_pow", "__ieee754_exp", "__ieee754_log", "__ieee754_log10", "__ieee754_sqrt",
                "__ieee754_rem_pio2", "__kernel_rem_pio2", "__kernel_sin", "__kernel_cos", "pow", "exp", "log",
@@ -460,6 +464,21 @@ def guard_bytes(header=GUARD_HEADER):
     return int(m.group(1))
 
 
+def read_su(objects):
+    """Object files -> (their -fstack-usage lines, objects without a .su file).
+    gcc writes x.su next to x.o; an object built before -fstack-usage (an
+    incremental build) has none, and its frames would go unchecked."""
+    lines, missing = [], []
+    for obj in objects:
+        su = (obj[:-2] if obj.endswith(".o") else obj) + ".su"
+        try:
+            with open(su, errors="replace") as f:
+                lines.extend(f.read().splitlines())
+        except FileNotFoundError:
+            missing.append(obj)
+    return lines, missing
+
+
 def check_frames(su_lines, guard, quiet=False, top=5):
     """-fstack-usage lines -> (ok, deepest frame bytes). A frame (plus an
     interrupt's exception frame below it) as large as the stack guard could step
@@ -573,6 +592,8 @@ def selftest():
     assert not ok
     ok, head = check_symbols(["20030000 B _estack", "20023820 B _ebss"], quiet=True)
     assert not ok and head == 51168
+    ok, head = check_symbols(["20030000 B _estack", "2001c780 B _ebss"], quiet=True)
+    assert ok and head == 80000, head   # passes at 75 KiB (failed at the old 90 KiB)
     su = ["a.cpp:1:6:void f()\t6032\tstatic", "b.cpp:2:6:void g()\t96\tstatic", "c.c:3:6:h\t40\tdynamic,bounded"]
     ok, deep = check_frames(su, 8192, quiet=True)
     assert ok and deep == 6032, deep
@@ -581,6 +602,17 @@ def selftest():
     assert check_frames(su + ["d.cpp:4:6:void big()\t7935\tstatic"], 8192, quiet=True)[0]
     assert not check_frames(su + ["e.cpp:5:6:void vla(int)\t16\tdynamic"], 8192, quiet=True)[0]
     assert not check_frames([], 8192, quiet=True)[0]
+    with tempfile.TemporaryDirectory() as d:
+        objs = [os.path.join(d, n) for n in ("a.cpp.o", "b.c.o")]
+        for o in objs:
+            open(o, "w").close()
+        with open(os.path.join(d, "a.cpp.su"), "w") as f:
+            f.write(su[0] + "\n")
+        lines, missing = read_su(objs)
+        assert lines == [su[0]] and missing == [objs[1]], (lines, missing)
+        with open(os.path.join(d, "b.c.su"), "w") as f:
+            f.write(su[1] + "\n")
+        assert read_su(objs) == ([su[0], su[1]], [])
     assert guard_bytes() > 0
     print("telemetry_check: selftest ok")
 
@@ -605,7 +637,9 @@ def main(argv):
     sz.add_argument("--nm-tool", default=None)
     sz.add_argument("elf")
     fr = sub.add_parser("frames")
-    fr.add_argument("build_dir")
+    fr.add_argument("build_dir", nargs="?")
+    fr.add_argument("--objects", nargs="+", default=None,
+                    help="the image's object files: only their .su files, and fail on a missing one")
     fr.add_argument("--guard-header", default=GUARD_HEADER)
     cp = sub.add_parser("cpi")
     cp.add_argument("log")
@@ -645,13 +679,22 @@ def main(argv):
             ok_sym, _ = check_symbols(r.stdout.splitlines())
             ok = ok and ok_sym
         elif a.cmd == "frames":
-            su = []
-            for root, _, files in os.walk(a.build_dir):
-                for name in files:
-                    if name.endswith(".su"):
-                        with open(os.path.join(root, name), errors="replace") as f:
-                            su.extend(f.read().splitlines())
+            su, missing = [], []
+            if a.objects:
+                su, missing = read_su(a.objects)
+            elif a.build_dir:
+                for root, _, files in os.walk(a.build_dir):
+                    for name in files:
+                        if name.endswith(".su"):
+                            with open(os.path.join(root, name), errors="replace") as f:
+                                su.extend(f.read().splitlines())
+            else:
+                fr.error("give a build dir or --objects")
             ok, _ = check_frames(su, guard_bytes(a.guard_header))
+            if missing:
+                print(f"frames: FAIL {len(missing)} of {len(a.objects)} objects have no .su file "
+                      f"(built before -fstack-usage? make clean), e.g. {missing[0]}")
+                ok = False
         else:
             selftest()
             ok = True
